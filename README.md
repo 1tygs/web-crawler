@@ -20,7 +20,7 @@ https://example.com/about
   https://example.com/
 ```
 
-- Only the start URL's exact host is crawled. Links to other domains and to subdomains are printed but never fetched.
+- Only the start URL's exact host is crawled (after following a redirect that only adds or removes `www.`). Links to other domains and to subdomains are printed but never fetched.
 - Results stream to stdout as pages complete; progress and a final summary go to stderr.
 - `--format jsonl` gives machine-readable output; `--max-pages` and `--max-depth` bound the crawl.
 
@@ -28,13 +28,25 @@ Every option and exit code is listed in [DESIGN.md §6.1](DESIGN.md#61-command-l
 
 ## Design in brief
 
-- **Fast.** One asyncio (uvloop) coordinator owns all crawl state and does only cheap work. A process pool parses response bodies while they're still compressed. An adaptive concurrency limit (AIMD plus a latency signal) runs close to what the server can sustain, and backs off on 429/503 and `Retry-After`.
+- **Fast.** One asyncio (uvloop) coordinator owns all crawl state and does only cheap work. A process pool parses response bodies while they're still compressed. An adaptive concurrency limit runs close to what the server can sustain: it halves on 429/503 and timeouts, honours `Retry-After`, and stops growing when a probe confirms the server is queueing ([ADR-001](docs/adr/001-concurrency-control.md)).
 - **Accurate.** Links are resolved as a browser resolves them: HTML5 parsing (selectolax/lexbor), WHATWG URLs (ada-url), `<base href>`, the final URL after redirects, and declarative shadow DOM. Each page is fetched exactly once (redirect-aware dedupe against an exact set), transient failures are retried, and every skipped URL is counted.
 - **Polite.** robots.txt per RFC 9309, `Crawl-delay`, and an honest User-Agent.
 
 Measured on an Apple M5, the full parse pipeline costs 0.4–2.8 ms per real page and eight parser processes handle about 2,900 pages/s, so the target server, not the crawler, sets the pace.
 
 Requires Python 3.14 or later. No JavaScript runs, so links created only by client-side rendering aren't seen; see [limitations](DESIGN.md#13-limitations-risks-and-what-to-revisit).
+
+## How this was built
+
+The brief asks which tools were used, including AI, and how the work was checked.
+
+- **Learning the domain.** Primary sources, as cited in DESIGN.md: RFC 9309 (robots.txt), RFC 6797 (HSTS) and RFC 3986 (URI equivalence); the WHATWG URL, HTML and Encoding standards; the CPython 3.14 documentation; and, for adaptive concurrency, TCP congestion control, Netflix's concurrency-limits and BBR. **TODO:** anything else you read, watched or asked.
+- **Measuring instead of assuming.** Performance and behaviour claims in DESIGN.md come from the scripts in `bench/`, run on the development machine (an Apple M5), or from simulations where a real server can't be controlled. Appendix A has the methods and results.
+- **Editor.** **TODO:** IDE and version, extensions, and whether inline AI completion such as Copilot was on.
+- **AI tools.**
+  - **Claude Code**, Anthropic's coding agent. **TODO:** how it was used for the first draft of the design and the benchmarks. In a review session on 2026-10-19 and 20 (Claude Opus 5.5, in the Claude desktop app), it reviewed the design against this brief, wrote and ran the checks and simulations in Appendix A.9–A.13, and applied the resulting changes to DESIGN.md, including [ADR-001](docs/adr/001-concurrency-control.md).
+  - **TODO:** any other AI tools, or "none".
+- **Checking AI output.** Claims were tested rather than taken on trust, and the scripts that test them are kept in `bench/`. The review's simulations rejected the first draft's limiter law and its `--max-depth` rules, and caught a bug in the review's own first proposal for the limiter; re-running a real-site measurement changed one of its numbers (A.12). **TODO:** how you reviewed the changes yourself.
 
 ## Benchmarks
 
@@ -61,6 +73,12 @@ curl --compressed -o bench/fixtures/python.html https://www.python.org/
 | `python bench/url_bench.py bench/fixtures` | URL resolution: `urljoin` vs yarl vs ada-url | A.5 |
 | `python bench/robots_bench.py bench/fixtures` | robots.txt matching: Protego vs `urllib.robotparser` | A.6 |
 | `python bench/memory_bench.py` | Memory per URL in the seen set and frontier | A.7 |
+| `python bench/pool_check.py MODE` | Process pool: on-demand workers, what one crash takes down, Ctrl-C while workers start | A.9 |
+| `python bench/depth_sim.py` | `--max-depth` rules against breadth-first-search ground truth, in simulation | A.10 |
+| `python bench/limiter_sim.py` | Concurrency laws on simulated servers | A.11 |
+| `python bench/ttfb_spread.py URL` | How widely a real site's response times spread | A.12 |
 
 - `client_bench.py` needs `python bench/server.py PAGE.html` running in another shell; it serves that page on 127.0.0.1:8899. `CLIENT` is one of `aiohttp`, `aiohttp+uvloop`, `aiohttp+uvloop+raw` (no decompression), `curl_cffi`, `niquests` or `httpx`.
 - `robots_bench.py` expects `wikipedia.html` and `wikipedia.robots.txt` from en.wikipedia.org, and `guardian.html` and `guardian.robots.txt` from www.theguardian.com.
+- `pool_check.py` takes a `MODE` of `ondemand`, `crash` or `sigint`, and `--method spawn` or `--method forkserver`. It and the two simulations use only the standard library.
+- `ttfb_spread.py` needs curl, and sends about 40 requests, one at a time, to the site you give it.
