@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+
+# Virtual environments (`uv venv` creates .venv/)
+.venv/
+venv/
+
+# Tool caches: pytest, mypy, ruff, hypothesis, coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+
+# Local settings
+.env
+
+# Saved third-party pages for bench/; not ours to redistribute (see README)
+bench/fixtures/
+
+# macOS
+.DS_Store
