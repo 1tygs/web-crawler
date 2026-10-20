@@ -2,9 +2,9 @@
 
 A fast, accurate and polite web crawler for the command line, written in Python. Give it a start URL and it crawls that host, printing each page's URL followed by every link found on the page.
 
-> **Status: in development, step 2 of the 5 in [the v1 plan](docs/implementation-plan.md).** `crawl URL` crawls the start URL's host breadth-first, eight requests at a time, and prints each page's links as a browser resolves them: in the page's charset, against its `<base href>`, from declarative shadow DOM and meta refresh too, and with `--all-urls` every URL-bearing attribute. It obeys robots.txt (RFC 9309), fetches each page once however many links and redirects lead to it, and follows a start URL's redirect to its `www.` host. Speed, robustness, and the limits and output options come in the next three steps; until then [DESIGN.md](DESIGN.md) describes more than the code does. The measurements behind the design can be reproduced with the scripts in [`bench/`](bench/).
+> **Status: in development, step 2 of the 5 in [the v1 plan](docs/implementation-plan.md), plus `--max-pages` and a clean Ctrl-C.** `crawl URL` crawls the start URL's host breadth-first, eight requests at a time, and prints each page's links as a browser resolves them: in the page's charset, against its `<base href>`, from declarative shadow DOM and meta refresh too, and with `--all-urls` every URL-bearing attribute. It obeys robots.txt (RFC 9309), fetches each page once however many links and redirects lead to it, and follows a start URL's redirect to its `www.` host. `--max-pages` bounds a crawl, and Ctrl-C stops one cleanly. Speed, robustness, and the other limits and output options come in the next three steps; until then [DESIGN.md](DESIGN.md) describes more than the code does. The measurements behind the design can be reproduced with the scripts in [`bench/`](bench/).
 
-## Planned usage
+## Usage
 
 ```bash
 crawl https://example.com/
@@ -22,7 +22,9 @@ https://example.com/about
 
 - Only the start URL's exact host is crawled (after following a redirect that only adds or removes `www.`). Links to other domains and to subdomains are printed but never fetched.
 - Results stream to stdout as pages complete; progress and a final summary go to stderr.
-- `--format jsonl` gives machine-readable output; `--max-pages` and `--max-depth` bound the crawl.
+- `--max-pages N` stops once N pages are printed: exactly N records, or fewer if the site is smaller. A fetch starts only while pages printed plus fetches in flight is below N, so no page is fetched only to be thrown away.
+- Ctrl-C (SIGINT) or SIGTERM stops the crawl cleanly: no more fetches start, those in flight are cancelled, only whole records reach stdout, and the summary still goes to stderr. The exit code is 130 for SIGINT and 143 for SIGTERM. A second Ctrl-C exits at once.
+- Planned: `--format jsonl` gives machine-readable output, and `--max-depth` bounds the crawl by depth.
 
 Every option and exit code is listed in [DESIGN.md §6.1](DESIGN.md#61-command-line).
 

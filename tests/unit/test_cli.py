@@ -41,6 +41,18 @@ def test_all_urls() -> None:
     assert parse_args(["--all-urls", "https://example.com/"]).all_urls
 
 
+def test_max_pages() -> None:
+    assert parse_args(["https://example.com/", "--max-pages", "5"]).max_pages == 5
+    assert parse_args(["https://example.com/"]).max_pages is None
+
+
+def test_max_pages_below_1_is_a_usage_error(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        parse_args(["https://example.com/", "--max-pages", "0"])
+    assert exit_info.value.code == 2
+    assert "max_pages must be at least 1, not 0" in capsys.readouterr().err
+
+
 def test_start_url_options() -> None:
     cfg = parse_args(["https://example.com/", "--strict-host", "--insecure"])
     assert (cfg.strict_host, cfg.insecure) == (True, True)
@@ -67,7 +79,7 @@ def test_help_exits_zero(capsys: pytest.CaptureFixture[str]) -> None:
         parse_args(["--help"])
     assert exit_info.value.code == 0
     assert capsys.readouterr().out.startswith(
-        "usage: crawl [-h] [--all-urls] [--ignore-robots] [--strict-host] [--insecure]"
+        "usage: crawl [-h] [--all-urls] [--max-pages N] [--ignore-robots]"
     )
 
 
@@ -110,3 +122,11 @@ def test_an_unexpected_exception_exits_1_with_its_traceback(
     assert main(["https://example.com/"]) == ExitCode.INTERNAL_ERROR
     assert "internal error" in caplog.text
     assert "RuntimeError: a bug" in caplog.text
+
+
+def test_ctrl_c_before_the_crawl_handles_it_exits_130(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def interrupted(*args: object, **kwargs: object) -> NoReturn:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("web_crawler.cli.crawl", interrupted)
+    assert main(["https://example.com/"]) == ExitCode.INTERRUPTED
