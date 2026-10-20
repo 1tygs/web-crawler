@@ -47,7 +47,15 @@ The brief asks which tools were used, including AI, and how the work was checked
   - **Claude Code**, Anthropic's coding agent, in the Claude desktop app with Claude Opus 5.5. The first draft of the design came from a session that started from the brief through the `system-design` skill of Anthropic's engineering plugin. It installed candidate libraries in a scratch virtual environment, then wrote and ran the benchmarks for HTML parsers, URL resolution, HTTP clients, the parse pipeline, robots.txt matching and memory per URL on the development machine. It picked each technology from those results and wrote DESIGN.md with the scripts moved into `bench/`. Separate short sessions wrote the README and set up the public repository and licence. In a review session it reviewed the design against this brief, wrote and ran the checks and simulations in Appendix A.9–A.13, and applied the resulting changes to DESIGN.md, including [ADR-001](docs/adr/001-concurrency-control.md).
 - **Checking AI output.** Claims were tested rather than taken on trust, and the scripts that test them are kept in `bench/`. The review's simulations rejected the first draft's limiter law and its `--max-depth` rules, and caught a bug in the review's own first proposal for the limiter; re-running a real-site measurement changed one of its numbers (A.12).
 
+## Development
 
+You need [uv](https://docs.astral.sh/uv/) 0.12.15 or later; it installs Python 3.14 itself if necessary. The Makefile runs everything through uv, so there's no virtual environment to manage.
+
+```bash
+make check                    # ruff, mypy --strict and the tests with coverage
+make test PYTEST_ARGS="-x"    # just the tests
+uv run pre-commit install     # optional: ruff and mypy before each commit
+```
 
 ## Benchmarks
 
