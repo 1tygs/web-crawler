@@ -192,7 +192,7 @@ Few sites will serve one client thousands of pages per second. The crawler's cei
   4. robots.txt ([§5.7](#57-robotstxt)).
   5. `--max-depth`.
 
-  Rejected keys also go into `seen`, so they aren't re-checked every time they're found. Depth rejections are the exception, so a later, shorter path can still admit them. A redirect's target goes through the trap rules and robots.txt, but not the extension filter: it's followed, and its response says what it is. The checks cost about 0.6 µs per new URL on top of robots.txt's, and run once per URL, not per link.
+  Rejected keys also go into `seen`, so they aren't re-checked every time they're found. Depth rejections are the exception, so a later, shorter path can still admit them. A redirect's target goes through the trap rules and robots.txt, but not the extension filter: it's followed, and its response says what it is. The checks cost about 0.6 µs per new URL on top of robots.txt's, and run once per URL, not per link (A.16).
 - **`--max-pages N`** is enforced when dispatching: a fetch starts only while pages printed plus fetches in flight is below N, so no page is fetched only to be thrown away. A fetch that ends without a page (an error, a non-HTML response, a redirect to a URL already claimed) frees its place. Exactly N records are printed, or fewer if the site is smaller.
 - **HSTS upgrade (RFC 6797), after v1.** Once an HTTPS response carries `Strict-Transport-Security`, in-scope `http://` links are upgraded to `https://` before the dedupe check, as browsers do. Legacy `http://` links then cost no redirect round-trip. Until then, redirect-aware dedupe ([§5.6](#56-url-normalization-and-dedupe)) collapses them for one extra request each.
 - **Exact depth under `--max-depth`.** Because of concurrency, a page can be reached by a longer path first. A two-level dispatch window makes the result independent of timing:
@@ -477,6 +477,7 @@ class ParseResult(NamedTuple):   # worker -> coordinator
     links_found: int             # links printed on the page, for stats
     decoded_bytes: int           # the body's size decompressed, for stats
     error: str | None            # e.g. "bad content-encoding": deterministic, so final
+    truncated: bool = False      # cut at the size cap, or its stream ended early
 
 def parse_page(job: ParseJob, ctx: WorkerContext) -> ParseResult: ...
                                  # pure; ctx is the static context (§5.5), which a pool
@@ -659,7 +660,7 @@ The brief asks how the crawler would extend to many domains at once, and whether
 
 ### 14.1 The engine as a library
 
-- `crawl(spec: CrawlSpec, sink: Sink) -> CrawlStats`. `CrawlSpec` is today's `Config` plus a scope policy. `Sink` is a protocol with `write(record)`, `backlogged` and `close()`, plus `start(on_drained)`, through which a sink that fell behind wakes the dispatcher: text and JSONL now; Kafka, object storage or a database later.
+- `crawl(spec: CrawlSpec, sink: Sink) -> CrawlStats`. `CrawlSpec` is today's `Config` plus a scope policy. `Sink` is a protocol with `write(record)`, `backlogged` and `close()`, plus `start(on_drained, on_closed)`, through which a sink that fell behind wakes the dispatcher, and one whose reader went away stops the crawl: text and JSONL now; Kafka, object storage or a database later.
 - The CLI shrinks to argument parsing, a stdout sink and exit codes.
 - The parts without I/O (`parse_page`, the URL rules, the robots policy, the limiter's law, admission) are reused unchanged by every front end below. That's the payoff of keeping them free of I/O ([§4.1](#41-process-and-component-view)).
 
@@ -1012,3 +1013,15 @@ The differences are rare symbols and vendor extensions, such as EUC-JP 0xA1C1, w
 - Parsing one of these pages takes 205 µs, so the inline crawl's 332 µs leaves about 125 µs for HTTP, the engine's bookkeeping and the output; the parser processes' machinery costs about as much again, a little more with more of them. Adding A.3's cost to A.4's, as §1 does, leaves the engine's bookkeeping out.
 - Over repeated runs of the same code, pages/s varied by about 5% and CPU per page by about 15 µs.
 - The coordinator's memory stays far below §7's 300 MB.
+- Step 4's robustness, measured the same way on 2026-10-20 in twelve 50,000-page crawls, six each, alternating with the code before it, three in each order: 1,048–1,113 pages/s against 994–1,095, 269–280 µs of coordinator CPU per page against 262–272 (medians 272 and 268), and 67–68 MiB against 66–67. The difference is within the runs' own spread. The rules admission adds cost 0.6 µs per new URL (A.16), and the retry, breaker and block-guard bookkeeping a few calls per page.
+
+**A.16 Admission's rules** (`bench/admission_bench.py`)
+
+Admission checks a URL it hasn't seen against its rules once, however many pages link to it (§5.1). 200,000 generated URLs of 1–5 path segments, 15% of them with a query and a few with a file's extension, admitted in batches of 120, as pages hand them over; median of 7 runs, on 2026-10-20:
+
+| Rules | No robots.txt | A short robots.txt |
+|---|---|---|
+| robots.txt only, before step 4 | 0.51 µs per URL | 1.54 µs |
+| Trap rules, extension filter and robots.txt | 1.13 µs | 2.16 µs |
+
+A first version cost 0.95 µs more rather than 0.6: it built a `Counter` of every path's segments, and read each path twice. The segment rule now counts them only for a path with more than three segments some of which repeat, and the extension filter reads the last segment straight from the URL.

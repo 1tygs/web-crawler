@@ -219,6 +219,9 @@ async def test_compressed_pages_are_crawled_as_a_browser_reads_them(parse_worker
     assert report.stats.failures == {"bad content-encoding": 1}
     assert report.stats.not_html == 1  # nosniff: its body isn't sniffed
     assert report.stats.decoded_bytes < 2 << 20  # the bomb stopped at the cap
+    # Corrupt data would be corrupt again: it isn't retried.
+    assert site.targets().count("/corrupt") == 1
+    assert not report.stats.retries
 
 
 @pytest.mark.parametrize("seed", range(4))
