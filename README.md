@@ -57,6 +57,8 @@ make test PYTEST_ARGS="-x"    # just the tests
 uv run pre-commit install     # optional: ruff and mypy before each commit
 ```
 
+CI runs the same targets on Linux and macOS for every pull request.
+
 ## Benchmarks
 
 The scripts in `bench/` produce the measurements in [DESIGN.md Appendix A](DESIGN.md#appendix-a-measurements). They need [uv](https://docs.astral.sh/uv/), Python 3.14, and macOS or Linux.
