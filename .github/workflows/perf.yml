@@ -1,0 +1,48 @@
+# bench/e2e.py's 50,000-page crawl, on each push to main (docs/implementation-plan.md §6). It
+# fails if a page is lost, or if pages/s, the coordinator's CPU per page or its peak RSS
+# crosses its gate. It isn't a required check: GitHub's runners differ by more than most
+# regressions would, so the gates sit beyond the slowest of them (DESIGN.md A.15).
+name: Performance
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UV_LOCKED: "1"
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          resolution-strategy: lowest
+          python-version: "3.14"
+      # The gates are about a quarter beyond the slowest of ten runs on GitHub's runners,
+      # which were on AMD EPYC 7763s and 9V74s; on an EPYC 9V45 the crawl is half as fast
+      # again. The crawl needs the crawler's own dependencies only, not the bench group.
+      - name: Crawl 50,000 synthetic pages
+        run: >-
+          uv run python bench/e2e.py --json e2e.json
+          --min-pages-per-second 470 --max-cpu-us-per-page 880 --max-peak-rss-mib 120
+      - name: Add the results to the job summary
+        if: always() && hashFiles('e2e.json') != ''
+        run: |
+          jq -r '"| Pages | Pages/s | Coordinator CPU per page | Coordinator peak RSS | Runner |",
+                 "|---|---|---|---|---|",
+                 "| \(.pages) | \(.pages_per_second) | \(.coordinator_cpu_us_per_page) µs | \(.coordinator_peak_rss_mib) MiB | \(.setup.cpu_model) |"' \
+            e2e.json >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always() && hashFiles('e2e.json') != ''
+        with:
+          name: e2e
+          path: e2e.json

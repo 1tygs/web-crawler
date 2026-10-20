@@ -3,6 +3,7 @@ its peak memory (docs/implementation-plan.md §6).
 
 Usage: uv run --group bench python bench/e2e.py [--pages 50000] [--latency 0.05]
            [--max-concurrency 64] [--parse-workers auto] [--server-processes 4] [--json FILE]
+           [--min-pages-per-second R] [--max-cpu-us-per-page US] [--max-peak-rss-mib MIB]
 
 A pre-fork aiohttp server, in processes of its own, serves --pages pages at /p/0 to /p/N-1, each
 after --latency seconds, gzipped: a page has about 70 KB of HTML with 120 links and some text,
@@ -10,6 +11,10 @@ like the average page DESIGN.md §7 assumes. Page n links to page n+1, so that e
 reached, and to 119 others picked at random, as on a real site, plus two other hosts. The crawl
 runs in this process as the crawl command runs it, writing to /dev/null, so this process's own
 CPU is the coordinator's: the parser processes' isn't counted.
+
+The --min and --max options are gates, as CI's performance job runs them: the results are
+printed and written first, then the run fails if a gate does, or if the crawl didn't print
+every page with exit code 0.
 """
 import argparse, asyncio, collections, gzip, json, logging, os, platform, random, re, resource
 import signal, socket, statistics
@@ -90,6 +95,18 @@ def wait_for(port, timeout=30.0):
         except OSError:
             time.sleep(0.05)
     raise SystemExit(f"the server didn't start listening on port {port}")
+
+
+def cpu_model():
+    """The processor's name, as the system gives it: a CI runner's tells its pages/s apart."""
+    try:
+        if sys.platform == "darwin":
+            return subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True,
+                                  text=True, check=True).stdout.strip()
+        with open("/proc/cpuinfo") as file:
+            return next(line.split(":", 1)[1].strip() for line in file if line.startswith("model name"))
+    except (OSError, StopIteration, subprocess.CalledProcessError):
+        return platform.processor()
 
 
 def cpu_seconds(who):
@@ -174,6 +191,9 @@ def main():
     parser.add_argument("--parse-workers", default="auto")
     parser.add_argument("--server-processes", type=int, default=4)
     parser.add_argument("--json", metavar="FILE", help="also write the results here")
+    parser.add_argument("--min-pages-per-second", type=float, metavar="R")
+    parser.add_argument("--max-cpu-us-per-page", type=float, metavar="US")
+    parser.add_argument("--max-peak-rss-mib", type=float, metavar="MIB")
     parser.add_argument("--serve", type=int, metavar="PORT", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.serve:
@@ -192,13 +212,35 @@ def main():
         "pages": args.pages, "latency_s": args.latency, "max_concurrency": args.max_concurrency,
         "parse_workers": args.parse_workers, "server_processes": args.server_processes,
         "machine": platform.machine(), "system": platform.system(), "python": platform.python_version(),
-        "cpus": os.cpu_count(),
+        "cpus": os.cpu_count(), "cpu_model": cpu_model(),
     }
     text = json.dumps(results, indent=2)
     print(text)
     if args.json:
         with open(args.json, "w") as file:
             file.write(text + "\n")
+    failed = gates(args, results)
+    for line in failed:
+        print(f"gate failed: {line}", file=sys.stderr)
+    if failed:
+        raise SystemExit(1)
+
+
+def gates(args, results):
+    """What fails the run: every page printed, with exit code 0, and the measures within the
+    gates given."""
+    failed = []
+    if (results["pages"], results["exit_code"]) != (args.pages, 0):
+        failed.append(f"{results['pages']:,} of {args.pages:,} pages, exit code {results['exit_code']}")
+    measures = [
+        ("pages/s", results["pages_per_second"], args.min_pages_per_second, -1),
+        ("coordinator CPU per page (us)", results["coordinator_cpu_us_per_page"], args.max_cpu_us_per_page, 1),
+        ("coordinator peak RSS (MiB)", results["coordinator_peak_rss_mib"], args.max_peak_rss_mib, 1),
+    ]
+    for name, value, gate, sign in measures:
+        if gate is not None and (value - gate) * sign > 0:
+            failed.append(f"{name} {value:,} {'below' if sign < 0 else 'above'} {gate:,}")
+    return failed
 
 
 if __name__ == "__main__":
