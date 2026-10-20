@@ -45,6 +45,8 @@ Checked on 2026-10-20 against the versions pinned in Appendix A (Python 3.14.6, 
 | Python's codec names aren't WHATWG labels: `latin1` and `ascii` mean iso8859-1 and ascii to Python but windows-1252 to a browser; `x-mac-cyrillic`, `koi8-ru` and `unicode11utf8` don't exist in Python | A WHATWG label table (`encodings.py`) maps labels to Python codecs |
 | Python 3.14 has `ProcessPoolExecutor.kill_workers()`, `os.process_cpu_count()` and `asyncio.run(loop_factory=)`. `PYTHON_CPU_COUNT` and `-X cpu_count` override `process_cpu_count()`; isolated mode (`-I`) ignores the variable | The second Ctrl-C calls `kill_workers()`. uvloop comes in through `loop_factory`. The cgroup cap applies only when no override is set (§5.12) |
 | Protego has `can_fetch`, `crawl_delay`, `request_rate` and `sitemaps`, and matches percent-encoding equivalents (`/~j` against `/%7Ej`) | Paths need no normalization before `can_fetch` |
+| Found in PR 1: aiohttp's `trust_env=True` reads `~/.netrc` and looks up the proxy on a thread for every request, 162.5 µs of CPU per request against 26.9 µs (DESIGN A.4), and sends `~/.netrc` credentials to the crawled host | `trust_env=False`. The transport reads `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY` once |
+| Found in PR 1: aiohttp 3.14 deprecates `proxy_auth`, but the `proxy_headers` it recommends instead reach the proxy only on the CONNECT that tunnels `https://` | Proxy credentials go on the request itself for `http://`, and in `proxy_headers` for `https://` |
 
 ## 3. Repository layout and tooling
 
@@ -214,7 +216,7 @@ class WorkerContext:                      # sent once, through the pool initiali
 
 ### 5.5 `parse.py`: the worker
 
-`init_worker(ctx)` stores the `WorkerContext` in a module global, sets SIGINT and SIGTERM to ignored, then unblocks them (DESIGN §4.3). `parse_page(job) -> ParseResult`:
+`parse_page(job, ctx) -> ParseResult` takes the `WorkerContext` as an argument, so it stays pure and the inline path needs no global (a refinement made in PR 1). In the pool, `init_worker(ctx)` stores the context in a module global, sets SIGINT and SIGTERM to ignored, then unblocks them (DESIGN §4.3), and each job runs a module-level wrapper that calls `parse_page(job, ctx)`, so the context still crosses to a worker only once. `parse_page`:
 
 1. `decode_body(job.body, job.content_encoding, ctx.max_bytes)`. On `ContentDecodeError`, return `ParseResult(b"", [], 0, 0, "bad_encoding")`.
 2. `pick_charset`. UTF-8 goes to lexbor as bytes, with no copy; other charsets go as `bytes.decode(codec, "replace")`.
@@ -319,7 +321,7 @@ Golden fixtures (`tests/fixtures/parse/*.html` with expected JSON) cover:
 - **Protocols** as in DESIGN §6.2. `read(limit) -> (bytes, more)` can be called repeatedly to stream in steps. `more` is exact because the implementation reads `limit + 1` bytes and keeps the extra one buffered.
 - **`AiohttpTransport` configuration:**
   - `TCPConnector(limit = limit_per_host = max_concurrency + 4, ttl_dns_cache=300, keepalive_timeout=30)`;
-  - `ClientSession(auto_decompress=False, trust_env=True, cookie_jar=CookieJar(unsafe=True), timeout=ClientTimeout(total=--timeout, sock_connect=10, sock_read=20), …)`, with the raised header limits and default headers for User-Agent, Accept and `Accept-Encoding: gzip, deflate, br, zstd`. `unsafe=True` lets IP-address hosts set cookies, as browsers do;
+  - `ClientSession(auto_decompress=False, trust_env=False, cookie_jar=CookieJar(unsafe=True), timeout=ClientTimeout(total=--timeout, sock_connect=10, sock_read=20), …)`, with the raised header limits and default headers for User-Agent, Accept and `Accept-Encoding: gzip, deflate, br, zstd`. `unsafe=True` lets IP-address hosts set cookies, as browsers do. Proxies come from the environment, read once (§2);
   - `ssl=False` under `--insecure`;
   - `resolver` and `ssl_context` arguments exist for tests only.
 - **Error mapping.** aiohttp's exceptions become `TransportError(kind)`, so nothing above this module imports aiohttp. The kinds are DNS, CONNECT, TLS, CONNECT_TIMEOUT, TIMEOUT, RESET, PAYLOAD (cut off mid-body), PROTOCOL and INVALID_URL.
@@ -354,7 +356,7 @@ It loops over at most 10 hops. Each iteration opens the request, feeds the limit
 
 ### 5.13 `output.py`
 
-- **`Sink` protocol:** `write(record)`, `backlogged` and `close()`. This is the seam DESIGN §14.1 names.
+- **`Sink` protocol:** `start(on_drained)`, `write(record)`, `backlogged` and `close()`. This is the seam DESIGN §14.1 names. `start` hands the sink the callback that wakes the dispatcher, since the CLI builds the sink before the event loop runs.
 - **`ThreadedSink(binary_stream)`** puts records on a `SimpleQueue` for a writer thread:
   - each batch of queued records goes out in one `write()`, and the thread flushes at most every 100 ms and whenever it's idle;
   - the backlog is two single-writer counters, bytes enqueued on the loop thread and bytes written on the writer thread, so no lock is needed;

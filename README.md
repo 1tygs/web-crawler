@@ -2,7 +2,7 @@
 
 A fast, accurate and polite web crawler for the command line, written in Python. Give it a start URL and it crawls that host, printing each page's URL followed by every link found on the page.
 
-> **Status: design stage.** [DESIGN.md](DESIGN.md) is the proposed design, and [docs/implementation-plan.md](docs/implementation-plan.md) is the plan for building v1; the crawler itself isn't implemented yet. The measurements behind the design can be reproduced with the scripts in [`bench/`](bench/).
+> **Status: in development, step 1 of the 5 in [the v1 plan](docs/implementation-plan.md).** The walking skeleton crawls: `crawl URL` fetches the start URL's host breadth-first, eight requests at a time, and prints each page's links. It doesn't read robots.txt yet, so point it only at sites you run. Accuracy, speed, robustness, and the limits and output options come in the next four steps; until then [DESIGN.md](DESIGN.md) describes more than the code does. The measurements behind the design can be reproduced with the scripts in [`bench/`](bench/).
 
 ## Planned usage
 
@@ -47,7 +47,17 @@ The brief asks which tools were used, including AI, and how the work was checked
   - **Claude Code**, Anthropic's coding agent, in the Claude desktop app with Claude Opus 5.5. The first draft of the design came from a session that started from the brief through the `system-design` skill of Anthropic's engineering plugin. It installed candidate libraries in a scratch virtual environment, then wrote and ran the benchmarks for HTML parsers, URL resolution, HTTP clients, the parse pipeline, robots.txt matching and memory per URL on the development machine. It picked each technology from those results and wrote DESIGN.md with the scripts moved into `bench/`. Separate short sessions wrote the README and set up the public repository and licence. In a review session it reviewed the design against this brief, wrote and ran the checks and simulations in Appendix A.9–A.13, and applied the resulting changes to DESIGN.md, including [ADR-001](docs/adr/001-concurrency-control.md).
 - **Checking AI output.** Claims were tested rather than taken on trust, and the scripts that test them are kept in `bench/`. The review's simulations rejected the first draft's limiter law and its `--max-depth` rules, and caught a bug in the review's own first proposal for the limiter; re-running a real-site measurement changed one of its numbers (A.12).
 
+## Development
 
+You need [uv](https://docs.astral.sh/uv/) 0.12.15 or later; it installs Python 3.14 itself if necessary. The Makefile runs everything through uv, so there's no virtual environment to manage.
+
+```bash
+make check                    # ruff, mypy --strict and the tests with coverage
+make test PYTEST_ARGS="-x"    # just the tests
+uv run pre-commit install     # optional: ruff and mypy before each commit
+```
+
+CI runs the same targets on Linux and macOS for every pull request.
 
 ## Benchmarks
 
@@ -81,7 +91,7 @@ curl --compressed -o bench/fixtures/python.html https://www.python.org/
 | `python bench/ttfb_spread.py URL`               | How widely a real site's response times spread                                         | A.12     |
 
 
-- `client_bench.py` needs `python bench/server.py PAGE.html` running in another shell; it serves that page on 127.0.0.1:8899. `CLIENT` is one of `aiohttp`, `aiohttp+uvloop`, `aiohttp+uvloop+raw` (no decompression), `curl_cffi`, `niquests` or `httpx`.
+- `client_bench.py` needs `python bench/server.py PAGE.html` running in another shell; it serves that page on 127.0.0.1:8899. `CLIENT` is one of `aiohttp`, `aiohttp+uvloop`, `aiohttp+uvloop+raw` (no decompression), `curl_cffi`, `niquests` or `httpx`. Adding `+env` to an aiohttp client turns on `trust_env`.
 - `robots_bench.py` expects `wikipedia.html` and `wikipedia.robots.txt` from en.wikipedia.org, and `guardian.html` and `guardian.robots.txt` from [www.theguardian.com](http://www.theguardian.com).
 - `pool_check.py` takes a `MODE` of `ondemand`, `crash` or `sigint`, and `--method spawn` or `--method forkserver`. It and the two simulations use only the standard library.
 - `ttfb_spread.py` needs curl, and sends about 40 requests, one at a time, to the site you give it.

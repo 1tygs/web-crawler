@@ -1,0 +1,27 @@
+# Install with `uv run pre-commit install`. Every hook runs the version pinned in uv.lock
+# through uv, so pre-commit, `make check` and CI can't disagree.
+minimum_pre_commit_version: "4.4.0"
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check
+        entry: uv run ruff check --fix --force-exclude
+        language: unsupported
+        types_or: [python, pyi]
+        require_serial: true
+      - id: ruff-format
+        name: ruff format
+        entry: uv run ruff format --force-exclude
+        language: unsupported
+        types_or: [python, pyi]
+        require_serial: true
+      # mypy checks the whole project, as configured in pyproject.toml, rather than just the
+      # staged files: a change can break a file that wasn't touched.
+      - id: mypy
+        name: mypy
+        entry: uv run mypy
+        language: unsupported
+        types_or: [python, pyi]
+        pass_filenames: false
+        require_serial: true

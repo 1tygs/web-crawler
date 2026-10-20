@@ -1,0 +1,5 @@
+# Entries mypy's stubtest reports for typings/*.pyi that are deliberate.
+
+# The C type's __init__ has the generic (*args, **kwargs) signature, but any argument raises
+# TypeError, so the stub declares none.
+brotli.Decompressor.__init__

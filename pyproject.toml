@@ -1,0 +1,104 @@
+[build-system]
+requires = ["uv_build>=0.12.15,<0.13"]
+build-backend = "uv_build"
+
+[project]
+name = "web-crawler"
+version = "1.0.0.dev0"
+description = "A fast, accurate and polite single-host web crawler for the command line"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Tiago Delgado" }]
+requires-python = ">=3.14"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Framework :: AsyncIO",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Internet :: WWW/HTTP :: Indexing/Search",
+    "Typing :: Typed",
+]
+# Floors are the versions DESIGN.md §9 evaluated; caps stop at the next major version.
+# uv.lock holds the exact versions.
+dependencies = [
+    "ada-url>=4.0.0,<5",
+    "aiohttp>=3.14.5,<4",
+    "brotli>=1.2.0,<2",
+    "orjson>=3.13.0,<4",
+    "protego>=0.7.0,<1",
+    "selectolax>=1.0.1,<2",
+    "uvloop>=0.23.0,<1; sys_platform != 'win32'",
+]
+
+[project.urls]
+Repository = "https://github.com/1tygs/web-crawler"
+Design = "https://github.com/1tygs/web-crawler/blob/main/DESIGN.md"
+
+[project.scripts]
+crawl = "web_crawler.cli:main"
+
+[dependency-groups]
+dev = [
+    "coverage>=7.16.2",
+    "hypothesis>=6.170.5",
+    "mypy>=2.4.0",
+    "pre-commit>=4.7.0",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.17.1",
+    "trustme>=1.2.1",
+]
+
+[tool.uv]
+required-version = ">=0.12.15"
+
+[tool.ruff]
+line-length = 100
+# bench/ keeps the measurement scripts as they were run for DESIGN.md Appendix A.
+extend-exclude = ["bench"]
+
+[tool.ruff.format]
+# Code blocks in DESIGN.md and docs/ are laid out for reading, so ruff leaves Markdown alone.
+exclude = ["*.md"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "ASYNC", "PERF", "PT", "PL"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests compare against literal values and build fixtures with many parameters.
+"tests/**" = ["PLR2004", "PLR0913"]
+
+[tool.mypy]
+strict = true
+mypy_path = "typings"
+files = ["src", "tests"]
+warn_unreachable = true
+enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
+
+[tool.pytest]
+minversion = "9.0"
+testpaths = ["tests"]
+addopts = ["-ra"]
+strict = true
+filterwarnings = ["error"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.coverage.run]
+branch = true
+source_pkgs = ["web_crawler"]
+concurrency = ["thread", "multiprocessing"]
+parallel = true
+# Measure the CLI tests' child processes too.
+patch = ["subprocess"]
+
+[tool.coverage.report]
+# The walking skeleton is fully covered; lowering this needs a reason.
+fail_under = 100
+show_missing = true
+skip_covered = true
+exclude_also = ["if TYPE_CHECKING:", "if __name__ == .__main__.:", "@overload", "class .*\\(Protocol\\):"]
