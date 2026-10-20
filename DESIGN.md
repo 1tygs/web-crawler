@@ -192,7 +192,7 @@ Few sites will serve one client thousands of pages per second. The crawler's cei
   4. robots.txt ([§5.7](#57-robotstxt)).
   5. `--max-depth`.
 
-  Rejected keys also go into `seen`, so they aren't re-checked every time they're found. Depth rejections are the exception, so a later, shorter path can still admit them.
+  Rejected keys also go into `seen`, so they aren't re-checked every time they're found. Depth rejections are the exception, so a later, shorter path can still admit them. A redirect's target goes through the trap rules and robots.txt, but not the extension filter: it's followed, and its response says what it is. The checks cost about 0.6 µs per new URL on top of robots.txt's, and run once per URL, not per link.
 - **`--max-pages N`** is enforced when dispatching: a fetch starts only while pages printed plus fetches in flight is below N, so no page is fetched only to be thrown away. A fetch that ends without a page (an error, a non-HTML response, a redirect to a URL already claimed) frees its place. Exactly N records are printed, or fewer if the site is smaller.
 - **HSTS upgrade (RFC 6797), after v1.** Once an HTTPS response carries `Strict-Transport-Security`, in-scope `http://` links are upgraded to `https://` before the dedupe check, as browsers do. Legacy `http://` links then cost no redirect round-trip. Until then, redirect-aware dedupe ([§5.6](#56-url-normalization-and-dedupe)) collapses them for one extra request each.
 - **Exact depth under `--max-depth`.** Because of concurrency, a page can be reached by a longer path first. A two-level dispatch window makes the result independent of timing:

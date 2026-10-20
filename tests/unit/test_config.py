@@ -15,6 +15,12 @@ def test_defaults_follow_the_design() -> None:
     assert cfg.max_rps is None
     assert cfg.timeout == 60.0
     assert cfg.retries == 3
+    assert cfg.skip_extensions
+    assert (cfg.max_url_length, cfg.max_segment_repeats, cfg.max_query_variants) == (
+        2048,
+        3,
+        1000,
+    )
     assert cfg.max_page_bytes == 32 * MIB
     assert not cfg.all_urls
     assert cfg.max_pages is None
@@ -49,6 +55,9 @@ def test_is_immutable() -> None:
         ("give_up_after", math.nan, "give_up_after must be a positive number of seconds"),
         ("max_page_bytes", 0, "max_page_bytes must be at least 1"),
         ("retries", -1, "retries must be at least 0"),
+        ("max_url_length", 0, "max_url_length must be at least 1, not 0"),
+        ("max_segment_repeats", 0, "max_segment_repeats must be at least 1"),
+        ("max_query_variants", -5, "max_query_variants must be at least 1"),
         ("max_pages", 0, "max_pages must be at least 1"),
         ("user_agent", "", "user_agent must be non-blank ASCII"),
         ("user_agent", "   ", "user_agent must be non-blank ASCII"),

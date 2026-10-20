@@ -973,6 +973,35 @@ async def test_403s_that_nothing_else_can_settle_are_final() -> None:
     assert report.stats.failures == {"HTTP 403": 2}
 
 
+async def test_links_that_a_rule_rejects_are_printed_and_counted_not_crawled() -> None:
+    replies: dict[str, Answer | list[Answer]] = {
+        START: html("/report.pdf", "/logo.PNG", "/a/a/a/a", "/page"),
+        "https://example.com/page": html(),
+    }
+    transport, sink = FakeTransport(replies), MemorySink()
+    report = await crawl(Config(start_url=START), sink, transport=transport)
+    assert pages(transport) == [START, "https://example.com/page"]
+    assert sink.records[0].count(b"\n  ") == 4  # all four printed
+    assert report.rejected == {"file extension": 2, "path segment repeated": 1}
+    assert (
+        "not crawled: file extension (2, such as https://example.com/report.pdf), path "
+        "segment repeated (1, such as https://example.com/a/a/a/a)" in report.summary
+    )
+
+
+async def test_no_skip_extensions_crawls_every_link() -> None:
+    replies: dict[str, Answer | list[Answer]] = {
+        START: html("/old.pdf"),
+        "https://example.com/old.pdf": Reply(301, {"Location": "/new"}),
+        "https://example.com/new": html(),
+    }
+    transport = FakeTransport(replies)
+    cfg = Config(start_url=START, skip_extensions=False)
+    report = await crawl(cfg, MemorySink(), transport=transport)
+    assert report.stats.pages == 2
+    assert not report.rejected
+
+
 async def test_records_stream_in_the_order_pages_complete() -> None:
     # DESIGN.md §2.4: output isn't sorted. /slow is linked first, and printed last.
     replies: dict[str, Answer | list[Answer]] = {

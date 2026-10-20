@@ -7,7 +7,13 @@ from hypothesis import strategies as st
 from web_crawler.frontier import Admission, Frontier, Hop
 from web_crawler.robots import RobotsPolicy, RobotsTxt
 from web_crawler.types import CrawlItem
-from web_crawler.urls import Scope
+from web_crawler.urls import (
+    LONG_URL,
+    QUERY_VARIANTS,
+    REPEATED_SEGMENT,
+    SKIPPED_EXTENSION,
+    Scope,
+)
 
 SCOPE = Scope.for_url("https://example.com/")
 NOW = 100.0  # the clock's reading, for tests where no retry is waiting
@@ -207,3 +213,96 @@ def test_admit_hop_to_a_url_robots_txt_disallows() -> None:
     assert url in admission.seen
     assert admission.rejected == {"robots.txt": 1}
     assert admission.admit_hop(set(), url, url) is Hop.CLAIMED  # checked once
+
+
+def links(*urls: str) -> list[tuple[str, str]]:
+    return [(url, url) for url in urls]
+
+
+def test_admit_rejects_what_a_trap_rule_or_the_extension_filter_does() -> None:
+    frontier = Frontier()
+    admission = Admission(frontier, SCOPE, disallowing("/private"))
+    long = "https://example.com/" + "x" * 2100
+    admitted = admission.admit(
+        links(
+            long,
+            "https://example.com/a/a/a/a",
+            "https://example.com/report.pdf",
+            "https://example.com/style.css",
+            "https://example.com/private/page",
+            "https://example.com/page",
+        ),
+        depth=1,
+    )
+    assert admitted == 1
+    assert admission.rejected == {
+        LONG_URL: 1,
+        REPEATED_SEGMENT: 1,
+        SKIPPED_EXTENSION: 2,
+        "robots.txt": 1,
+    }
+    assert admission.examples[SKIPPED_EXTENSION] == [
+        "https://example.com/report.pdf",
+        "https://example.com/style.css",
+    ]
+    # Claimed: found again, they're neither checked nor counted again.
+    assert admission.admit(links(long, "https://example.com/report.pdf"), depth=2) == 0
+    assert admission.rejected[SKIPPED_EXTENSION] == 2
+    assert [item.url for item in pop_all(frontier)] == ["https://example.com/page"]
+
+
+def test_the_extension_filter_can_be_turned_off() -> None:
+    frontier = Frontier()
+    admission = Admission(frontier, SCOPE, skip_extensions=False)
+    assert admission.admit(links("https://example.com/old.pdf"), depth=1) == 1
+    assert not admission.rejected
+
+
+def test_a_path_may_have_a_limited_number_of_query_strings() -> None:
+    frontier = Frontier()
+    admission = Admission(frontier, SCOPE, max_query_variants=3)
+    calendar = [f"https://example.com/cal?month={n}" for n in range(5)]
+    assert admission.admit(links(*calendar), depth=1) == 3
+    assert admission.rejected == {QUERY_VARIANTS: 2}
+    assert admission.examples[QUERY_VARIANTS] == calendar[3:]
+    # Other paths, and the path without a query, have their own count.
+    others = ["https://example.com/cal", "https://example.com/list?page=1"]
+    assert admission.admit(links(*others), depth=1) == 2
+    # Another scheme is another path, for this count.
+    assert admission.admit(links("http://example.com/cal?month=9"), depth=1) == 1
+
+
+def test_query_variants_count_only_new_urls() -> None:
+    frontier = Frontier()
+    admission = Admission(frontier, SCOPE, max_query_variants=2)
+    for _ in range(5):
+        admission.admit(links("https://example.com/cal?m=1", "https://example.com/cal?m=2"), 1)
+    assert not admission.rejected
+
+
+@pytest.mark.parametrize(
+    ("url", "hop", "rule"),
+    [
+        ("https://example.com/" + "x" * 2100, Hop.TRAP, LONG_URL),
+        ("https://example.com/a/a/a/a", Hop.TRAP, REPEATED_SEGMENT),
+        ("https://example.com/private/x", Hop.DISALLOWED, "robots.txt"),
+        # A redirect's target is followed whatever its extension: its response says what
+        # it is.
+        ("https://example.com/report.pdf", Hop.FOLLOW, None),
+    ],
+)
+def test_admit_hop_applies_the_trap_rules_and_robots_txt(
+    url: str, hop: Hop, rule: str | None
+) -> None:
+    admission = Admission(Frontier(), SCOPE, disallowing("/private"))
+    assert admission.admit_hop(set(), url, url) is hop
+    assert admission.rejected == ({rule: 1} if rule else {})
+    assert url in admission.seen
+
+
+def test_admit_hop_counts_query_variants() -> None:
+    admission = Admission(Frontier(), SCOPE, max_query_variants=1)
+    url = "https://example.com/cal?month=2"
+    assert admission.admit_hop(set(), "https://example.com/cal?month=1", "1") is Hop.FOLLOW
+    assert admission.admit_hop(set(), url, url) is Hop.TRAP
+    assert admission.rejected == {QUERY_VARIANTS: 1}

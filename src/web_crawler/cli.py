@@ -78,6 +78,14 @@ def build_parser() -> argparse.ArgumentParser:
         "(default: %(default)s)",
     )
     parser.add_argument(
+        "--no-skip-extensions",
+        dest="skip_extensions",
+        action="store_false",
+        help="crawl links to files that are almost never HTML too, such as images, PDFs, "
+        "archives, fonts, style sheets and scripts, as for a site whose /old.pdf redirects "
+        "to a page; they're printed either way",
+    )
+    parser.add_argument(
         "--ignore-robots",
         action="store_true",
         help="don't fetch or obey robots.txt: for crawling your own site",
@@ -126,6 +134,7 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
             max_rps=args.max_rps,
             parse_workers=args.parse_workers,
             retries=args.retries,
+            skip_extensions=args.skip_extensions,
             ignore_robots=args.ignore_robots,
             strict_host=args.strict_host,
             insecure=args.insecure,

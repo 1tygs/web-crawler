@@ -220,6 +220,20 @@ async def test_does_not_follow_a_redirect_out_of_scope(location: str) -> None:
     assert transport.requested == [START]
 
 
+async def test_does_not_follow_a_redirect_to_a_trap() -> None:
+    location = "/a/a/a/a"
+    outcome, transport, _ = await fetch({START: Reply(301, {"Location": location})})
+    target = "https://example.com/a/a/a/a"
+    assert outcome == Final(
+        "redirect to a trap",
+        f"HTTP 301 to {target}, which a trap rule rejects",
+        (START,),
+        301,
+        target,
+    )
+    assert transport.requested == [START]
+
+
 async def test_claims_each_redirect_target_before_requesting_it() -> None:
     admission = claiming()
     replies: Replies = {

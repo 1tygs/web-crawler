@@ -191,6 +191,7 @@ class _Redirect:
 _STOPPED = {
     Hop.OUT_OF_SCOPE: ("redirect out of scope", "outside the crawl's scope"),
     Hop.DISALLOWED: ("redirect disallowed", "which robots.txt disallows"),
+    Hop.TRAP: ("redirect to a trap", "which a trap rule rejects"),
 }
 
 

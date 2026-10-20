@@ -118,7 +118,14 @@ async def crawl(  # noqa: PLR0913  (the collaborators that tests replace)
     start_url, scheme_was_implicit = normalize_start(cfg.start_url)
     stats = Stats(started=clock())
     frontier = Frontier()
-    admission = Admission(frontier, Scope.for_url(start_url))
+    admission = Admission(
+        frontier,
+        Scope.for_url(start_url),
+        max_url_length=cfg.max_url_length,
+        max_segment_repeats=cfg.max_segment_repeats,
+        max_query_variants=cfg.max_query_variants,
+        skip_extensions=cfg.skip_extensions,
+    )
     owned = transport is None
     if transport is None:
         transport = AiohttpTransport(cfg)
