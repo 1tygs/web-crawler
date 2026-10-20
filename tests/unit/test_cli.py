@@ -55,6 +55,19 @@ def test_max_pages_below_1_is_a_usage_error(capsys: pytest.CaptureFixture[str]) 
     assert "max_pages must be at least 1, not 0" in capsys.readouterr().err
 
 
+def test_max_depth() -> None:
+    assert parse_args(["https://example.com/", "--max-depth", "2"]).max_depth == 2
+    assert parse_args(["https://example.com/", "--max-depth", "0"]).max_depth == 0
+    assert parse_args(["https://example.com/"]).max_depth is None
+
+
+def test_max_depth_below_0_is_a_usage_error(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        parse_args(["https://example.com/", "--max-depth", "-1"])
+    assert exit_info.value.code == 2
+    assert "max_depth must be at least 0, not -1" in capsys.readouterr().err
+
+
 def test_speed_options() -> None:
     speed = ["--max-concurrency", "10", "--max-rps", "2.5", "--parse-workers", "3"]
     cfg = parse_args(["https://example.com/", *speed])
@@ -164,7 +177,8 @@ def test_help_exits_zero(capsys: pytest.CaptureFixture[str]) -> None:
     assert exit_info.value.code == 0
     usage = " ".join(capsys.readouterr().out.split())  # however the terminal's width wraps it
     assert usage.startswith(
-        "usage: crawl [-h] [--all-urls] [--max-pages N] [--max-concurrency N] [--max-rps R] "
+        "usage: crawl [-h] [--all-urls] [--max-pages N] [--max-depth N] [--max-concurrency N] "
+        "[--max-rps R] "
         "[--parse-workers N] [--timeout S] [--max-page-bytes N] [--retries N] "
         "[--no-skip-extensions] [--ignore-robots]"
     )
@@ -174,7 +188,7 @@ def test_help_exits_zero(capsys: pytest.CaptureFixture[str]) -> None:
     ("argv", "message"),
     [
         ([], "the following arguments are required: URL"),
-        (["https://example.com/", "--max-dept", "2"], "unrecognized arguments: --max-dept 2"),
+        (["https://example.com/", "--max-deph", "2"], "unrecognized arguments: --max-deph 2"),
         (["https://a.example/", "https://b.example/"], "unrecognized arguments"),
     ],
 )

@@ -37,6 +37,7 @@ class Config:
     # The most of a page's body that's read, as sent, and that it decompresses to.
     max_page_bytes: int = 32 * MIB
     max_pages: int | None = None  # stop once this many pages are printed
+    max_depth: int | None = None  # crawl only pages within this many links of the start URL
     all_urls: bool = False  # print every URL-bearing attribute; still crawl only links
     ignore_robots: bool = False  # for crawling your own site
     strict_host: bool = False  # a start URL that redirects to its www. variant can't start
@@ -79,6 +80,7 @@ _AT_LEAST = {
     "retries": 0,
     "max_page_bytes": 1,
     "max_pages": 1,
+    "max_depth": 0,
     "max_url_length": 1,
     "max_segment_repeats": 1,
     "max_query_variants": 1,

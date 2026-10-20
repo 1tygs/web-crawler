@@ -1057,6 +1057,94 @@ async def test_a_page_over_the_size_cap_is_parsed_as_far_as_it_got() -> None:
     assert ", 1 cut short" in report.summary
 
 
+def chain(*steps: tuple[str, Answer | list[Answer]]) -> dict[str, Answer | list[Answer]]:
+    return {f"https://example.com{path}": answer for path, answer in steps}
+
+
+async def test_max_depth_crawls_only_pages_within_n_links() -> None:
+    replies = {START: html("/1", "/1b")} | chain(
+        ("/1", html("/2")), ("/1b", html("/2")), ("/2", html("/3", "/3b")), ("/3", html())
+    )
+    transport, sink = FakeTransport(replies), MemorySink()
+    report = await crawl(Config(start_url=START, max_depth=2), sink, transport=transport)
+    assert report.exit_code is ExitCode.OK
+    assert sorted(pages(transport)) == [
+        START,
+        *(f"https://example.com/{p}" for p in ["1", "1b", "2"]),
+    ]
+    assert len(sink.records) == 4
+    assert report.unique_urls == 6  # /3 and /3b were found, if not crawled
+    assert report.rejected == {"depth limit": 2}
+    assert report.examples == {"depth limit": ["https://example.com/3", "https://example.com/3b"]}
+    assert "not crawled: depth limit (2, such as https://example.com/3)" in report.summary
+
+
+async def test_max_depth_0_crawls_the_start_url_alone() -> None:
+    transport = FakeTransport({START: html("/a", "/b")})
+    report = await crawl(Config(start_url=START, max_depth=0), MemorySink(), transport=transport)
+    assert pages(transport) == [START]
+    assert report.stats.pages == 1
+    assert report.rejected == {"depth limit": 2}
+
+
+def shortcut(slow: Answer | list[Answer]) -> dict[str, Answer | list[Answer]]:
+    """A site where /x is 3 links from the start through /fast and /m, and 2 through /slow,
+    which answers late; /y, on /x, is 3 links from the start at most."""
+    return {START: html("/fast", "/slow")} | chain(
+        ("/fast", html("/m")),
+        ("/m", html("/x")),
+        ("/slow", slow),
+        ("/x", html("/y")),
+        ("/y", html()),
+    )
+
+
+@pytest.mark.parametrize(
+    "slow",
+    [html("/x", delay=0.05), [ErrorKind.RESET, html("/x")]],
+    ids=["a slow page", "a page tried again"],
+)
+async def test_max_depth_waits_for_shorter_paths(slow: Answer | list[Answer]) -> None:
+    # /x is found 3 links from the start first, while /slow, which links to it, is still
+    # to finish. Dispatched then, /x would put /y 4 links away, beyond the limit; the window
+    # holds it back until /slow finishes, which lowers it to 2, so /y is crawled.
+    transport = FakeTransport(shortcut(slow))
+    cfg = Config(start_url=START, max_depth=3)
+    report = await crawl(cfg, MemorySink(), transport=transport, rng=Fixed(0.2))
+    assert "https://example.com/y" in pages(transport)
+    assert report.stats.pages == 6
+    assert not report.rejected
+
+
+async def test_without_max_depth_a_page_found_by_a_longer_path_keeps_that_depth() -> None:
+    transport = FakeTransport(shortcut(html("/x", delay=0.05)))
+    report = await crawl(Config(start_url=START), MemorySink(), transport=transport)
+    assert report.stats.pages == 6
+    assert pages(transport).index("https://example.com/x") < pages(transport).index(
+        "https://example.com/slow"
+    )
+
+
+async def test_max_depth_waits_for_403s_held_until_their_run_is_settled() -> None:
+    # /forbidden's 403 is held, and while it is, the window holds back /deep, 3 links away.
+    # Nothing else can settle the run, so the 403 is final, and the window moves on.
+    replies = {START: html("/a", "/forbidden")} | chain(
+        ("/a", html("/b")),
+        ("/b", html("/deep")),
+        ("/forbidden", Reply(403, HTML, delay=0.05)),
+        ("/deep", html()),
+    )
+    transport = FakeTransport(replies)
+    async with asyncio.timeout(10):  # a crawl that waits on the 403 for ever fails
+        report = await crawl(
+            Config(start_url=START, max_depth=3), MemorySink(), transport=transport
+        )
+    assert report.exit_code is ExitCode.OK
+    assert pages(transport)[-1] == "https://example.com/deep"
+    assert report.stats.pages == 4
+    assert report.stats.failures == {"HTTP 403": 1}
+
+
 async def test_records_stream_in_the_order_pages_complete() -> None:
     # DESIGN.md §2.4: output isn't sorted. /slow is linked first, and printed last.
     replies: dict[str, Answer | list[Answer]] = {

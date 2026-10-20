@@ -3,6 +3,7 @@
 import asyncio
 import gzip
 import os
+import random
 import signal
 import sys
 import time
@@ -16,7 +17,7 @@ import brotli
 import pytest
 from aiohttp import web
 
-from tests.support.bench import make_site
+from tests.support.bench import bfs, make_site
 from tests.support.command import CRAWL, run, split_records
 from tests.support.graphs import expected_records, graph_site, href
 from tests.support.site import HTML, Handler, Resource, Site, page, redirect, unused_port
@@ -240,6 +241,27 @@ async def test_random_sites_match_breadth_first_ground_truth(
     assert report.exit_code is ExitCode.OK
     assert sorted(sink.records) == expected_records(site.origin, graph)
     assert max(Counter(site.targets()).values()) == 1  # no URL requested twice
+
+
+@pytest.mark.parametrize("seed", range(4))
+async def test_max_depth_matches_breadth_first_ground_truth(seed: int, parse_workers: int) -> None:
+    # Pages answer after random delays, so fetches complete in an order unlike the
+    # breadth-first one, and a page is often found first by a longer path: the crawl still
+    # prints exactly the pages within --max-depth links of the start.
+    graph = make_site(seed, pages=300, branching=3.0, cross_links=2)
+    depths = sorted(bfs(graph).values())
+    max_depth = depths[len(depths) // 2]  # through the middle of the site
+    rng = random.Random(seed)
+    delays = {node: rng.choice([0.0, 0.0, 0.002, 0.02]) for node in range(len(graph))}
+    async with Site({}) as site:
+        site.resources = graph_site(site.origin, graph, delays=delays)
+        sink = MemorySink()
+        cfg = Config(start_url=site.url(), max_depth=max_depth, parse_workers=parse_workers)
+        report = await crawl(cfg, sink)
+    assert report.exit_code is ExitCode.OK
+    assert sorted(sink.records) == expected_records(site.origin, graph, max_depth=max_depth)
+    assert max(Counter(site.targets()).values()) == 1  # no URL requested twice
+    assert report.rejected["depth limit"] > 0
 
 
 async def test_the_crawl_command_prints_the_ground_truth(parse_workers: int) -> None:

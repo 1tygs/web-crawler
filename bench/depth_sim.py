@@ -11,6 +11,7 @@ heavy-tailed per-page latency, compared against breadth-first-search ground trut
           re-admit them when the page is found shallower, recursively through other such pages
   window  DESIGN.md §5.1 now: no stored links; an item at depth d is dispatched only when nothing at
           depth <= d-2 is still queued or in flight; queued items are lowered as before
+  crawler the window as the crawler runs it: its own Frontier and Admission (web_crawler.frontier)
 """
 import collections
 import heapq
@@ -18,6 +19,9 @@ import math
 import random
 import statistics
 import sys
+
+from web_crawler.frontier import Admission, Frontier
+from web_crawler.urls import Scope
 
 
 def make_site(rng, n, branching, cross):
@@ -54,6 +58,8 @@ def bfs(adj):
 
 
 def crawl(adj, lat, max_depth, conc, rule):
+    if rule == "crawler":
+        return crawl_with_frontier(adj, lat, max_depth, conc)
     depth = {0: 0}
     state = {0: "queued"}
     queues = collections.defaultdict(collections.deque)
@@ -125,6 +131,40 @@ def crawl(adj, lat, max_depth, conc, rule):
     return fetched, t, lowered_in_flight
 
 
+def crawl_with_frontier(adj, lat, max_depth, conc):
+    """The crawler's own Frontier and Admission, driven as crawl() drives the rules above:
+    pages are keys, dispatched from the frontier while fewer than conc are in flight."""
+    frontier = Frontier(max_depth)
+    admission = Admission(frontier, Scope.for_url("https://example.com/"))
+    admission.admit([("0", "0")], 0)
+    t, seq, events, fetched = 0.0, 0, [], set()
+    while True:
+        while len(events) < conc and (item := frontier.pop(t)) is not None:
+            heapq.heappush(events, (t + lat[int(item.key)], seq, item))
+            seq += 1
+        if not events:
+            break
+        t, _, item = heapq.heappop(events)
+        u = int(item.key)
+        fetched.add(u)
+        admission.admit([(str(c), str(c)) for c in adj[u]], item.depth + 1)
+        frontier.finish(item)
+    return fetched, t, 0  # it never lowers an item in flight: it can't
+
+
+def scenario(seed, n, branching, cross):
+    """A seeded site; the --max-depth that cuts through its middle; the pages within it; and
+    each page's latency, log-normal with a median of 100 ms and a heavy tail."""
+    rng = random.Random(seed)
+    adj = make_site(rng, n, branching, cross)
+    dist = bfs(adj)
+    depths = sorted(dist.values())
+    max_depth = depths[len(depths) // 2]
+    truth = {v for v, d in dist.items() if d <= max_depth}
+    lat = [rng.lognormvariate(math.log(0.1), 1.0) for _ in range(n)]
+    return adj, lat, max_depth, truth
+
+
 def main(seeds):
     families = {  # name: (pages, branching, cross-links per page)
         "sparse sites (3,000 pages, 1 cross-link per page)": (3000, 3.0, 1),
@@ -132,17 +172,12 @@ def main(seeds):
     }
     for name, (n, b, x) in families.items():
         wrong = collections.Counter()
-        missed = {r: [] for r in ("naive", "draft", "window")}
+        missed = {r: [] for r in ("naive", "draft", "window", "crawler")}
         lowered = 0
         ratio = []
+        same_time = 0  # sites where the crawler's frontier took exactly the window's time
         for seed in range(seeds):
-            rng = random.Random(seed)
-            adj = make_site(rng, n, b, x)
-            dist = bfs(adj)
-            depths = sorted(dist.values())
-            max_depth = depths[len(depths) // 2]  # the limit cuts through the middle of the site
-            truth = {v for v, d in dist.items() if d <= max_depth}
-            lat = [rng.lognormvariate(math.log(0.1), 1.0) for _ in range(n)]  # median 100 ms, heavy tail
+            adj, lat, max_depth, truth = scenario(seed, n, b, x)
             span = {}
             for rule, misses in missed.items():
                 fetched, span[rule], low = crawl(adj, lat, max_depth, 32, rule)
@@ -153,12 +188,14 @@ def main(seeds):
                 if rule == "window":
                     lowered += low
             ratio.append(span["window"] / span["draft"])
+            same_time += span["crawler"] == span["window"]
         print(f"\n{name}: {seeds} seeded sites, 32 requests in flight, --max-depth = median page depth")
         for rule, m in missed.items():
             print(f"  {rule:<7} runs with pages missed {wrong[rule]:>3}/{seeds}"
                   f"   pages missed per run: mean {statistics.mean(m):5.1f}, max {max(m):4}")
         print(f"  window: in-flight items lowered {lowered}; crawl time / draft crawl time: median "
               f"{statistics.median(ratio):.3f}, p95 {statistics.quantiles(ratio, n=20)[18]:.3f}")
+        print(f"  crawler: the same crawl time as window on {same_time}/{seeds} sites")
 
 
 if __name__ == "__main__":

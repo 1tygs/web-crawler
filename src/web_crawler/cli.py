@@ -48,6 +48,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="stop once N pages are printed; Ctrl-C also stops cleanly, printing whole records",
     )
     parser.add_argument(
+        "--max-depth",
+        type=int,
+        metavar="N",
+        help="crawl only pages within N links of the start URL, exactly, however the "
+        "fetches interleave; 0 crawls the start URL alone",
+    )
+    parser.add_argument(
         "--max-concurrency",
         type=int,
         metavar="N",
@@ -161,6 +168,7 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
             user_agent=args.user_agent,
             all_urls=args.all_urls,
             max_pages=args.max_pages,
+            max_depth=args.max_depth,
             max_concurrency=args.max_concurrency,
             max_rps=args.max_rps,
             parse_workers=args.parse_workers,

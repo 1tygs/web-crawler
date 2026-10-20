@@ -117,7 +117,7 @@ async def crawl(  # noqa: PLR0913  (the collaborators that tests replace)
     cfg.parse_workers processes."""
     start_url, scheme_was_implicit = normalize_start(cfg.start_url)
     stats = Stats(started=clock())
-    frontier = Frontier()
+    frontier = Frontier(cfg.max_depth)
     admission = Admission(
         frontier,
         Scope.for_url(start_url),
@@ -188,9 +188,8 @@ async def crawl(  # noqa: PLR0913  (the collaborators that tests replace)
                     await transport.close()
             finally:
                 sink.close()
-    return CrawlReport(
-        exit_code, stats, len(admission.seen), clock(), admission.rejected, admission.examples
-    )
+    rejected, examples = admission.rejections()
+    return CrawlReport(exit_code, stats, admission.unique_urls, clock(), rejected, examples)
 
 
 class _Limiter:
@@ -375,7 +374,7 @@ class _Start:
         assert not isinstance(outcome, Claimed)
         if isinstance(outcome, Page):
             return item, outcome  # it's outstanding until the dispatcher parses its page
-        self.frontier.finish()
+        self.frontier.finish(item)
         _count(self.stats, outcome)
         if self._problem is not None:
             return self._problem
@@ -579,10 +578,11 @@ class _Dispatcher:
             if item is None:
                 if (due := self.frontier.next_retry_at()) is not None:
                     self._wake_in(due - now)
-                elif self._in_pipeline == 0:
+                elif self._in_pipeline == 0 and (held := self.guard.settle()):
                     # Nothing else can settle a run of 403s now: they're final (DESIGN.md
-                    # §5.4).
-                    self._refused(self.guard.settle())
+                    # §5.4). Under --max-depth, that may open the window to what's queued.
+                    self._refused(held)
+                    continue
                 break
             self._gate.take(now)
             self._start(item)
@@ -786,7 +786,7 @@ class _Dispatcher:
         finally:
             self._in_pipeline -= 1
             if finished:
-                self.frontier.finish()
+                self.frontier.finish(item)
             self.pump()
 
     def _no_page(
@@ -826,9 +826,9 @@ class _Dispatcher:
 
     def _refused(self, held: list[CrawlItem]) -> None:
         """The block guard settled a run of 403s: the pages it held are forbidden."""
-        for _ in held:
+        for item in held:
             self.stats.failures["HTTP 403"] += 1
-            self.frontier.finish()
+            self.frontier.finish(item)
 
     def _retry(self, outcome: Retry) -> bool:
         """Put outcome's item in the retry heap, if it has retries left, and say whether it

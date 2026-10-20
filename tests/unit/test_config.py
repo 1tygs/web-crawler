@@ -24,6 +24,7 @@ def test_defaults_follow_the_design() -> None:
     assert cfg.max_page_bytes == 32 * MIB
     assert not cfg.all_urls
     assert cfg.max_pages is None
+    assert cfg.max_depth is None
     assert not cfg.ignore_robots
     assert cfg.robots_refresh == 24 * 3600  # RFC 9309 §2.4
     assert (cfg.first_probe, cfg.give_up_after) == (1.0, 300.0)
@@ -59,6 +60,7 @@ def test_is_immutable() -> None:
         ("max_segment_repeats", 0, "max_segment_repeats must be at least 1"),
         ("max_query_variants", -5, "max_query_variants must be at least 1"),
         ("max_pages", 0, "max_pages must be at least 1"),
+        ("max_depth", -1, "max_depth must be at least 0, not -1"),
         ("user_agent", "", "user_agent must be non-blank ASCII"),
         ("user_agent", "   ", "user_agent must be non-blank ASCII"),
         ("user_agent", "crawler/1.0 (über)", "user_agent must be non-blank ASCII"),
