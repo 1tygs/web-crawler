@@ -21,6 +21,7 @@ from http import HTTPStatus
 from types import FrameType
 from typing import Any, NoReturn
 
+from web_crawler import retry
 from web_crawler.config import Config
 from web_crawler.fetcher import (
     AdmissionHops,
@@ -31,17 +32,31 @@ from web_crawler.fetcher import (
     HopPolicy,
     NotPage,
     Page,
+    Retry,
     RobotsFetcher,
+    resume,
 )
 from web_crawler.frontier import Admission, Frontier, Hop
-from web_crawler.limiter import ConcurrencyLaw, Decision, PauseGate, rate_ceiling
+from web_crawler.limiter import (
+    BLOCKED_AFTER,
+    OPENS_AFTER,
+    BlockGuard,
+    CircuitBreaker,
+    ConcurrencyLaw,
+    Decision,
+    PauseGate,
+    Probes,
+    Verdict,
+    rate_ceiling,
+)
 from web_crawler.output import Sink
 from web_crawler.pool import ParseCrashed, Parser, worker_count
 from web_crawler.pool import start as start_parser
+from web_crawler.retry import Class
 from web_crawler.robots import Availability, RobotsPolicy, RobotsTxt, product_token
 from web_crawler.stats import Stats
-from web_crawler.transport import AiohttpTransport, ErrorKind, Transport
-from web_crawler.types import CrawlItem, ExitCode, WorkerContext
+from web_crawler.transport import AiohttpTransport, Transport
+from web_crawler.types import CrawlItem, ErrorKind, ExitCode, WorkerContext
 from web_crawler.urls import Scope, dedupe_key, normalize_start
 
 log = logging.getLogger(__name__)
@@ -103,15 +118,24 @@ async def crawl(  # noqa: PLR0913  (the collaborators that tests replace)
     start_url, scheme_was_implicit = normalize_start(cfg.start_url)
     stats = Stats(started=clock())
     frontier = Frontier()
-    admission = Admission(frontier, Scope.for_url(start_url))
+    admission = Admission(
+        frontier,
+        Scope.for_url(start_url),
+        max_url_length=cfg.max_url_length,
+        max_segment_repeats=cfg.max_segment_repeats,
+        max_query_variants=cfg.max_query_variants,
+        skip_extensions=cfg.skip_extensions,
+    )
     owned = transport is None
     if transport is None:
         transport = AiohttpTransport(cfg)
-    robots = None if cfg.ignore_robots else RobotsFetcher(transport, rng=rng or random.Random())
+    rng = rng or random.Random()
+    robots = None if cfg.ignore_robots else RobotsFetcher(transport, rng=rng)
     law = ConcurrencyLaw(cfg.max_concurrency)
-    fetcher = Fetcher(
-        transport, cfg.max_page_bytes, stats, signals=_Limiter(law, clock), clock=clock
-    )
+    breaker = CircuitBreaker(first_probe=cfg.first_probe, give_up_after=cfg.give_up_after)
+    guard = BlockGuard(first_probe=cfg.first_probe, give_up_after=cfg.give_up_after)
+    signals = _Limiter(law, breaker, clock)
+    fetcher = Fetcher(transport, cfg.max_page_bytes, stats, signals=signals, clock=clock)
     product = product_token(cfg.user_agent)
     if parser is None:
         workers = worker_count(cfg.parse_workers)
@@ -124,6 +148,9 @@ async def crawl(  # noqa: PLR0913  (the collaborators that tests replace)
         product=product,
         strict_host=cfg.strict_host,
         stats=stats,
+        retries=cfg.retries,
+        rng=rng,
+        clock=clock,
     )
     dispatcher = _Dispatcher(
         fetcher=fetcher,
@@ -136,6 +163,8 @@ async def crawl(  # noqa: PLR0913  (the collaborators that tests replace)
         max_bytes=cfg.max_page_bytes,
         make_parser=parser,
         law=law,
+        breaker=breaker,
+        guard=guard,
         max_concurrency=cfg.max_concurrency,
         max_rps=cfg.max_rps,
         clock=clock,
@@ -143,11 +172,13 @@ async def crawl(  # noqa: PLR0913  (the collaborators that tests replace)
         robots=robots,
         product=product,
         robots_refresh=cfg.robots_refresh,
+        retries=cfg.retries,
+        rng=rng,
     )
     interrupts = _Interrupts(dispatcher)
     with interrupts:  # until the sink is closed, so a second Ctrl-C can cut closing short
         try:
-            sink.start(dispatcher.pump)
+            sink.start(dispatcher.pump, interrupts.output_closed)
             work = asyncio.create_task(_run(start, dispatcher, start_url, scheme_was_implicit))
             exit_code = await interrupts.wait(work)
         finally:
@@ -163,20 +194,26 @@ async def crawl(  # noqa: PLR0913  (the collaborators that tests replace)
 
 
 class _Limiter:
-    """Feeds the concurrency law what the fetcher hears (DESIGN.md §5.3), and logs what it
-    decides. Responses below 500, but for 429, are samples of the server's latency."""
+    """Feeds the concurrency law and the circuit breaker what the fetcher hears (DESIGN.md
+    §5.3), and logs what the law decides. Responses below 500, but for 429, are samples of
+    the server's latency."""
 
-    def __init__(self, law: ConcurrencyLaw, clock: Callable[[], float]) -> None:
+    def __init__(
+        self, law: ConcurrencyLaw, breaker: CircuitBreaker, clock: Callable[[], float]
+    ) -> None:
         self._law = law
+        self._breaker = breaker
         self._clock = clock
 
     def answered(self, status: int, ttfb: float, issued_at: float) -> None:
+        self._breaker.answered(issued_at)
         if status in _THROTTLED:
             self._decided(self._law.on_congestion(issued_at, self._clock()))
         elif status < HTTPStatus.INTERNAL_SERVER_ERROR:
             self._decided(self._law.on_sample(ttfb, issued_at, self._clock()))
 
     def failed(self, kind: ErrorKind, issued_at: float) -> None:
+        self._breaker.failed(kind, issued_at, self._clock())
         if kind in _CONGESTED:
             self._decided(self._law.on_congestion(issued_at, self._clock()))
 
@@ -194,7 +231,8 @@ async def _run(
 
 @dataclass(slots=True)
 class _Interrupts:
-    """Stops the crawl cleanly on the first SIGINT or SIGTERM (DESIGN.md §5.9).
+    """Stops the crawl cleanly on the first SIGINT or SIGTERM (DESIGN.md §5.9), or when the
+    sink's reader goes away, as stdout's does when `| head` has read enough.
 
     Dispatching stops and the crawl's task is cancelled; crawl() then cancels the fetches
     in flight, lets the parses already submitted finish and print, stops the parser
@@ -204,9 +242,10 @@ class _Interrupts:
     """
 
     dispatcher: _Dispatcher
-    exit_code: ExitCode | None = None  # the first signal's
+    exit_code: ExitCode | None = None  # the first stop's
     _work: asyncio.Task[ExitCode] = field(init=False)
     _previous: dict[signal.Signals, _SignalHandler] = field(default_factory=dict)
+    _watching: bool = False  # within the with block
 
     def __enter__(self) -> None:
         loop = asyncio.get_running_loop()
@@ -216,8 +255,10 @@ class _Interrupts:
                 continue
             self._previous[sig] = previous
             loop.add_signal_handler(sig, self._received, sig)
+        self._watching = True
 
     def __exit__(self, *exc_info: object) -> None:
+        self._watching = False
         loop = asyncio.get_running_loop()
         for sig, previous in self._previous.items():
             loop.remove_signal_handler(sig)
@@ -234,9 +275,18 @@ class _Interrupts:
             return self.exit_code
 
     def _received(self, sig: signal.Signals) -> None:
-        if self.exit_code is not None:  # a second SIGTERM: closing is already under way
+        self._stop(_STOP_SIGNALS[sig])
+
+    def output_closed(self) -> None:
+        """The sink's reader went away: nothing more can be printed (DESIGN.md §6.1)."""
+        self._stop(ExitCode.STDOUT_CLOSED)
+
+    def _stop(self, exit_code: ExitCode) -> None:
+        # Once stopping, a SIGTERM or a closed output changes nothing; a reader that went
+        # away while the sink was closing, once crawl() was done, changes nothing either.
+        if self.exit_code is not None or not self._watching:
             return
-        self.exit_code = _STOP_SIGNALS[sig]
+        self.exit_code = exit_code
         self.dispatcher.halt()
         self._work.cancel()
         if signal.SIGINT in self._previous:
@@ -275,6 +325,9 @@ class _Start:
     product: str  # the User-Agent's product token, which robots.txt groups name
     strict_host: bool
     stats: Stats
+    retries: int  # for errors, from --retries
+    rng: random.Random  # for retries' backoff
+    clock: Callable[[], float]
     _files: dict[str, RobotsTxt] = field(default_factory=dict, init=False)  # by origin
     _warned: set[str] = field(default_factory=set, init=False)  # unreachable, logged
     _problem: _CantStart | None = field(default=None, init=False)  # why a hop can't be followed
@@ -306,10 +359,18 @@ class _Start:
         if (problem := await self._read_robots(self.admission.scope, start_url)) is not None:
             return problem
         self.admission.admit([(dedupe_key(start_url), start_url)], depth=0)
-        item = self.frontier.pop()
+        item = self.frontier.pop(self.clock())
         assert item is not None
-        # The start URL is fetched on its own: if it isn't a page, there's no crawl.
+        # The start URL is fetched on its own: if it isn't a page, there's no crawl. Nothing
+        # else is queued, so its retries wait here.
         outcome = await self.fetcher.fetch(item, self)
+        while isinstance(outcome, Retry):
+            if (again := _next_attempt(outcome, self.retries, self.rng, self.stats)) is None:
+                outcome = outcome.final
+                break
+            item, delay = again
+            await asyncio.sleep(delay)
+            outcome = await self.fetcher.fetch(item, self)
         # Nothing but the start URL's own chain has claimed anything yet.
         assert not isinstance(outcome, Claimed)
         if isinstance(outcome, Page):
@@ -386,6 +447,27 @@ class _Start:
         return f"{final.url}: {final.detail}"
 
 
+def _next_attempt(
+    outcome: Retry, retries: int, rng: random.Random, stats: Stats
+) -> tuple[CrawlItem, float] | None:
+    """When to fetch outcome's item again, and as what; or None if it has no retries left."""
+    again = retry.next_attempt(
+        outcome.item, outcome.cls, retries=retries, rng=rng, retry_after=outcome.retry_after
+    )
+    if again is not None:
+        final = outcome.final
+        stats.retries[final.reason] += 1
+        log.info("%s: %s; trying again in %.2f s", final.url, final.detail, again[1])
+    return again
+
+
+def _answered(outcome: FetchOutcome) -> bool:
+    """Whether outcome ended with a response, rather than with no response at all."""
+    if isinstance(outcome, Retry):
+        outcome = outcome.final
+    return not isinstance(outcome, Final) or outcome.status is not None
+
+
 def _count(stats: Stats, outcome: NotPage | Claimed | Final) -> None:
     """Count an item that ended without a page."""
     if isinstance(outcome, NotPage):
@@ -417,6 +499,8 @@ class _Dispatcher:
     max_bytes: int  # the most a page's body may decompress to
     make_parser: Callable[[WorkerContext], Parser]
     law: ConcurrencyLaw
+    breaker: CircuitBreaker
+    guard: BlockGuard
     max_concurrency: int
     max_rps: float | None
     clock: Callable[[], float]
@@ -424,6 +508,8 @@ class _Dispatcher:
     robots: RobotsFetcher | None  # None under --ignore-robots
     product: str  # the User-Agent's product token, which robots.txt groups name
     robots_refresh: float  # seconds between fetches of robots.txt
+    retries: int  # for errors, from --retries
+    rng: random.Random  # for retries' backoff
     _parser: Parser | None = field(default=None, init=False)
     _gate: PauseGate = field(default_factory=PauseGate, init=False)
     _slots: int = field(default=0, init=False)
@@ -432,16 +518,19 @@ class _Dispatcher:
     _fetching: set[asyncio.Task[None]] = field(default_factory=set, init=False)
     _parsing: set[asyncio.Task[None]] = field(default_factory=set, init=False)
     _stopping: bool = field(default=False, init=False)
-    _done: asyncio.Future[None] = field(init=False)
+    _done: asyncio.Event = field(default_factory=asyncio.Event, init=False)
     _wake: asyncio.TimerHandle | None = field(default=None, init=False)
     _refresh: asyncio.TimerHandle | None = field(default=None, init=False)
     _refreshing: asyncio.Task[None] | None = field(default=None, init=False)
-
-    def __post_init__(self) -> None:
-        self._done = asyncio.get_running_loop().create_future()
+    _home: str = field(default="", init=False)  # the start page's URL, which probes request
+    _unreachable: bool = field(default=False, init=False)  # the breaker, at the last pump
+    _breaker_probes: asyncio.Task[None] | None = field(default=None, init=False)
+    _guard_probes: asyncio.Task[None] | None = field(default=None, init=False)
+    _aborted: bool = field(default=False, init=False)
 
     async def run(self, start: CrawlItem, page: Page) -> ExitCode:
-        """Crawl from the start page until nothing is outstanding."""
+        """Crawl from the start page until nothing is outstanding, or until the crawl gives
+        up on its host."""
         # The scope is fixed now, so the parsers' context can be, and the gateway can start:
         # each worker gets the context once, as it starts (DESIGN.md §5.5).
         ctx = WorkerContext(self.admission.scope.prefixes, self.max_bytes, self.all_urls)
@@ -454,19 +543,25 @@ class _Dispatcher:
             self._refresh = asyncio.get_running_loop().call_later(
                 self.robots_refresh, self._start_refresh
             )
+        self._home = page.job.url
         self._start(start, page)
         self.pump()
-        await self._done
+        await self._done.wait()
+        if self._aborted:
+            return ExitCode.ABORTED
         return ExitCode.INTERNAL_ERROR if self.stats.internal_errors else ExitCode.OK
 
     def pump(self) -> None:
         """Start fetches while there's room. It runs after every completion and every
-        release of a permit, when the rate ceiling allows the next start, and when the
-        sink's backlog clears."""
+        release of a permit, when the rate ceiling allows the next start, when the sink's
+        backlog clears, and when a probe finds the host well again."""
         if self._stopping:
             return
+        if self.breaker.open is not self._unreachable:
+            self._breaker_moved()
         while (
-            self._in_pipeline < self._slots
+            not (self.breaker.open or self.guard.tripped)
+            and self._in_pipeline < self._slots
             and self._requests < self.law.limit
             and not self.sink.backlogged
         ):
@@ -480,14 +575,104 @@ class _Dispatcher:
             if (wait := self._gate.delay(now)) > 0:
                 self._wake_in(wait)
                 break
-            item = self.frontier.pop()
+            item = self.frontier.pop(now)
             if item is None:
+                if (due := self.frontier.next_retry_at()) is not None:
+                    self._wake_in(due - now)
+                elif self._in_pipeline == 0:
+                    # Nothing else can settle a run of 403s now: they're final (DESIGN.md
+                    # §5.4).
+                    self._refused(self.guard.settle())
                 break
             self._gate.take(now)
             self._start(item)
         complete = self.frontier.outstanding == 0 or self.stats.pages == self.max_pages
-        if complete and not self._done.done():
-            self._done.set_result(None)
+        if complete:
+            self._done.set()
+
+    def _breaker_moved(self) -> None:
+        """The circuit breaker opened or closed since the last pump (DESIGN.md §5.3)."""
+        self._unreachable = self.breaker.open
+        if self._unreachable:
+            log.warning(
+                "%d requests in a row got no answer (%s): pausing the crawl, and checking %s "
+                "until it answers, for up to %g s",
+                OPENS_AFTER,
+                self.breaker.last,
+                self._home,
+                self.breaker.probes.give_up_after,
+            )
+            self._breaker_probes = asyncio.create_task(self._probe_until_reachable())
+            return
+        log.warning("%s answers again: resuming the crawl", self._home)
+        if self._breaker_probes is not None:  # a response closed it before a probe did
+            self._breaker_probes.cancel()
+            self._breaker_probes = None
+
+    async def _probe_until_reachable(self) -> None:
+        """Request the start page now and then while the breaker is open, until a response
+        closes it; abort the crawl if none does in time."""
+        breaker = self.breaker
+        while breaker.open:
+            if not await self._probe_due(breaker.probes):
+                give_up = breaker.probes.give_up_after
+                self._abort(f"{self._home} has given no answer for {give_up:g} s ({breaker.last})")
+                return
+            issued = self.clock()
+            if await self.fetcher.probe(self._home) is None:
+                breaker.probes.failed(self.clock())
+            else:
+                breaker.answered(issued)
+        self._breaker_probes = None
+        self.pump()
+
+    async def _probe_until_served(self) -> None:
+        """Request the start page now and then while the block guard is tripped, until it's
+        served rather than refused, then try the refused pages again; abort the crawl if it
+        isn't in time (DESIGN.md §5.4)."""
+        guard = self.guard
+        while guard.tripped:
+            if not await self._probe_due(guard.probes):
+                give_up = guard.probes.give_up_after
+                self._abort(
+                    f"{self._home} still answers 403 Forbidden after {give_up:g} s, as a block "
+                    "would"
+                )
+                return
+            status = await self.fetcher.probe(self._home)
+            if status is None or status == HTTPStatus.FORBIDDEN:
+                guard.probes.failed(self.clock())
+                continue
+            held = guard.recovered()
+            log.warning(
+                "%s is served again (HTTP %d): resuming the crawl, and trying the %d refused "
+                "pages again",
+                self._home,
+                status,
+                len(held),
+            )
+            self.stats.retries["HTTP 403"] += len(held)
+            for item in held:
+                self.frontier.schedule_retry(item, self.clock())
+        self._guard_probes = None
+        self.pump()
+
+    async def _probe_due(self, probes: Probes) -> bool:
+        """Wait until the next probe is due. Returns False if the time to give up comes
+        first."""
+        while (now := self.clock()) < probes.next:
+            if now >= probes.deadline:
+                return False
+            await asyncio.sleep(min(probes.next, probes.deadline) - now)
+        return now < probes.deadline
+
+    def _abort(self, why: str) -> None:
+        """Give up on the crawl: it ends as a signal ends it, keeping what it printed, and
+        exits 4 (DESIGN.md §5.3)."""
+        log.error("aborting: %s", why)
+        self._aborted = True
+        self.halt()
+        self._done.set()
 
     def _start(self, item: CrawlItem, page: Page | None = None) -> None:
         self._in_pipeline += 1
@@ -499,7 +684,8 @@ class _Dispatcher:
         task.add_done_callback(self._parsing.discard)
 
     def _wake_in(self, delay: float) -> None:
-        """Pump after delay seconds, unless it's already due to run sooner."""
+        """Pump after delay seconds, unless it's already due to run sooner: when the rate
+        ceiling allows the next start, or the next retry is due."""
         loop = asyncio.get_running_loop()
         when = loop.time() + delay
         if self._wake is not None:
@@ -536,9 +722,8 @@ class _Dispatcher:
         for timer in (self._wake, self._refresh):
             if timer is not None:
                 timer.cancel()
-        cancelled = list(self._fetching)
-        if self._refreshing is not None:
-            cancelled.append(self._refreshing)
+        others = (self._refreshing, self._breaker_probes, self._guard_probes)
+        cancelled = [*self._fetching, *(task for task in others if task is not None)]
         for task in cancelled:
             task.cancel()
         await asyncio.gather(*cancelled, *self._parsing, return_exceptions=True)
@@ -578,9 +763,12 @@ class _Dispatcher:
 
     async def _process(self, item: CrawlItem, page: Page | None) -> None:
         """Fetch item, unless its page is already here, and parse the page it leads to."""
+        finished = True
         try:
+            issued = self.clock()
             outcome = page if page is not None else await self._fetch(item)
             if isinstance(outcome, Page):
+                self._refused(self.guard.answered(issued))
                 # From here the task is a parse, which a stop lets finish and print rather
                 # than cancel: once submitted, it runs to its end in its worker anyway.
                 task = asyncio.current_task()
@@ -589,7 +777,7 @@ class _Dispatcher:
                 self._parsing.add(task)
                 await self._page(item, outcome)
             else:
-                _count(self.stats, outcome)
+                finished = self._no_page(item, outcome, issued)
         except Exception:
             # A bug, not a property of the page. Count it, so the exit code says so, and
             # carry on with the rest of the crawl.
@@ -597,8 +785,76 @@ class _Dispatcher:
             log.exception("internal error while crawling %s", item.url)
         finally:
             self._in_pipeline -= 1
-            self.frontier.finish()
+            if finished:
+                self.frontier.finish()
             self.pump()
+
+    def _no_page(
+        self, item: CrawlItem, outcome: NotPage | Claimed | Retry | Final, issued: float
+    ) -> bool:
+        """Deal with a fetch of item, sent at issued, that led to no page. Returns whether
+        the item is finished: it isn't if it's to be tried again, or the block guard holds
+        it."""
+        if isinstance(outcome, Final) and outcome.status == HTTPStatus.FORBIDDEN:
+            return not self._forbidden(item, outcome, issued)
+        if _answered(outcome):  # by a response, and not a 403
+            self._refused(self.guard.answered(issued))
+        if isinstance(outcome, Retry):
+            return not self._retry(outcome)
+        _count(self.stats, outcome)
+        return True
+
+    def _forbidden(self, item: CrawlItem, final: Final, issued: float) -> bool:
+        """item got a 403 for a request sent at issued, which the block guard may hold
+        until its run of 403s is settled (DESIGN.md §5.4). Returns whether it did: then the
+        item stays outstanding."""
+        verdict = self.guard.forbidden(resume(item, final.chain), issued, self.clock())
+        if verdict is Verdict.FINAL:
+            _count(self.stats, final)
+            return False
+        if verdict is Verdict.TRIPPED:
+            log.warning(
+                "%d requests in a row were refused with 403 Forbidden, as a block would refuse "
+                "them: pausing the crawl, and checking %s until it's served again, for up to "
+                "%g s",
+                BLOCKED_AFTER,
+                self._home,
+                self.guard.probes.give_up_after,
+            )
+            self._guard_probes = asyncio.create_task(self._probe_until_served())
+        return True
+
+    def _refused(self, held: list[CrawlItem]) -> None:
+        """The block guard settled a run of 403s: the pages it held are forbidden."""
+        for _ in held:
+            self.stats.failures["HTTP 403"] += 1
+            self.frontier.finish()
+
+    def _retry(self, outcome: Retry) -> bool:
+        """Put outcome's item in the retry heap, if it has retries left, and say whether it
+        did; otherwise the item's failure is final. Waiting there, the item holds no permit
+        and no pipeline slot (DESIGN.md §5.4). A Retry-After holds every request back."""
+        now = self.clock()
+        if outcome.cls is Class.ERROR and self.breaker.open:
+            # The host can't be reached, which says nothing about this page: trying again
+            # once it can costs the page none of its retries (DESIGN.md §5.3).
+            final = outcome.final
+            self.stats.retries[final.reason] += 1
+            log.info("%s: %s; trying again once the host answers", final.url, final.detail)
+            self.frontier.schedule_retry(outcome.item, now)
+            return True
+        if (pause := outcome.retry_after) is not None:
+            # The server asks for no requests for a while, not just this one.
+            final = outcome.final
+            log.info("%s: %s, Retry-After: pausing for %g s", final.url, final.detail, pause)
+            self._gate.pause(now + pause)
+        again = _next_attempt(outcome, self.retries, self.rng, self.stats)
+        if again is None:
+            _count(self.stats, outcome.final)
+            return False
+        item, delay = again
+        self.frontier.schedule_retry(item, now + delay)
+        return True
 
     async def _fetch(self, item: CrawlItem) -> FetchOutcome:
         """item's fetch, which holds a permit of the concurrency limit until it's done."""
@@ -627,3 +883,4 @@ class _Dispatcher:
         self.stats.pages += 1
         self.stats.links_found += result.links_found
         self.stats.decoded_bytes += result.decoded_bytes
+        self.stats.truncated += result.truncated

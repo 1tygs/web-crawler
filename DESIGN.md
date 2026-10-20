@@ -192,7 +192,7 @@ Few sites will serve one client thousands of pages per second. The crawler's cei
   4. robots.txt ([§5.7](#57-robotstxt)).
   5. `--max-depth`.
 
-  Rejected keys also go into `seen`, so they aren't re-checked every time they're found. Depth rejections are the exception, so a later, shorter path can still admit them.
+  Rejected keys also go into `seen`, so they aren't re-checked every time they're found. Depth rejections are the exception, so a later, shorter path can still admit them. A redirect's target goes through the trap rules and robots.txt, but not the extension filter: it's followed, and its response says what it is. The checks cost about 0.6 µs per new URL on top of robots.txt's, and run once per URL, not per link (A.16).
 - **`--max-pages N`** is enforced when dispatching: a fetch starts only while pages printed plus fetches in flight is below N, so no page is fetched only to be thrown away. A fetch that ends without a page (an error, a non-HTML response, a redirect to a URL already claimed) frees its place. Exactly N records are printed, or fewer if the site is smaller.
 - **HSTS upgrade (RFC 6797), after v1.** Once an HTTPS response carries `Strict-Transport-Security`, in-scope `http://` links are upgraded to `https://` before the dedupe check, as browsers do. Legacy `http://` links then cost no redirect round-trip. Until then, redirect-aware dedupe ([§5.6](#56-url-normalization-and-dedupe)) collapses them for one extra request each.
 - **Exact depth under `--max-depth`.** Because of concurrency, a page can be reached by a longer path first. A two-level dispatch window makes the result independent of timing:
@@ -209,7 +209,7 @@ Few sites will serve one client thousands of pages per second. The crawler's cei
 - An aiohttp `ClientSession` with `TCPConnector(limit = limit_per_host = max_concurrency + 4, ttl_dns_cache = 300, keepalive_timeout = 30)`. The four extra connections serve requests the dispatcher doesn't count, such as robots.txt refetches and health probes. Happy eyeballs is on by default.
 - `auto_decompress=False`, with `Accept-Encoding: gzip, deflate, br, zstd`, exactly the encodings the workers can decode. zstd comes from the 3.14 standard library.
 - `Accept: text/html,application/xhtml+xml;q=0.9,*/*;q=0.8` and an honest User-Agent, e.g. `web-crawler/1.0 (+https://github.com/<you>/web-crawler)`.
-- Timeouts: connect 10 s, read 20 s, total 60 s.
+- Timeouts: connect 10 s, read 20 s, total 60 s (`--timeout`). A total under 10 s that runs out before the connection is ready counts as a connect timeout: the host wasn't reached, which the circuit breaker needs to know ([§5.3](#53-adaptive-concurrency-limiter)).
 - TLS verification on; `--insecure` turns it off for dev hosts.
 - Cookie jar on, so cookie-gated redirects resolve as they would in a browser.
 - Proxies are taken from the environment (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`) and read once. aiohttp's own `trust_env` re-reads them, and `~/.netrc`, on a thread for every request. That costs 162.5 µs of CPU per request against 26.9 µs (A.4), and it would send `~/.netrc` credentials to the crawled host.
@@ -219,7 +219,7 @@ Few sites will serve one client thousands of pages per second. The crawler's cei
 - **Cookie-gated redirects.** A redirect back to a URL already in the same chain is followed, rather than called a loop: a consent or login gate redirects to a page that sets a cookie, which redirects back, and with the cookie the page is served. The cookie jar is on for exactly this. A real loop ends at the 10-hop limit and is reported as a loop, with its chain; a chain of 10 distinct hops is reported as too many redirects.
 - **Headers-first triage:**
   - HTML: stream the body up to `--max-page-bytes` (default 32 MiB) and flag truncation.
-  - Non-HTML: don't read the body. If `Content-Length ≤ 64 KiB`, drain it so the connection can be reused; otherwise close it.
+  - Non-HTML, and error statuses: don't read the body. If `Content-Length ≤ 64 KiB`, drain it so the connection can be reused; otherwise close it. A body that fails while it's drained is no matter: its connection is closed instead.
   - Missing or unknown `Content-Type` (`*/*`, `unknown/unknown`, `application/unknown` or one that doesn't parse): decompress the start of the body, the 1,445 bytes MIME Sniffing reads, and sniff it for the standard's HTML patterns, unless `X-Content-Type-Options: nosniff` forbids it. The body is still compressed at this point, so the raw bytes can't be sniffed.
 - **Latency sample** is the time from when the request had its connection, from the pool at once or new once DNS, TCP and TLS are done, to its response headers. It tracks server queueing without being skewed by body size, or by connection set-up: the first rounds of a crawl are mostly new connections, and their handshakes would inflate the base. The transport's connector notes the moment it hands a request its connection, for 1.3 µs of CPU per request; aiohttp's `TraceConfig` reports the same moment, but costs 8.3 µs (A.4).
 
@@ -262,23 +262,30 @@ on 429 / 503 / timeout / connection reset or refused / body cut off:
 - Optional hard ceilings:
   - `--max-rps R` spaces request starts evenly, 1/R seconds apart, with no bursts: a quiet spell earns no catching up.
   - A robots.txt `Crawl-delay: d` becomes a 1/d requests-per-second ceiling. This is on by default; `--ignore-robots` turns it off along with the rules.
-- **Circuit breaker.** After 20 consecutive connection-level failures (DNS, connect, TLS), dispatch pauses and single probe requests back off from 1 s to 60 s. If the host stays unreachable for 5 minutes, the crawl aborts with exit code 4 and keeps its partial results. That's better than burning every URL's retry budget.
+- **Circuit breaker.** After 20 consecutive connection-level failures (DNS, connect, TLS, connect timeout), dispatch pauses, and single probes of the start page back off from 1 s to 60 s. A response closes the breaker. If the host stays unreachable for 5 minutes, the crawl aborts with exit code 4 and keeps its partial results. That's better than burning every URL's retry budget: a failure while the breaker is open, or the one that opens it, costs its page no retry.
+  - Only a response to a request sent after the failures counts, as for the limiter's cuts: one that was already on its way when the host went says nothing about it now.
+  - A reset or a timeout means the connection was made, so it neither counts towards a run nor breaks one.
 
 ### 5.4 Errors and retries
 
 | Condition | Action |
 |---|---|
 | DNS failure, connection refused or reset, TLS error, timeout, body cut off mid-transfer | Retry up to 3 times with exponential backoff and full jitter (base 0.5 s, cap 30 s). A hard signal to the limiter, except for DNS and TLS failures, which say nothing about the server's load |
-| 429, 503 | Honour `Retry-After` (seconds or HTTP-date), halve the limit, retry. These have their own budget of 5, so throttling doesn't use up the error retries |
+| 429, 503 | Honour `Retry-After` (seconds or HTTP-date): no request starts until it ends, at most 300 s later, and the page that asked goes first. Halve the limit, retry. These have their own budget of 5, so throttling doesn't use up the error retries; without a `Retry-After`, they back off as errors do |
 | 408, 500, 502, 504 | Retry up to 3 times with backoff |
 | Other 4xx/5xx (404, 410, 401, 403, …) | Final: counted, logged at `-v`, optional JSONL error record |
-| 20 consecutive 403s after successful pages | Likely a firewall block, not 20 forbidden pages. Pause dispatch and re-request the start URL with backoff. If it recovers, requeue those URLs once; if it's still blocked after 5 minutes, abort with exit code 4 and keep the partial results |
+| 20 consecutive 403s after successful pages | Likely a firewall block, not 20 forbidden pages. Pause dispatch and re-request the start URL with backoff, as the circuit breaker does. If it's served, requeue those URLs once; if it's still refused after 5 minutes, abort with exit code 4 and keep the partial results |
 | Redirect loop, more than 10 hops, off-host redirect | Final: recorded with the redirect chain. A redirect back into its own chain is followed first, for cookie gates; a loop ends at the 10-hop limit |
-| Body over the size cap | Parse the part received and flag `truncated` |
+| Body over the size cap | Parse the part received and flag `truncated`; the summary counts pages cut short |
 | Corrupt compression | Final ("bad content-encoding"); the result is deterministic, so retrying won't help. A compressed stream that ends early isn't corrupt: it's parsed as far as it got and flagged `truncated`, as a browser renders it |
 | Worker crash (`BrokenProcessPool`) | Every job in the pool fails, not just the one that crashed (A.9). Rebuild the pool and resubmit them all without using up retries. If it breaks again, rerun the survivors one at a time: the page that crashes on its own gets a parse error, and the rest go through |
 
-Retries go back through the retry heap. Nothing sleeps while holding a permit.
+**A 403 is held until its run of 403s is settled.** Its page stays outstanding, with no outcome yet, so a page requeued after a block gets one record, not an error and then a page, and `--max-depth` stays exact. A run is settled in one of three ways:
+- a response other than 403, to a request sent after the run's earliest: the host serves the crawl, so the 403s are final. A response to a request sent before it may predate the block, and says nothing;
+- the 20th 403, which trips the rule above. Requests already in flight that get a 403 join the run, and only a probe ends the pause; a page requeued that gets another 403 is final;
+- nothing else can move the crawl on, with nothing queued, in flight or waiting to retry: the 403s are final.
+
+Retries go back through the retry heap. Nothing sleeps while holding a permit. A retry resumes where its item failed, after the redirects it had followed: those URLs were claimed for it, so starting again from the first would find them claimed, by no one who will print them. The start URL is retried in place, before the crawl begins, since nothing else is queued yet.
 
 ### 5.5 Parser workers
 
@@ -375,13 +382,15 @@ JSONL (`--format jsonl`) has one object per page:
 ```
 
 - stdout carries only results. Logs, progress and the summary go to stderr, so `crawl … > out.txt` stays clean.
-- Each record is written with one `write()` and is never interleaved. The writer thread flushes every 100 ms and at exit, so `| head`, `tee` and `tail -f` behave as expected. A closed pipe (e.g. `| head`) ends the crawl quietly.
+- Each record is written with one `write()` and is never interleaved. The writer thread flushes every 100 ms and at exit, so `| head`, `tee` and `tail -f` behave as expected. A closed pipe (e.g. `| head`) ends the crawl quietly, with exit code 141 ([§5.9](#59-shutdown)).
 - At thousands of lines per second, the terminal itself becomes the bottleneck. When stdout is a terminal, the progress line suggests redirecting to a file.
 
 ### 5.9 Shutdown
 
 - **First SIGINT/SIGTERM.** Dispatching stops and in-flight fetches are cancelled. Parse jobs already submitted finish so their records print; the workers never see the signal ([§4.3](#43-concurrency-model)). Then output is flushed, the summary printed, and the process exits with 130 (SIGINT) or 143 (SIGTERM).
 - **Second SIGINT.** Exit immediately; the pool is killed.
+- **Abort** ([§5.3](#53-adaptive-concurrency-limiter), [§5.4](#54-errors-and-retries)). As for the first signal, with exit code 4: the host stayed unreachable, or kept refusing the crawl, for 5 minutes. An error line on stderr says which.
+- **Stdout closed,** as when `| head` has read enough. The writer thread's next write fails, and it discards the rest; the crawl stops as for the first signal, with exit code 141, 128 + SIGPIPE, as a shell reports a program that SIGPIPE ended. Nothing is said about it, and no traceback is printed; the summary still goes to stderr, unless stderr went to the same pipe.
 - **Normal end.** Shut down the pool, close the session (with a graceful TLS close), flush, print the summary, exit 0.
 
 ---
@@ -407,7 +416,7 @@ crawl URL [options]
 | `--ignore-robots` | off | For crawling your own site; also ignores `Crawl-delay` |
 | `--strict-host` | off | Refuse a start URL that redirects to another host, even when only `www.` differs |
 | `--timeout S`, `--retries N` | 60, 3 | Total timeout per request; retry budget |
-| `--max-page-bytes N` | 32 MiB | Size cap per page |
+| `--max-page-bytes N` | 32M | Size cap per page, as sent and decompressed; K, M and G are binary suffixes |
 | `--user-agent UA` | `web-crawler/1.0 (+url)` | Also selects the robots.txt group |
 | `--insecure`, `--no-skip-extensions` | off | Escape hatches |
 | `-v`/`-vv`, `-q` | — | Observability; `-v` also logs the limiter's decisions |
@@ -422,7 +431,9 @@ A start URL given without a scheme gets `https://`. If its host gives no answer 
 - `2`: usage error.
 - `3`: couldn't start. The start URL is unreachable, disallowed by robots.txt, or redirects to another host (other than adding or removing `www.`, unless `--strict-host` is set), or its robots.txt is unreachable.
 - `4`: aborted because the host became unreachable or kept blocking requests.
-- `130`: interrupted.
+- `130`: interrupted (SIGINT).
+- `141`: stdout closed, as by `| head`.
+- `143`: terminated (SIGTERM).
 
 ### 6.2 Internal contracts
 
@@ -432,7 +443,9 @@ class CrawlItem:                 # an admitted URL
     url: str                     # display URL: what is requested and printed
     key: str                     # dedupe key
     depth: int
-    attempt: int = 0
+    attempt: int = 0             # retries after errors so far (--retries)
+    throttled: int = 0           # retries after a 429 or 503 so far: a budget of their own
+    redirected_from: tuple[str, ...] = ()  # redirects already followed: a retry resumes there
 
 class Response(Protocol):        # one HTTP exchange, no redirect handling
     url: str
@@ -464,6 +477,7 @@ class ParseResult(NamedTuple):   # worker -> coordinator
     links_found: int             # links printed on the page, for stats
     decoded_bytes: int           # the body's size decompressed, for stats
     error: str | None            # e.g. "bad content-encoding": deterministic, so final
+    truncated: bool = False      # cut at the size cap, or its stream ended early
 
 def parse_page(job: ParseJob, ctx: WorkerContext) -> ParseResult: ...
                                  # pure; ctx is the static context (§5.5), which a pool
@@ -552,7 +566,7 @@ Python 3.14 or later is required, because `compression.zstd` is in its standard 
   - status code histogram and errors by class;
   - policy rejections by rule (robots, traps, extension), with examples;
   - time-to-first-byte p50/p95/p99;
-  - bytes on the wire vs decoded;
+  - bytes on the wire vs decoded, and pages cut short;
   - duration, average and peak pages/s, limiter range, peak RSS.
 - `-v` logs failures, rejections and the limiter's decisions; `-vv` logs every request. After v1, `--stats-json FILE` writes the summary for scripts.
 - Policy decisions are always counted and sampled. An accurate crawl is one whose omissions you can audit.
@@ -569,7 +583,7 @@ Python 3.14 or later is required, because `compression.zstd` is in its standard 
 | Unit: limiter | Within 15% of the ceiling's crawl time when the server has spare capacity; under half the unthrottled queueing on a small origin; halves on 429; honours `Retry-After`; one cut per congestion event | The simulator behind ADR-001 (`bench/limiter_sim.py`) with a fake clock: a narrow and a wide steady spread of response times, a page-mix shift late and during slow start, and a small origin that queues |
 | Unit: robots | The crawler's own handling: fetching every origin up front, each status class including 429, redirects, re-fetching after 24 hours | Table tests, plus a few pinned Protego behaviours (longest match, wildcards, group selection). Google's test suite isn't run against Protego, which matches groups more loosely ([§5.7](#57-robotstxt)) |
 | Integration | Output matches ground truth exactly; each URL is fetched at most once | An in-process aiohttp server, over http and https, serving sites with known link graphs; a test resolver serves `*.test` hosts on their default ports: the scenarios below, plus seeded random graphs with random latencies, compared against a breadth-first search with and without `--max-depth`. The server's request log proves there are no double fetches |
-| Fault injection | Recovery without losing pages | Connection resets mid-body, truncated gzip, `kill -9` on one worker of a busy pool (no page lost), a page that crashes its worker every time (only it fails), Ctrl-C mid-crawl and while workers are starting (no partial records; summary printed), a run of 403s mid-crawl |
+| Fault injection | Recovery without losing pages | Connection resets mid-body, truncated gzip, 429 and 503 with and without `Retry-After`, `kill -9` on one worker of a busy pool (no page lost), a page that crashes its worker every time (only it fails), Ctrl-C mid-crawl and while workers are starting (no partial records; summary printed), a run of 403s mid-crawl that ends and one that doesn't (exit 4), a host that goes away (exit 4), a decompression bomb, `\| head` (exit 141, no traceback) |
 | Performance | No regressions | A local server with 50 ms of injected latency and 50k pages, tracking pages/s, coordinator CPU per page and peak RSS in CI. `bench/` holds the scripts behind this document |
 
 The integration test sites cover:
@@ -646,7 +660,7 @@ The brief asks how the crawler would extend to many domains at once, and whether
 
 ### 14.1 The engine as a library
 
-- `crawl(spec: CrawlSpec, sink: Sink) -> CrawlStats`. `CrawlSpec` is today's `Config` plus a scope policy. `Sink` is a protocol with `write(record)`, `backlogged` and `close()`, plus `start(on_drained)`, through which a sink that fell behind wakes the dispatcher: text and JSONL now; Kafka, object storage or a database later.
+- `crawl(spec: CrawlSpec, sink: Sink) -> CrawlStats`. `CrawlSpec` is today's `Config` plus a scope policy. `Sink` is a protocol with `write(record)`, `backlogged` and `close()`, plus `start(on_drained, on_closed)`, through which a sink that fell behind wakes the dispatcher, and one whose reader went away stops the crawl: text and JSONL now; Kafka, object storage or a database later.
 - The CLI shrinks to argument parsing, a stdout sink and exit codes.
 - The parts without I/O (`parse_page`, the URL rules, the robots policy, the limiter's law, admission) are reused unchanged by every front end below. That's the payoff of keeping them free of I/O ([§4.1](#41-process-and-component-view)).
 
@@ -999,3 +1013,15 @@ The differences are rare symbols and vendor extensions, such as EUC-JP 0xA1C1, w
 - Parsing one of these pages takes 205 µs, so the inline crawl's 332 µs leaves about 125 µs for HTTP, the engine's bookkeeping and the output; the parser processes' machinery costs about as much again, a little more with more of them. Adding A.3's cost to A.4's, as §1 does, leaves the engine's bookkeeping out.
 - Over repeated runs of the same code, pages/s varied by about 5% and CPU per page by about 15 µs.
 - The coordinator's memory stays far below §7's 300 MB.
+- Step 4's robustness, measured the same way on 2026-10-20 in twelve 50,000-page crawls, six each, alternating with the code before it, three in each order: 1,048–1,113 pages/s against 994–1,095, 269–280 µs of coordinator CPU per page against 262–272 (medians 272 and 268), and 67–68 MiB against 66–67. The difference is within the runs' own spread. The rules admission adds cost 0.6 µs per new URL (A.16), and the retry, breaker and block-guard bookkeeping a few calls per page.
+
+**A.16 Admission's rules** (`bench/admission_bench.py`)
+
+Admission checks a URL it hasn't seen against its rules once, however many pages link to it (§5.1). 200,000 generated URLs of 1–5 path segments, 15% of them with a query and a few with a file's extension, admitted in batches of 120, as pages hand them over; median of 7 runs, on 2026-10-20:
+
+| Rules | No robots.txt | A short robots.txt |
+|---|---|---|
+| robots.txt only, before step 4 | 0.51 µs per URL | 1.54 µs |
+| Trap rules, extension filter and robots.txt | 1.13 µs | 2.16 µs |
+
+A first version cost 0.95 µs more rather than 0.6: it built a `Counter` of every path's segments, and read each path twice. The segment rule now counts them only for a path with more than three segments some of which repeat, and the extension filter reads the last segment straight from the URL.

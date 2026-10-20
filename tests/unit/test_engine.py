@@ -9,16 +9,16 @@ from typing import Any
 import pytest
 
 from tests.support.fake_transport import Answer, FakeResponse, FakeTransport, Reply
-from tests.support.jitter import Lowest
+from tests.support.jitter import Fixed, Lowest
 from web_crawler import engine
 from web_crawler.config import Config
 from web_crawler.engine import CrawlReport
+from web_crawler.limiter import BLOCKED_AFTER, OPENS_AFTER, CircuitBreaker, ConcurrencyLaw
 from web_crawler.limiter import START as INITIAL_LIMIT
-from web_crawler.limiter import ConcurrencyLaw
 from web_crawler.output import MemorySink, Sink
 from web_crawler.pool import InlineParser
-from web_crawler.transport import ErrorKind
-from web_crawler.types import ExitCode, ParseJob, ParseResult, WorkerContext
+from web_crawler.transport import TransportError
+from web_crawler.types import ErrorKind, ExitCode, ParseJob, ParseResult, WorkerContext
 
 START = "https://example.com/"
 
@@ -36,8 +36,13 @@ PLAIN_ROBOTS = "http://example.com/robots.txt"
 
 
 def pages(transport: FakeTransport) -> list[str]:
-    """What the crawl requested, robots.txt aside."""
+    """What the crawl got responses for, robots.txt aside."""
     return [url for url in transport.requested if not url.endswith("/robots.txt")]
+
+
+def tries(transport: FakeTransport) -> list[str]:
+    """What the crawl requested, answered or not, robots.txt aside."""
+    return [url for url in transport.opened if not url.endswith("/robots.txt")]
 
 
 def robots(rules: str) -> Reply:
@@ -109,46 +114,53 @@ def cuts(caplog: pytest.LogCaptureFixture) -> list[str]:
 
 
 @pytest.mark.parametrize(
-    ("answer", "cut"),
+    ("answer", "cut", "retried"),
     [
-        (Reply(429, HTML), True),
-        (Reply(503, HTML), True),
-        (ErrorKind.TIMEOUT, True),
-        (ErrorKind.CONNECT_TIMEOUT, True),
-        (ErrorKind.RESET, True),
-        (ErrorKind.CONNECT, True),  # refused
-        (Reply(headers=HTML, read_error=ErrorKind.PAYLOAD), True),  # cut off mid-body
-        (Reply(500, HTML), False),
-        (Reply(404, HTML), False),
-        (ErrorKind.DNS, False),
-        (ErrorKind.TLS, False),
+        (Reply(429, HTML), True, True),
+        (Reply(503, HTML), True, True),
+        (ErrorKind.TIMEOUT, True, True),
+        (ErrorKind.CONNECT_TIMEOUT, True, True),
+        (ErrorKind.RESET, True, True),
+        (ErrorKind.CONNECT, True, True),  # refused
+        (Reply(headers=HTML, read_error=ErrorKind.PAYLOAD), True, True),  # cut off mid-body
+        (Reply(500, HTML), False, True),
+        (Reply(404, HTML), False, False),
+        (ErrorKind.DNS, False, True),
+        (ErrorKind.TLS, False, True),
     ],
 )
 async def test_distress_cuts_the_limit(
-    answer: Answer, cut: bool, caplog: pytest.LogCaptureFixture
+    answer: Answer, cut: bool, retried: bool, caplog: pytest.LogCaptureFixture
 ) -> None:
+    # The page fails once; a page that's worth another try is printed the second time.
     caplog.set_level(logging.INFO, "web_crawler.engine")
-    replies = fan_out(pages=40, delay=0.01)
-    replies["https://example.com/7"] = answer
-    report = await crawl(Config(start_url=START), MemorySink(), transport=FakeTransport(replies))
-    assert report.stats.pages == 40
+    replies: dict[str, Answer | list[Answer]] = {**fan_out(pages=40, delay=0.01)}
+    replies["https://example.com/7"] = [answer, html()]
+    transport = FakeTransport(replies)
+    report = await crawl(Config(start_url=START), MemorySink(), transport=transport, rng=Lowest())
+    assert report.stats.pages == 40 + retried
     assert cuts(caplog) == (["concurrency limit: cut: 8 -> 4"] if cut else [])
 
 
 async def test_one_congestion_event_cuts_the_limit_once(caplog: pytest.LogCaptureFixture) -> None:
-    # Eight requests in flight all get a 429: one cut answers them all.
+    # Eight requests in flight all get a 429: one cut answers them all. Tried again, after
+    # the cut, they get their pages.
     caplog.set_level(logging.INFO, "web_crawler.engine")
-    replies = fan_out(pages=8, delay=0.01)
-    replies |= {f"https://example.com/{n}": Reply(429, HTML, delay=0.01) for n in range(8)}
-    await crawl(Config(start_url=START), MemorySink(), transport=FakeTransport(replies))
+    replies: dict[str, Answer | list[Answer]] = {**fan_out(pages=8, delay=0.01)}
+    replies |= {
+        f"https://example.com/{n}": [Reply(429, HTML, delay=0.01), html()] for n in range(8)
+    }
+    transport = FakeTransport(replies)
+    report = await crawl(Config(start_url=START), MemorySink(), transport=transport, rng=Lowest())
     assert cuts(caplog) == ["concurrency limit: cut: 8 -> 4"]
+    assert report.stats.pages == 9
 
 
 def test_samples_are_responses_below_500_other_than_429(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     caplog.set_level(logging.INFO, "web_crawler.engine")
-    limiter = engine._Limiter(ConcurrencyLaw(64), clock=lambda: 1.0)
+    limiter = engine._Limiter(ConcurrencyLaw(64), CircuitBreaker(), clock=lambda: 1.0)
     for status in (500, 502, 504):  # not samples, slow as they are
         limiter.answered(status, 9.0, issued_at=0.0)
     for status in (200, 301, 404, 410, 499, 200, 200, 200):
@@ -281,7 +293,8 @@ async def test_a_start_url_that_isnt_a_page_cant_start(
     reply: Reply | ErrorKind, message: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     sink = MemorySink()
-    report = await crawl(Config(start_url=START), sink, transport=FakeTransport({START: reply}))
+    transport = FakeTransport({START: reply})
+    report = await crawl(Config(start_url=START), sink, transport=transport, rng=Lowest())
     assert report.exit_code is ExitCode.CANNOT_START
     assert message in caplog.text
     assert sink.records == []
@@ -363,11 +376,13 @@ async def test_failures_are_counted_not_printed() -> None:
         "https://example.com/off": Reply(302, {"Location": "https://elsewhere.org/"}),
     }
     sink = MemorySink()
-    report = await crawl(Config(start_url=START), sink, transport=FakeTransport(replies))
+    transport = FakeTransport(replies)
+    report = await crawl(Config(start_url=START), sink, transport=transport, rng=Lowest())
     assert report.exit_code is ExitCode.OK
     assert len(sink.records) == 1
     assert report.stats.not_html == 1
     assert report.stats.failures == {"HTTP 404": 1, "reset": 1, "redirect out of scope": 1}
+    assert report.stats.retries == {"reset": 3}  # its retries, before it failed
 
 
 class Valve(MemorySink):
@@ -378,7 +393,7 @@ class Valve(MemorySink):
         self.limit = limit
         self.on_drained: Callable[[], object] = lambda: None
 
-    def start(self, on_drained: Callable[[], object]) -> None:
+    def start(self, on_drained: Callable[[], object], on_closed: Callable[[], object]) -> None:
         self.on_drained = on_drained
 
     @property
@@ -412,6 +427,45 @@ async def test_a_backlogged_sink_pauses_dispatch_until_it_drains() -> None:
     report = await task
     assert report.stats.pages == 21
     assert len(pages(transport)) == 21
+
+
+class Gone(MemorySink):
+    """A sink whose reader goes away once it has `limit` records, as `| head` does."""
+
+    def __init__(self, limit: int) -> None:
+        super().__init__()
+        self.limit = limit
+        self.on_closed: Callable[[], object] = lambda: None
+
+    def start(self, on_drained: Callable[[], object], on_closed: Callable[[], object]) -> None:
+        self.on_closed = on_closed
+
+    def write(self, record: bytes) -> None:
+        super().write(record)
+        if len(self.records) == self.limit:
+            asyncio.get_running_loop().call_soon(self.on_closed)
+
+
+async def test_a_sink_whose_reader_goes_away_ends_the_crawl_with_141() -> None:
+    transport = FakeTransport(fan_out(pages=40, delay=0.01))
+    sink = Gone(limit=3)
+    report = await crawl(Config(start_url=START), sink, transport=transport)
+    assert report.exit_code is ExitCode.STDOUT_CLOSED
+    assert len(sink.records) < 41  # what was in flight finished; nothing more started
+    assert len(pages(transport)) < 41
+    assert sink.closed
+    assert transport.in_flight == 0
+
+
+async def test_a_reader_that_goes_away_after_the_crawl_changes_nothing() -> None:
+    class GoneOnClose(Gone):
+        def close(self) -> None:
+            self.on_closed()  # as a writer thread may, flushing the last records
+            super().close()
+
+    sink = GoneOnClose(limit=1 << 30)
+    report = await crawl(Config(start_url=START), sink, transport=FakeTransport(fan_out(3, 0)))
+    assert report.exit_code is ExitCode.OK
 
 
 async def test_cancelling_a_crawl_stops_its_fetches_and_closes_the_sink() -> None:
@@ -619,6 +673,388 @@ async def test_a_bug_in_a_refetch_is_counted_and_the_crawl_continues(
     assert report.stats.internal_errors >= 1
     assert report.stats.pages == 5
     assert "internal error while refetching robots.txt" in caplog.text
+
+
+async def test_a_fetch_that_fails_is_tried_again(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO, "web_crawler.engine")
+    replies: dict[str, Answer | list[Answer]] = {
+        START: html("/a"),
+        "https://example.com/a": [ErrorKind.RESET, Reply(502, HTML), html()],
+    }
+    transport, sink = FakeTransport(replies), MemorySink()
+    report = await crawl(Config(start_url=START), sink, transport=transport, rng=Lowest())
+    assert report.exit_code is ExitCode.OK
+    assert len(sink.records) == 2
+    assert tries(transport) == [START] + ["https://example.com/a"] * 3
+    assert report.stats.retries == {"reset": 1, "HTTP 502": 1}
+    assert not report.stats.failures
+    assert "retried: HTTP 502 (1), reset (1)" in report.summary
+    assert "https://example.com/a: reset: scripted; trying again in 0.00 s" in caplog.messages
+
+
+@pytest.mark.parametrize("retries", [0, 1, 3])
+async def test_a_fetch_that_keeps_failing_ends_after_its_retries(retries: int) -> None:
+    replies: dict[str, Answer | list[Answer]] = {
+        START: html("/a"),
+        "https://example.com/a": ErrorKind.CONNECT,
+    }
+    transport = FakeTransport(replies)
+    cfg = Config(start_url=START, retries=retries)
+    report = await crawl(cfg, MemorySink(), transport=transport, rng=Lowest())
+    assert report.exit_code is ExitCode.OK
+    assert tries(transport) == [START] + ["https://example.com/a"] * (1 + retries)
+    assert report.stats.failures == {"connect": 1}
+    assert report.stats.retries == ({"connect": retries} if retries else {})
+
+
+async def test_throttling_is_tried_again_on_a_budget_of_its_own() -> None:
+    # Five tries more whatever --retries says, and none of them use up its retries.
+    replies: dict[str, Answer | list[Answer]] = {
+        START: html("/busy", "/flaky"),
+        "https://example.com/busy": Reply(503, HTML),
+        "https://example.com/flaky": [Reply(429, HTML), ErrorKind.RESET, Reply(429, HTML), html()],
+    }
+    transport = FakeTransport(replies)
+    cfg = Config(start_url=START, retries=1)
+    report = await crawl(cfg, MemorySink(), transport=transport, rng=Lowest())
+    assert tries(transport).count("https://example.com/busy") == 6
+    assert tries(transport).count("https://example.com/flaky") == 4
+    assert report.stats.pages == 2
+    assert report.stats.failures == {"HTTP 503": 1}
+    assert report.stats.retries == {"HTTP 503": 5, "HTTP 429": 2, "reset": 1}
+
+
+async def test_retry_after_pauses_every_request(caplog: pytest.LogCaptureFixture) -> None:
+    # The server asks for a second's pause. The requests already in flight finish, but no
+    # other starts until the pause is over, and then the page that asked for it goes first.
+    caplog.set_level(logging.INFO, "web_crawler.engine")
+    replies: dict[str, Answer | list[Answer]] = {
+        START: html("/busy", *(f"/{n}" for n in range(30))),
+        "https://example.com/busy": [Reply(429, {"Retry-After": "1"}), html()],
+    }
+    replies |= {f"https://example.com/{n}": html(delay=0.01) for n in range(30)}
+    transport = Times(replies)
+    report = await crawl(Config(start_url=START), MemorySink(), transport=transport, rng=Lowest())
+    assert report.stats.pages == 32
+    started = [(url, at) for url, at in transport.started if not url.endswith("/robots.txt")]
+    first, after = started[1 : 1 + INITIAL_LIMIT], started[1 + INITIAL_LIMIT :]
+    assert first[0][0] == "https://example.com/busy"
+    assert after[0][0] == "https://example.com/busy"
+    assert after[0][1] - first[0][1] >= 1.0 - 0.01
+    assert "https://example.com/busy: HTTP 429, Retry-After: pausing for 1 s" in caplog.messages
+
+
+async def test_the_start_url_waits_as_long_as_retry_after_says(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, "web_crawler.engine")
+    transport = Times({START: [Reply(503, {"Retry-After": "1"}), html()]})
+    report = await crawl(Config(start_url=START), MemorySink(), transport=transport, rng=Lowest())
+    assert report.exit_code is ExitCode.OK
+    (_, first), (_, second) = [entry for entry in transport.started if entry[0] == START]
+    assert second - first >= 1.0 - 0.01
+    assert "https://example.com/: HTTP 503; trying again in 1.00 s" in caplog.messages
+
+
+async def test_an_error_that_would_recur_is_not_tried_again() -> None:
+    replies: dict[str, Answer | list[Answer]] = {
+        START: html("/a", "/b"),
+        "https://example.com/a": ErrorKind.PROTOCOL,
+        "https://example.com/b": Reply(404, HTML),
+    }
+    transport = FakeTransport(replies)
+    report = await crawl(Config(start_url=START), MemorySink(), transport=transport)
+    assert sorted(tries(transport)) == sorted(replies)
+    assert report.stats.failures == {"protocol": 1, "HTTP 404": 1}
+    assert not report.stats.retries
+
+
+async def test_an_item_waits_out_its_backoff_holding_no_permit() -> None:
+    # With one request in flight at most, /bad's backoff (a tenth of 0.5 s) leaves room
+    # for the other pages, each 0.01 s, before /bad is tried again.
+    replies: dict[str, Answer | list[Answer]] = {
+        START: html("/bad", "/1", "/2", "/3"),
+        "https://example.com/bad": [ErrorKind.RESET, html()],
+    }
+    replies |= {f"https://example.com/{n}": html(delay=0.01) for n in (1, 2, 3)}
+    transport = FakeTransport(replies)
+    cfg = Config(start_url=START, max_concurrency=1)
+    report = await crawl(cfg, MemorySink(), transport=transport, rng=Fixed(0.1))
+    assert report.stats.pages == 5
+    assert tries(transport) == [
+        START,
+        "https://example.com/bad",
+        "https://example.com/1",
+        "https://example.com/2",
+        "https://example.com/3",
+        "https://example.com/bad",
+    ]
+
+
+async def test_a_retry_resumes_after_the_redirects_it_followed() -> None:
+    # /old's redirect claimed /new for it. Starting again from /old would find /new claimed,
+    # and nothing would print it.
+    replies: dict[str, Answer | list[Answer]] = {
+        START: html("/old"),
+        "https://example.com/old": Reply(301, {"Location": "/new"}),
+        "https://example.com/new": [ErrorKind.TIMEOUT, html()],
+    }
+    transport, sink = FakeTransport(replies), MemorySink()
+    report = await crawl(Config(start_url=START), sink, transport=transport, rng=Lowest())
+    assert tries(transport) == [
+        START,
+        "https://example.com/old",
+        "https://example.com/new",
+        "https://example.com/new",
+    ]
+    assert sorted(sink.records)[-1] == b"https://example.com/new\n\n"
+    assert not report.stats.failures
+
+
+async def test_the_start_url_is_tried_again_before_the_crawl_gives_up(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    transport = FakeTransport({START: [ErrorKind.RESET, Reply(500, HTML), html()]})
+    report = await crawl(Config(start_url=START), MemorySink(), transport=transport, rng=Lowest())
+    assert report.exit_code is ExitCode.OK
+    assert tries(transport) == [START] * 3
+    assert report.stats.retries == {"reset": 1, "HTTP 500": 1}
+
+    transport = FakeTransport({START: ErrorKind.RESET})
+    cfg = Config(start_url=START, retries=2)
+    report = await crawl(cfg, MemorySink(), transport=transport, rng=Lowest())
+    assert report.exit_code is ExitCode.CANNOT_START
+    assert tries(transport) == [START] * 3
+    assert "can't start: https://example.com/: reset: scripted" in caplog.text
+
+
+class Outage(FakeTransport):
+    """A host that turns the crawl away once its start page is served: every request gets
+    `answer` instead, by default a DNS error, until `failing` probes of the start page have
+    got it too. Then it serves the crawl again."""
+
+    def __init__(
+        self,
+        replies: Mapping[str, Answer | list[Answer]],
+        failing: int,
+        answer: Reply | ErrorKind = ErrorKind.DNS,
+    ) -> None:
+        super().__init__(replies)
+        self.failing = failing
+        self.answer = answer
+        self.served = self.down = False
+        self.failed: list[str] = []  # the requests turned away, in order
+
+    @asynccontextmanager
+    async def open(self, url: str) -> AsyncIterator[FakeResponse]:
+        if self.down and url == START:  # a probe
+            self.down = self.failing > 0
+            self.failing -= 1
+        if not self.down:
+            async with super().open(url) as response:
+                yield response
+            if url == START and not self.served:
+                self.served = self.down = True
+            return
+        self.failed.append(url)
+        await asyncio.sleep(0)
+        if isinstance(self.answer, ErrorKind):
+            raise TransportError(self.answer, "scripted")
+        reply = self.answer
+        yield FakeResponse(url, reply.status, reply.headers, reply.body, reply.read_error)
+
+
+async def test_a_host_that_cant_be_reached_pauses_the_crawl_until_it_can(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The host goes once the start page is served. Eight pages are in flight at a time (DNS
+    # failures don't cut the limit), and the 20th failure in a row opens the breaker: the
+    # seven requests still in flight fail too, and then nothing is requested but probes of
+    # the start page, the second of which finds the host. Every page is printed.
+    transport = Outage(fan_out(pages=40, delay=0.0), failing=1)
+    cfg = Config(start_url=START, first_probe=0.01)
+    report = await crawl(cfg, MemorySink(), transport=transport, rng=Lowest())
+    assert report.exit_code is ExitCode.OK
+    assert report.stats.pages == 41
+    assert not report.stats.failures
+    assert len(transport.failed) == OPENS_AFTER + (INITIAL_LIMIT - 1) + 1  # and a probe
+    assert transport.failed[-1] == START
+    assert caplog.messages == [
+        "20 requests in a row got no answer (dns): pausing the crawl, and checking "
+        "https://example.com/ until it answers, for up to 300 s",
+        "https://example.com/ answers again: resuming the crawl",
+    ]
+
+
+async def test_failures_while_the_host_cant_be_reached_cost_no_retries() -> None:
+    # With no retries, each of the first 19 failures ends its page. The 20th opens the
+    # breaker, and it and those of the seven requests still in flight cost nothing: those
+    # pages are tried again once the host is back.
+    transport = Outage(fan_out(pages=40, delay=0.0), failing=0)
+    cfg = Config(start_url=START, first_probe=0.01, retries=0)
+    report = await crawl(cfg, MemorySink(), transport=transport, rng=Lowest())
+    assert report.stats.failures == {"dns": OPENS_AFTER - 1}
+    assert report.stats.pages == 1 + 40 - (OPENS_AFTER - 1)
+    assert report.stats.retries == {"dns": 1 + (INITIAL_LIMIT - 1)}
+
+
+async def test_a_response_sent_after_the_failures_resumes_the_crawl_before_a_probe(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # /ok was requested after the 20th failure's request, and it answers once the breaker is
+    # open: the host can be reached after all, and the crawl resumes without a probe.
+    replies: dict[str, Answer | list[Answer]] = {
+        START: html(*(f"/{n}" for n in range(OPENS_AFTER)), "/ok"),
+        "https://example.com/ok": html(delay=0.05),
+    }
+    replies |= {f"https://example.com/{n}": [ErrorKind.DNS, html()] for n in range(OPENS_AFTER)}
+    transport = FakeTransport(replies)
+    cfg = Config(start_url=START, retries=0)
+    report = await crawl(cfg, MemorySink(), transport=transport, rng=Lowest())
+    assert report.exit_code is ExitCode.OK
+    assert report.stats.failures == {"dns": OPENS_AFTER - 1}  # no retries
+    assert report.stats.pages == 3  # the start page, /ok, and the page that opened it
+    assert tries(transport).count(START) == 1  # no probe
+    assert caplog.messages[-1] == "https://example.com/ answers again: resuming the crawl"
+
+
+async def test_a_host_that_stays_out_of_reach_aborts_the_crawl(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    transport = Outage(fan_out(pages=40, delay=0.0), failing=1000)
+    sink = MemorySink()
+    cfg = Config(start_url=START, first_probe=0.05, give_up_after=0.2)
+    started = time.monotonic()
+    report = await crawl(cfg, sink, transport=transport, rng=Lowest())
+    assert 0.2 <= time.monotonic() - started < 2
+    assert report.exit_code is ExitCode.ABORTED
+    assert len(sink.records) == 1  # the start page, kept
+    assert sink.closed
+    assert transport.failed.count(START) == 2  # probes at 0.05 s and 0.15 s; the next is too late
+    assert "aborting: https://example.com/ has given no answer for 0.2 s (dns)" in caplog.messages
+    assert report.summary.startswith("1 page in ")
+
+
+FORBIDDEN = Reply(403, HTML, b"<!doctype html>Forbidden")
+
+
+async def test_a_run_of_403s_pauses_the_crawl_until_it_is_served_again(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A firewall refuses the crawl from when the start page is served. The 20th 403 in a
+    # row trips the guard: the 403s of the requests still in flight are held as well, and
+    # nothing is requested but probes of the start page, the second of which is served.
+    # The refused pages are tried again, and two that are forbidden anyway get a 403 again:
+    # that one is final.
+    replies: dict[str, Answer | list[Answer]] = {
+        START: html("/private/1", "/private/2", *(f"/{n}" for n in range(30)))
+    }
+    replies |= {f"https://example.com/private/{n}": FORBIDDEN for n in (1, 2)}
+    replies |= {f"https://example.com/{n}": html() for n in range(30)}
+    transport = Outage(replies, failing=1, answer=FORBIDDEN)
+    cfg = Config(start_url=START, first_probe=0.01)
+    report = await crawl(cfg, MemorySink(), transport=transport, rng=Lowest())
+    assert report.exit_code is ExitCode.OK
+    assert report.stats.pages == 31
+    assert report.stats.failures == {"HTTP 403": 2}
+    refused = len(transport.failed) - 1  # all but the probe that was refused
+    assert refused >= BLOCKED_AFTER
+    assert report.stats.retries == {"HTTP 403": refused}
+    assert caplog.messages == [
+        "20 requests in a row were refused with 403 Forbidden, as a block would refuse "
+        "them: pausing the crawl, and checking https://example.com/ until it's served "
+        "again, for up to 300 s",
+        f"https://example.com/ is served again (HTTP 200): resuming the crawl, and trying "
+        f"the {refused} refused pages again",
+    ]
+
+
+async def test_a_run_of_403s_that_goes_on_aborts_the_crawl(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    transport = Outage(fan_out(pages=40, delay=0.0), failing=1000, answer=FORBIDDEN)
+    sink = MemorySink()
+    cfg = Config(start_url=START, first_probe=0.05, give_up_after=0.2)
+    report = await crawl(cfg, sink, transport=transport, rng=Lowest())
+    assert report.exit_code is ExitCode.ABORTED
+    assert len(sink.records) == 1  # the start page, kept
+    assert transport.failed.count(START) == 2
+    assert (
+        "aborting: https://example.com/ still answers 403 Forbidden after 0.2 s, as a block "
+        "would" in caplog.messages
+    )
+
+
+async def test_forbidden_pages_among_others_are_final_without_a_pause(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A page served after each 403 shows the host isn't refusing the crawl.
+    links = [link for n in range(30) for link in (f"/private/{n}", f"/{n}")]
+    replies: dict[str, Answer | list[Answer]] = {START: html(*links)}
+    replies |= {f"https://example.com/private/{n}": FORBIDDEN for n in range(30)}
+    replies |= {f"https://example.com/{n}": html() for n in range(30)}
+    transport = FakeTransport(replies)
+    report = await crawl(Config(start_url=START), MemorySink(), transport=transport)
+    assert report.stats.pages == 31
+    assert report.stats.failures == {"HTTP 403": 30}
+    assert not report.stats.retries
+    assert len(tries(transport)) == 61  # each once
+    assert not caplog.messages
+
+
+async def test_403s_that_nothing_else_can_settle_are_final() -> None:
+    # The crawl's last pages are refused, and the run is short of a block: with nothing
+    # left to show whether the host serves the crawl, the 403s are final, and it ends.
+    replies: dict[str, Answer | list[Answer]] = {START: html("/a", "/b")}
+    replies |= {"https://example.com/a": FORBIDDEN, "https://example.com/b": FORBIDDEN}
+    report = await crawl(Config(start_url=START), MemorySink(), transport=FakeTransport(replies))
+    assert report.exit_code is ExitCode.OK
+    assert report.stats.failures == {"HTTP 403": 2}
+
+
+async def test_links_that_a_rule_rejects_are_printed_and_counted_not_crawled() -> None:
+    replies: dict[str, Answer | list[Answer]] = {
+        START: html("/report.pdf", "/logo.PNG", "/a/a/a/a", "/page"),
+        "https://example.com/page": html(),
+    }
+    transport, sink = FakeTransport(replies), MemorySink()
+    report = await crawl(Config(start_url=START), sink, transport=transport)
+    assert pages(transport) == [START, "https://example.com/page"]
+    assert sink.records[0].count(b"\n  ") == 4  # all four printed
+    assert report.rejected == {"file extension": 2, "path segment repeated": 1}
+    assert (
+        "not crawled: file extension (2, such as https://example.com/report.pdf), path "
+        "segment repeated (1, such as https://example.com/a/a/a/a)" in report.summary
+    )
+
+
+async def test_no_skip_extensions_crawls_every_link() -> None:
+    replies: dict[str, Answer | list[Answer]] = {
+        START: html("/old.pdf"),
+        "https://example.com/old.pdf": Reply(301, {"Location": "/new"}),
+        "https://example.com/new": html(),
+    }
+    transport = FakeTransport(replies)
+    cfg = Config(start_url=START, skip_extensions=False)
+    report = await crawl(cfg, MemorySink(), transport=transport)
+    assert report.stats.pages == 2
+    assert not report.rejected
+
+
+async def test_a_page_over_the_size_cap_is_parsed_as_far_as_it_got() -> None:
+    # The cap falls after the first link: the page is printed with it, and counted.
+    body = b'<a href="/near">x</a>' + b" " * 1000 + b'<a href="/far">y</a>'
+    replies: dict[str, Answer | list[Answer]] = {
+        START: html("/big"),
+        "https://example.com/big": Reply(headers=HTML, body=body),
+        "https://example.com/near": html(),
+    }
+    transport, sink = FakeTransport(replies), MemorySink()
+    report = await crawl(Config(start_url=START, max_page_bytes=500), sink, transport=transport)
+    assert b"https://example.com/big\n  https://example.com/near\n\n" in sink.records
+    assert pages(transport) == [START, "https://example.com/big", "https://example.com/near"]
+    assert report.stats.truncated == 1
+    assert ", 1 cut short" in report.summary
 
 
 async def test_records_stream_in_the_order_pages_complete() -> None:

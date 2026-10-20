@@ -8,7 +8,7 @@ import sys
 import time
 import zlib
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Mapping
 from compression import zstd
 from pathlib import Path
 
@@ -40,7 +40,8 @@ def hand_built(port: int, other_port: int) -> dict[str, Resource]:
             f"http://127.0.0.1:{other_port}/",
             "/old",
             "/also-old",  # redirects to /new too: /new is fetched and printed once
-            "/file.bin",
+            "/download",  # not HTML: fetched, and counted
+            "/archive.zip",  # by its extension, not HTML: printed, never requested
             "/missing",
             "#top",
             "mailto:someone@example.com",
@@ -61,7 +62,7 @@ def hand_built(port: int, other_port: int) -> dict[str, Resource]:
         "/old": redirect("/new"),
         "/also-old": redirect("/new", status=302),
         "/new": page("/"),
-        "/file.bin": Resource(
+        "/download": Resource(
             body=b"\0" * 100, headers=(("Content-Type", "application/octet-stream"),)
         ),
         "/~user/": page("/%7Euser/"),
@@ -80,7 +81,8 @@ def hand_built_records(port: int, other_port: int) -> list[bytes]:
             f"http://127.0.0.1:{other_port}/",
             f"{o}/old",
             f"{o}/also-old",
-            f"{o}/file.bin",
+            f"{o}/download",
+            f"{o}/archive.zip",
             f"{o}/missing",
             f"{o}/",
             f"{o}/~user/",
@@ -122,7 +124,7 @@ async def test_a_hand_built_site(parse_workers: int) -> None:
             "/old",
             "/also-old",
             "/new",
-            "/file.bin",
+            "/download",
             "/missing",
             "/~user/",
         ]
@@ -133,8 +135,8 @@ async def test_a_hand_built_site(parse_workers: int) -> None:
     # Whichever of /old and /also-old answered second found /new already claimed.
     assert stats.failures == {"HTTP 404": 1, "redirect to a URL already claimed": 1}
     assert stats.statuses == {200: 9, 301: 1, 302: 1, 404: 1}
-    assert report.unique_urls == 13  # /new, reached only by redirect, among them
-    assert report.rejected == {"robots.txt": 1}
+    assert report.unique_urls == 14  # /new, reached only by redirect, among them
+    assert report.rejected == {"robots.txt": 1, "file extension": 1}
 
 
 def _compressed(name: str, *codings: str, content_type: str | None = HTML) -> Resource:
@@ -217,6 +219,9 @@ async def test_compressed_pages_are_crawled_as_a_browser_reads_them(parse_worker
     assert report.stats.failures == {"bad content-encoding": 1}
     assert report.stats.not_html == 1  # nosniff: its body isn't sniffed
     assert report.stats.decoded_bytes < 2 << 20  # the bomb stopped at the cap
+    # Corrupt data would be corrupt again: it isn't retried.
+    assert site.targets().count("/corrupt") == 1
+    assert not report.stats.retries
 
 
 @pytest.mark.parametrize("seed", range(4))
@@ -303,8 +308,55 @@ async def test_a_redirect_loop_ends_at_the_hop_limit(parse_workers: int) -> None
     assert site.targets() == ["/robots.txt", "/", *(["/loop", "/loop/"] * 6)[:11]]
 
 
+class _SoftNotFound(Mapping[str, Resource | Handler]):
+    """resources, and a page for any path under /soft/, as a site that answers 404s with a
+    page does: each links to a/, so a crawl would go deeper for ever."""
+
+    def __init__(self, resources: dict[str, Resource | Handler]) -> None:
+        self._resources = resources
+
+    def __getitem__(self, target: str) -> Resource | Handler:
+        return page("a/") if target.startswith("/soft/") else self._resources[target]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._resources)
+
+    def __len__(self) -> int:
+        return len(self._resources)
+
+
+async def test_trap_rules_end_a_crawl_that_would_never_end(parse_workers: int) -> None:
+    # An endless calendar, each month linking to the next, and a soft-404 site: the trap
+    # rules cut both, and the summary says where.
+    async def calendar(request: web.Request) -> web.StreamResponse:
+        month = int(request.query.get("month", "0"))
+        return web.Response(body=f'<a href="?month={month + 1}">next</a>', content_type="text/html")
+
+    resources: dict[str, Resource | Handler] = {"/": page("/cal", "/soft/"), "/cal": calendar}
+    resources |= {f"/cal?month={n}": calendar for n in range(1, 60)}
+    async with Site(_SoftNotFound(resources)) as site:
+        cfg = Config(
+            start_url=site.url(),
+            ignore_robots=True,
+            max_query_variants=50,
+            parse_workers=parse_workers,
+        )
+        report = await crawl(cfg, MemorySink())
+    assert report.exit_code is ExitCode.OK
+    months = [f"/cal?month={n}" for n in range(1, 51)]
+    deeper = ["/soft/", "/soft/a/", "/soft/a/a/", "/soft/a/a/a/"]
+    assert sorted(site.targets()) == sorted(["/", "/cal", *months, *deeper])
+    assert report.rejected == {"too many query variants": 1, "path segment repeated": 1}
+    assert report.examples == {
+        "too many query variants": [site.url("/cal?month=51")],
+        "path segment repeated": [site.url("/soft/a/a/a/a/")],
+    }
+
+
 START_FAILURES = {
-    "error status": (Resource(status=500), "{start}: HTTP 500"),
+    # Not a 500, which is tried again first, after random backoffs; tests/unit/test_engine.py
+    # has the start URL's retries.
+    "error status": (Resource(status=404), "{start}: HTTP 404"),
     "not html": (
         Resource(body=b"%PDF", headers=(("Content-Type", "application/pdf"),)),
         "{start} isn't an HTML page (Content-Type: application/pdf)",
@@ -502,11 +554,11 @@ async def test_sigterm_stops_the_crawl_and_an_ignored_sigint_stays_ignored(
 
 def _wide_site(size: int) -> dict[str, Resource | Handler]:
     """size pages, each linking to all of them, and to a missing page and a non-page."""
-    links = ["/missing", "/file.bin", *(f"/{n}" for n in range(1, size))]
+    links = ["/missing", "/download", *(f"/{n}" for n in range(1, size))]
     pages: dict[str, Resource | Handler] = {f"/{n}": page(*links) for n in range(1, size)}
     return pages | {
         "/": page(*links),
-        "/file.bin": Resource(body=b"\0", headers=(("Content-Type", "application/zip"),)),
+        "/download": Resource(body=b"\0", headers=(("Content-Type", "application/zip"),)),
     }
 
 
@@ -525,7 +577,7 @@ async def test_max_pages_prints_and_fetches_at_most_n_pages(
         report = await crawl(cfg, sink)
     assert report.exit_code is ExitCode.OK
     assert len(sink.records) == printed  # exactly N, or every page of a smaller site
-    page_fetches = [t for t in site.targets() if t not in ("/missing", "/file.bin")]
+    page_fetches = [t for t in site.targets() if t not in ("/missing", "/download")]
     assert len(page_fetches) == printed  # no page fetched only to be thrown away
     assert len(set(page_fetches)) == printed
 

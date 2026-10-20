@@ -3,10 +3,13 @@
 
 The fetcher follows redirects itself, so that each hop is checked and claimed before it's
 requested, and reads only the bodies worth reading. What to do with a response is decided
-by triage() from the status and headers alone.
+by triage() from the status and headers alone, and whether a failure is worth another try
+by retry.classify().
 """
 
 import asyncio
+import contextlib
+import dataclasses
 import enum
 import random
 import time
@@ -29,10 +32,12 @@ from web_crawler.content import (
     sniff_html,
 )
 from web_crawler.frontier import Admission, Hop
+from web_crawler.limiter import parse_retry_after
+from web_crawler.retry import Class, classify
 from web_crawler.robots import Availability, RobotsTxt
 from web_crawler.stats import Stats
-from web_crawler.transport import ErrorKind, Response, Transport, TransportError
-from web_crawler.types import CrawlItem, ParseJob
+from web_crawler.transport import Response, Transport, TransportError
+from web_crawler.types import CrawlItem, ErrorKind, ParseJob
 from web_crawler.urls import dedupe_key, strip_fragment
 
 MAX_REDIRECTS = 10
@@ -84,7 +89,29 @@ class Final:
         return self.chain[-1]
 
 
-type FetchOutcome = Page | NotPage | Claimed | Final
+@dataclass(frozen=True, slots=True)
+class Retry:
+    """The item failed in a way that another try may not (DESIGN.md §5.4)."""
+
+    item: CrawlItem  # to request again: the item where it failed, as resume() makes it
+    cls: Class  # what kind of failure, which says what budget a retry uses
+    final: Final  # how the item ends if it isn't tried again
+    retry_after: float | None = None  # seconds a 429 or 503's Retry-After asks for
+
+
+type FetchOutcome = Page | NotPage | Claimed | Retry | Final
+
+
+def resume(item: CrawlItem, chain: Sequence[str]) -> CrawlItem:
+    """item, to request again where it got to: the last of chain, the URLs it requested,
+    after the redirects that led there. Starting again from its first URL would find the
+    redirects' targets claimed, by this item, and nothing would print the page."""
+    if len(chain) == len(item.redirected_from) + 1:
+        return item
+    url = chain[-1]
+    return dataclasses.replace(
+        item, url=url, key=dedupe_key(url), redirected_from=tuple(chain[:-1])
+    )
 
 
 class HopPolicy(Protocol):
@@ -165,11 +192,12 @@ class _Redirect:
 _STOPPED = {
     Hop.OUT_OF_SCOPE: ("redirect out of scope", "outside the crawl's scope"),
     Hop.DISALLOWED: ("redirect disallowed", "which robots.txt disallows"),
+    Hop.TRAP: ("redirect to a trap", "which a trap rule rejects"),
 }
 
 
 class Fetcher:
-    def __init__(
+    def __init__(  # noqa: PLR0913  (the collaborators that tests replace)
         self,
         transport: Transport,
         max_page_bytes: int,
@@ -177,12 +205,14 @@ class Fetcher:
         *,
         signals: Signals | None = None,
         clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
     ) -> None:
         self._transport = transport
         self._max_page_bytes = max_page_bytes
         self._stats = stats
         self._signals = signals or _Unheard()
         self._clock = clock
+        self._wall_clock = wall_clock  # for Retry-After's dates
 
     async def fetch(self, item: CrawlItem, hops: HopPolicy) -> FetchOutcome:
         """Request item.url and follow its redirects to a page, or to why there isn't one.
@@ -190,19 +220,25 @@ class Fetcher:
         Each redirect target is claimed before it's requested (hops), so a page reached by
         redirect is fetched once, however many URLs lead to it. A target that comes back
         within the chain is followed again, as a cookie gate needs; a real loop ends after
-        MAX_REDIRECTS redirects, and is reported as one.
+        MAX_REDIRECTS redirects, and is reported as one. An item tried again carries the
+        redirects it followed before, and the chain goes on from them.
+
+        A failure that another try may not repeat is a Retry; whether there is one is the
+        caller's to decide.
         """
-        chain = [item.url]
-        keys = {item.key}
+        chain = [*item.redirected_from, item.url]
+        keys = {dedupe_key(url) for url in item.redirected_from}
+        keys.add(item.key)
         while True:
             issued = self._clock()
             try:
                 async with self._transport.open(chain[-1]) as response:
                     self._signals.answered(response.status, response.ttfb, issued)
-                    outcome = await self._handle(response, tuple(chain))
+                    outcome = await self._handle(response, tuple(chain), item)
             except TransportError as error:
                 self._signals.failed(error.kind, issued)
-                return Final(str(error.kind), str(error), tuple(chain))
+                final = Final(str(error.kind), str(error), tuple(chain))
+                return _retry_or(final, classify(error.kind), item)
             if not isinstance(outcome, _Redirect):
                 return outcome
             target, status = outcome.target, outcome.status
@@ -220,13 +256,26 @@ class Fetcher:
                 detail = f"HTTP {status} to {target}, {why}"
                 return Final(reason, detail, tuple(chain), status, target)
 
-    async def _handle(self, response: Response, chain: tuple[str, ...]) -> FetchOutcome | _Redirect:
-        """The outcome of one response, the last of chain, or the redirect it makes."""
+    async def probe(self, url: str) -> int | None:
+        """The status of one request for url, with no redirect followed and no body read,
+        or None if it got no response: a check on a host the crawl paused for, which the
+        concurrency limit doesn't count (DESIGN.md §5.3)."""
+        try:
+            async with self._transport.open(url) as response:
+                return response.status
+        except TransportError:
+            return None
+
+    async def _handle(
+        self, response: Response, chain: tuple[str, ...], item: CrawlItem
+    ) -> FetchOutcome | _Redirect:
+        """The outcome of item's request for the last URL of chain, or the redirect it
+        makes."""
         status = response.status
         self._stats.statuses[status] += 1
         match triage(status, response.headers):
             case Triage.REDIRECT:
-                await response.read(DRAIN_LIMIT)  # so its connection can be reused
+                await _drain(response)
                 location = response.headers["Location"]
                 try:
                     target = strip_fragment(ada_url.join_url(response.url, location))
@@ -243,7 +292,20 @@ class Fetcher:
                 await _drain_if_small(response)
                 return NotPage(response.url, response.headers.get("Content-Type"))
             case Triage.FINAL:  # pragma: no branch  (the cases are exhaustive)
-                return Final(f"HTTP {status}", f"HTTP {status}", chain, status)
+                return await self._failed(response, chain, item)
+
+    async def _failed(
+        self, response: Response, chain: tuple[str, ...], item: CrawlItem
+    ) -> Retry | Final:
+        """An answer that isn't a page or a redirect: final, or worth another try. A 429 or
+        503 says how long to wait in its Retry-After, if it says."""
+        await _drain_if_small(response)
+        status = response.status
+        final = Final(f"HTTP {status}", f"HTTP {status}", chain, status)
+        if (cls := classify(status)) is not Class.THROTTLE:
+            return _retry_or(final, cls, item)
+        value = response.headers.get("Retry-After")
+        return Retry(resume(item, chain), cls, final, parse_retry_after(value, self._wall_clock()))
 
     async def _sniff(self, response: Response, chain: tuple[str, ...]) -> Page | NotPage | Final:
         """A 2xx response without a usable type: a page if its body starts as HTML does. The
@@ -372,7 +434,7 @@ class RobotsFetcher:
                     except ContentDecodeError as error:
                         return _Answer(status, undecodable=str(error))
                     return _Answer(status, text, more or cut)
-                await response.read(DRAIN_LIMIT)  # so its connection can be reused
+                await _drain(response)
                 if status in REDIRECT_STATUSES and "Location" in response.headers:
                     try:
                         location = ada_url.join_url(url, response.headers["Location"])
@@ -382,6 +444,11 @@ class RobotsFetcher:
                 return _Answer(status)
         except TransportError as error:
             return error
+
+
+def _retry_or(final: Final, cls: Class, item: CrawlItem) -> Retry | Final:
+    """A Retry of item where final ended it, if final is worth another try."""
+    return final if cls is Class.FINAL else Retry(resume(item, final.chain), cls, final)
 
 
 def _too_many_redirects(chain: tuple[str, ...], looped: bool, target: str, status: int) -> Final:
@@ -401,10 +468,19 @@ def _page(response: Response, body: bytes, truncated: bool) -> Page:
 
 
 async def _drain_if_small(response: Response) -> None:
-    """Read the rest of an unwanted body if it's small, so that its connection can be
-    reused; a bigger one is cheaper to drop with its connection."""
+    """Read the rest of an unwanted body if it says it's small, so that its connection can
+    be reused; a bigger one, or one of unknown size, is cheaper to drop with its
+    connection."""
     size = _content_length(response.headers)
     if size is not None and size <= DRAIN_LIMIT:
+        await _drain(response)
+
+
+async def _drain(response: Response) -> None:
+    """Read up to DRAIN_LIMIT more bytes of an unwanted body, so that its connection can be
+    reused if that was the rest of it. One that fails to arrive is no matter: its
+    connection is closed instead."""
+    with contextlib.suppress(TransportError):
         await response.read(DRAIN_LIMIT)
 
 

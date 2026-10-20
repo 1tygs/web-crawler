@@ -5,8 +5,8 @@ Nothing above this module imports aiohttp: its exceptions arrive as TransportErr
 """
 
 import contextvars
-import enum
 import logging
+import math
 import ssl
 import time
 import urllib.request
@@ -24,6 +24,7 @@ from aiohttp.tracing import Trace
 from multidict import CIMultiDictProxy
 
 from web_crawler.config import Config
+from web_crawler.types import ErrorKind
 
 log = logging.getLogger(__name__)
 
@@ -33,18 +34,6 @@ KIB = 1024
 # (DESIGN.md §5.2).
 ACCEPT = "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8"
 ACCEPT_ENCODING = "gzip, deflate, br, zstd"
-
-
-class ErrorKind(enum.StrEnum):
-    DNS = "dns"
-    CONNECT = "connect"
-    TLS = "tls"
-    CONNECT_TIMEOUT = "connect_timeout"
-    TIMEOUT = "timeout"
-    RESET = "reset"  # the connection was closed or reset
-    PAYLOAD = "payload"  # the body ended early
-    PROTOCOL = "protocol"  # the response wasn't valid HTTP
-    INVALID_URL = "invalid_url"
 
 
 class TransportError(Exception):
@@ -186,7 +175,14 @@ class _Exchange:
             )
             ttfb = time.perf_counter() - max(started, _connected.get(started))
         except (aiohttp.ClientError, TimeoutError, ValueError) as error:
-            raise transport_error(error) from error
+            failure = transport_error(error)
+            if failure.kind is ErrorKind.TIMEOUT and _connected.get(-math.inf) < started:
+                # The whole request's timeout ran out before it had a connection, as it does
+                # when it's shorter than the connect timeout, or while the host's name is
+                # resolved: the host wasn't reached.
+                detail = str(error) or type(error).__name__
+                failure = TransportError(ErrorKind.CONNECT_TIMEOUT, detail)
+            raise failure from error
         return _AiohttpResponse(self._url, self._response, ttfb)
 
     async def __aexit__(

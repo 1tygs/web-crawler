@@ -7,7 +7,13 @@ the argument parser.
 import math
 from dataclasses import dataclass
 
-from web_crawler.urls import StartURLError, normalize_start
+from web_crawler.urls import (
+    MAX_QUERY_VARIANTS,
+    MAX_SEGMENT_REPEATS,
+    MAX_URL_LENGTH,
+    StartURLError,
+    normalize_start,
+)
 
 MIB = 1024 * 1024
 
@@ -26,39 +32,61 @@ class Config:
     max_concurrency: int = 64  # upper bound on requests in flight
     parse_workers: int | None = None  # parser processes; None: one fewer than the CPUs
     max_rps: float | None = None  # requests started per second, at most
-    timeout: float = 60.0  # seconds, for one whole request
-    max_page_bytes: int = 32 * MIB  # body bytes read from one page
+    timeout: float = 60.0  # seconds for one whole request, from connecting to the body's end
+    retries: int = 3  # how many times an item is tried again after an error; not a 429 or 503
+    # The most of a page's body that's read, as sent, and that it decompresses to.
+    max_page_bytes: int = 32 * MIB
     max_pages: int | None = None  # stop once this many pages are printed
     all_urls: bool = False  # print every URL-bearing attribute; still crawl only links
     ignore_robots: bool = False  # for crawling your own site
     strict_host: bool = False  # a start URL that redirects to its www. variant can't start
     insecure: bool = False  # don't verify TLS certificates
+    skip_extensions: bool = True  # don't crawl links to files that are almost never HTML
+    # The trap rules' thresholds (DESIGN.md §5.1), which have no flags.
+    max_url_length: int = MAX_URL_LENGTH  # characters
+    max_segment_repeats: int = MAX_SEGMENT_REPEATS  # times one segment may occur in a path
+    max_query_variants: int = MAX_QUERY_VARIANTS  # distinct query strings for one path
     robots_refresh: float = 24 * 3600.0  # seconds between fetches of robots.txt (RFC 9309)
+    # A host the crawl pauses for, as unreachable, is checked first_probe seconds after the
+    # pause began, then twice as long after each check, up to a minute apart; after
+    # give_up_after seconds the crawl aborts.
+    first_probe: float = 1.0
+    give_up_after: float = 300.0
 
     def __post_init__(self) -> None:
         try:
             normalize_start(self.start_url)
         except StartURLError as error:
             raise ConfigError(str(error)) from None
-        if self.max_concurrency < 1:
-            raise ConfigError(f"max_concurrency must be at least 1, not {self.max_concurrency}")
-        if self.parse_workers is not None and self.parse_workers < 0:
-            raise ConfigError(f"parse_workers must be at least 0, not {self.parse_workers}")
-        if self.max_rps is not None and not (math.isfinite(self.max_rps) and self.max_rps > 0):
-            raise ConfigError(
-                f"max_rps must be a positive number of requests per second, not {self.max_rps}"
-            )
-        if not (math.isfinite(self.timeout) and self.timeout > 0):
-            raise ConfigError(f"timeout must be a positive number of seconds, not {self.timeout}")
-        if not (math.isfinite(self.robots_refresh) and self.robots_refresh > 0):
-            raise ConfigError(
-                f"robots_refresh must be a positive number of seconds, not {self.robots_refresh}"
-            )
-        if self.max_page_bytes < 1:
-            raise ConfigError(f"max_page_bytes must be at least 1, not {self.max_page_bytes}")
-        if self.max_pages is not None and self.max_pages < 1:
-            raise ConfigError(f"max_pages must be at least 1, not {self.max_pages}")
+        for name, least in _AT_LEAST.items():
+            if (count := getattr(self, name)) is not None and count < least:
+                raise ConfigError(f"{name} must be at least {least}, not {count}")
+        for name, unit in _POSITIVE.items():
+            value = getattr(self, name)
+            if value is not None and not (math.isfinite(value) and value > 0):
+                raise ConfigError(f"{name} must be a positive number of {unit}, not {value}")
         if not (self.user_agent.strip() and self.user_agent.isascii()):
             raise ConfigError(f"user_agent must be non-blank ASCII, not {self.user_agent!r}")
         if not self.user_agent.isprintable():
             raise ConfigError(f"user_agent can't contain control characters: {self.user_agent!r}")
+
+
+# The least each count may be, and the unit of each number that must be positive. A setting
+# that may be None, for no limit, is checked only when it's set.
+_AT_LEAST = {
+    "max_concurrency": 1,
+    "parse_workers": 0,
+    "retries": 0,
+    "max_page_bytes": 1,
+    "max_pages": 1,
+    "max_url_length": 1,
+    "max_segment_repeats": 1,
+    "max_query_variants": 1,
+}
+_POSITIVE = {
+    "max_rps": "requests per second",
+    "timeout": "seconds",
+    "robots_refresh": "seconds",
+    "first_probe": "seconds",
+    "give_up_after": "seconds",
+}

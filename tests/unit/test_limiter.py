@@ -1,10 +1,31 @@
 """ADR-001's concurrency law (DESIGN.md §5.3): its state machine, step by step, and its
 behaviour on A.11's simulated servers, which bench/limiter_sim.py runs on this same class."""
 
+import email.utils
+import math
+
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from tests.support.bench import simulate
-from web_crawler.limiter import ConcurrencyLaw, Decision, Kind, PauseGate, rate_ceiling
+from web_crawler.limiter import (
+    BLOCKED_AFTER,
+    LONGEST_PROBE,
+    MAX_PAUSE,
+    OPENS_AFTER,
+    BlockGuard,
+    CircuitBreaker,
+    ConcurrencyLaw,
+    Decision,
+    Kind,
+    PauseGate,
+    Probes,
+    Verdict,
+    parse_retry_after,
+    rate_ceiling,
+)
+from web_crawler.types import CrawlItem, ErrorKind
 
 BASE = 0.100  # seconds: the first round's median time to first byte
 
@@ -190,6 +211,76 @@ def test_without_a_rate_the_gate_never_waits() -> None:
     assert gate.delay(1.0) == 0
 
 
+def test_a_pause_holds_every_start_back_until_it_ends() -> None:
+    gate = PauseGate()
+    gate.pause(until=40.0)
+    assert gate.delay(10.0) == 30.0
+    gate.pause(until=20.0)  # an earlier end doesn't shorten it
+    assert gate.delay(10.0) == 30.0
+    gate.pause(until=50.0)  # a later one extends it
+    assert gate.delay(10.0) == 40.0
+    assert gate.delay(50.0) == 0
+
+
+def test_a_pause_and_the_rate_ceiling_each_hold_starts_back() -> None:
+    gate = PauseGate(rate=1)
+    gate.take(10.0)
+    gate.pause(until=10.5)
+    assert gate.delay(10.0) == 1.0  # the rate's turn is later than the pause's end
+    gate.pause(until=12.0)
+    assert gate.delay(10.0) == 2.0
+    assert gate.delay(12.0) == 0
+
+
+NOW = 784111777.0  # Sun, 06 Nov 1994 08:49:37 GMT, RFC 9110's example date
+
+
+@pytest.mark.parametrize(
+    ("value", "seconds"),
+    [
+        ("120", 120.0),
+        ("0", 0.0),
+        (" 5\t", 5.0),
+        ("300", MAX_PAUSE),
+        ("301", MAX_PAUSE),  # capped
+        ("9" * 400, MAX_PAUSE),
+        # An HTTP date, in each of the three formats HTTP allows: IMF-fixdate, RFC 850 and
+        # asctime, which has no zone and is GMT.
+        ("Sun, 06 Nov 1994 08:51:37 GMT", 120.0),
+        ("Sunday, 06-Nov-94 08:51:37 GMT", 120.0),
+        ("Sun Nov  6 08:51:37 1994", 120.0),
+        ("Sun, 06 Nov 1994 08:49:37 GMT", 0.0),  # now
+        ("Sun, 06 Nov 1994 08:00:00 GMT", 0.0),  # past
+        ("Sun, 06 Nov 1994 09:49:37 GMT", MAX_PAUSE),  # an hour from now: capped
+    ],
+)
+def test_retry_after_is_seconds_or_a_date(value: str, seconds: float) -> None:
+    assert parse_retry_after(value, NOW) == seconds
+
+
+@pytest.mark.parametrize(
+    "value",
+    [None, "", "soon", "-5", "1.5", "+30", "١٢٠", "1994-11-06T08:51:37Z", "Sun, 31 Feb 1994"],
+)
+def test_retry_after_that_says_neither_is_ignored(value: str | None) -> None:
+    assert parse_retry_after(value, NOW) is None
+
+
+@given(st.text(), st.floats(0, 4e9))
+def test_retry_after_is_never_more_than_the_cap(value: str, now: float) -> None:
+    seconds = parse_retry_after(value, now)
+    assert seconds is None or 0.0 <= seconds <= MAX_PAUSE
+
+
+@given(st.integers(0, 10**6))
+def test_retry_after_reads_a_date_that_email_utils_writes(ahead: int) -> None:
+    date = email.utils.formatdate(NOW + ahead, usegmt=True)
+    assert parse_retry_after(date, NOW) == min(ahead, MAX_PAUSE)
+    assert math.isclose(
+        parse_retry_after(date, NOW + 0.25) or 0.0, max(min(ahead, 300.25) - 0.25, 0.0)
+    )
+
+
 @pytest.mark.parametrize(
     ("max_rps", "crawl_delay", "rate"),
     [
@@ -203,6 +294,172 @@ def test_without_a_rate_the_gate_never_waits() -> None:
 )
 def test_rate_ceiling(max_rps: float | None, crawl_delay: float | None, rate: float | None) -> None:
     assert rate_ceiling(max_rps, crawl_delay) == rate
+
+
+def test_probes_back_off_from_the_first_wait_to_a_minute() -> None:
+    probes = Probes(first=1.0, give_up_after=300.0)
+    probes.start(100.0)
+    assert (probes.began, probes.next, probes.deadline) == (100.0, 101.0, 400.0)
+    waits = []
+    for _ in range(9):
+        now = probes.next
+        probes.failed(now)
+        waits.append(probes.next - now)
+    assert waits == [2.0, 4.0, 8.0, 16.0, 32.0, LONGEST_PROBE, 60.0, 60.0, 60.0]
+    probes.start(1000.0)  # a pause later on starts from the first wait again
+    assert (probes.next, probes.deadline) == (1001.0, 1300.0)
+
+
+def opened(breaker: CircuitBreaker, at: float = 10.0) -> CircuitBreaker:
+    """breaker, opened by failures of requests sent up to time at."""
+    for n in range(OPENS_AFTER):
+        breaker.failed(ErrorKind.CONNECT, issued_at=at - OPENS_AFTER + n + 1, now=at)
+    assert breaker.open
+    return breaker
+
+
+@pytest.mark.parametrize(
+    "kind", [ErrorKind.DNS, ErrorKind.CONNECT, ErrorKind.TLS, ErrorKind.CONNECT_TIMEOUT]
+)
+def test_the_breaker_opens_after_20_connection_failures_in_a_row(kind: ErrorKind) -> None:
+    breaker = CircuitBreaker(first_probe=1.0, give_up_after=300.0)
+    for n in range(OPENS_AFTER - 1):
+        assert not breaker.failed(kind, issued_at=n, now=n + 0.5)
+        assert not breaker.open
+    assert breaker.failed(kind, issued_at=19.0, now=19.5)
+    assert breaker.open
+    assert breaker.last is kind
+    assert (breaker.probes.next, breaker.probes.deadline) == (20.5, 319.5)
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        ErrorKind.RESET,
+        ErrorKind.TIMEOUT,
+        ErrorKind.PAYLOAD,
+        ErrorKind.PROTOCOL,
+        ErrorKind.INVALID_URL,
+    ],
+)
+def test_a_failure_after_connecting_neither_counts_nor_breaks_a_run(kind: ErrorKind) -> None:
+    breaker = CircuitBreaker()
+    for n in range(OPENS_AFTER - 1):
+        breaker.failed(ErrorKind.CONNECT, issued_at=n, now=n)
+        assert not breaker.failed(kind, issued_at=n, now=n)
+    assert breaker.failed(ErrorKind.CONNECT, issued_at=19.0, now=19.0)
+
+
+def test_a_response_starts_the_count_again() -> None:
+    breaker = CircuitBreaker()
+    for n in range(OPENS_AFTER - 1):
+        breaker.failed(ErrorKind.CONNECT, issued_at=n, now=n)
+    assert not breaker.answered(issued_at=18.5)  # sent after the last failure's request
+    for n in range(OPENS_AFTER - 1):
+        assert not breaker.failed(ErrorKind.CONNECT, issued_at=20 + n, now=20 + n)
+    assert not breaker.open
+
+
+def test_a_response_to_a_request_sent_before_the_failures_says_nothing() -> None:
+    breaker = CircuitBreaker()
+    for n in range(OPENS_AFTER - 1):
+        breaker.failed(ErrorKind.CONNECT, issued_at=n, now=n)
+    assert not breaker.answered(issued_at=18.0)  # sent with the last failure
+    assert breaker.failed(ErrorKind.CONNECT, issued_at=19.0, now=19.0)
+    assert not breaker.answered(issued_at=5.0)  # long on its way: the host may be gone since
+    assert breaker.open
+
+
+def test_a_response_to_a_later_request_closes_the_breaker() -> None:
+    breaker = opened(CircuitBreaker())
+    assert breaker.answered(issued_at=10.5)  # a probe
+    assert not breaker.open
+    assert not breaker.answered(issued_at=11.0)  # already closed
+    # Closed, it counts afresh, and a run opens it again, with probes from the first wait.
+    for n in range(OPENS_AFTER - 1):
+        breaker.failed(ErrorKind.DNS, issued_at=50 + n, now=50 + n)
+    assert breaker.failed(ErrorKind.DNS, issued_at=69.0, now=69.5)
+    assert breaker.probes.next == 70.5
+
+
+def test_failures_while_open_change_nothing() -> None:
+    breaker = opened(CircuitBreaker())
+    probes = (breaker.probes.next, breaker.probes.deadline)
+    assert not breaker.failed(ErrorKind.TLS, issued_at=10.0, now=12.0)
+    assert breaker.last is ErrorKind.CONNECT
+    assert (breaker.probes.next, breaker.probes.deadline) == probes
+    assert breaker.open
+
+
+def page(n: int) -> CrawlItem:
+    return CrawlItem(f"https://example.com/{n}", f"https://example.com/{n}", 1)
+
+
+def test_403s_are_held_while_their_run_is_short_of_a_block() -> None:
+    guard = BlockGuard()
+    for n in range(BLOCKED_AFTER - 1):
+        assert guard.forbidden(page(n), issued_at=n, now=n) is Verdict.HELD
+    assert guard.held == BLOCKED_AFTER - 1
+    assert not guard.tripped
+
+
+def test_a_response_to_a_request_sent_after_the_runs_first_403_settles_it() -> None:
+    guard = BlockGuard()
+    guard.forbidden(page(0), issued_at=5.0, now=6.0)
+    guard.forbidden(page(1), issued_at=7.0, now=8.0)
+    assert guard.answered(issued_at=4.0) == []  # sent before the run began: may be stale
+    assert guard.answered(issued_at=5.0) == []
+    assert guard.answered(issued_at=5.5) == [page(0), page(1)]  # the host serves the crawl
+    assert guard.held == 0
+    assert guard.answered(issued_at=100.0) == []  # no run to settle
+
+
+def test_a_run_begins_with_its_earliest_request() -> None:
+    # A 403 for a request sent earlier, though it came later, moves the run's start back.
+    guard = BlockGuard()
+    guard.forbidden(page(0), issued_at=5.0, now=6.0)
+    guard.forbidden(page(1), issued_at=3.0, now=7.0)
+    assert guard.answered(issued_at=4.0) == [page(0), page(1)]
+
+
+def tripped(guard: BlockGuard, now: float = 20.0) -> BlockGuard:
+    for n in range(BLOCKED_AFTER - 1):
+        assert guard.forbidden(page(n), issued_at=n, now=n) is Verdict.HELD
+    assert guard.forbidden(page(19), issued_at=19.0, now=now) is Verdict.TRIPPED
+    return guard
+
+
+def test_the_20th_403_in_a_row_trips_the_guard() -> None:
+    guard = tripped(BlockGuard(first_probe=1.0, give_up_after=300.0))
+    assert guard.tripped
+    assert (guard.probes.next, guard.probes.deadline) == (21.0, 320.0)
+    # Tripped, it holds every 403, and only a probe ends it.
+    assert guard.forbidden(page(20), issued_at=18.0, now=21.0) is Verdict.HELD
+    assert guard.answered(issued_at=25.0) == []
+    assert guard.tripped
+    assert guard.held == BLOCKED_AFTER + 1
+
+
+def test_when_the_block_ends_the_held_pages_are_tried_again_once() -> None:
+    guard = tripped(BlockGuard())
+    assert guard.recovered() == [page(n) for n in range(BLOCKED_AFTER)]
+    assert not guard.tripped
+    assert guard.held == 0
+    # A page tried again that gets another 403 is forbidden; other pages are held again.
+    assert guard.forbidden(page(3), issued_at=30.0, now=31.0) is Verdict.FINAL
+    assert guard.forbidden(page(99), issued_at=30.0, now=31.0) is Verdict.HELD
+    assert guard.held == 1
+
+
+def test_settling_makes_the_held_403s_final() -> None:
+    guard = BlockGuard()
+    for n in range(3):
+        guard.forbidden(page(n), issued_at=n, now=n)
+    assert guard.settle() == [page(0), page(1), page(2)]
+    assert guard.settle() == []
+    # A new run starts afresh: a response sent after the old run's start doesn't settle it.
+    guard.forbidden(page(5), issued_at=10.0, now=10.0)
+    assert guard.answered(issued_at=5.0) == []
 
 
 SEEDS = (1, 2, 3)

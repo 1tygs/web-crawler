@@ -6,12 +6,19 @@ from hypothesis import assume, given
 from hypothesis import strategies as st
 
 from web_crawler.urls import (
+    LONG_URL,
+    MAX_URL_LENGTH,
+    REPEATED_SEGMENT,
+    SKIPPED_EXTENSIONS,
     Scope,
     StartURLError,
     dedupe_key,
+    has_skipped_extension,
     is_www_variant,
     normalize_start,
     strip_fragment,
+    trap_rule,
+    without_query,
 )
 
 
@@ -346,3 +353,85 @@ def test_dedupe_key_is_the_same_for_every_way_of_writing_a_url(
     # Writing a digit plainly after a bare "%" can make an escape; that's another URL.
     assume(meaning(other) == meaning(url))
     assert dedupe_key(other) == dedupe_key(url)
+
+
+@pytest.mark.parametrize(
+    ("url", "rule"),
+    [
+        ("https://example.com/", None),
+        ("https://example.com/" + "x" * (MAX_URL_LENGTH - 20), None),  # 2,048 characters
+        ("https://example.com/" + "x" * (MAX_URL_LENGTH - 19), LONG_URL),
+        # Relative links that a soft-404 site answers whatever they lead to.
+        ("https://example.com/a/a/a", None),
+        ("https://example.com/a/a/a/a", REPEATED_SEGMENT),
+        ("https://example.com/a/b/a/b/a/b", None),
+        ("https://example.com/a/b/a/b/a/b/a/b", REPEATED_SEGMENT),
+        ("https://example.com/x/./a//a/b/a/c/a/", REPEATED_SEGMENT),
+        ("https://example.com/a/", None),
+        ("https://example.com////", REPEATED_SEGMENT),  # four empty segments
+        ("https://example.com:8443/a/a/a/a", REPEATED_SEGMENT),
+        ("http://[::1]:8000/a/a/a/a", REPEATED_SEGMENT),
+        # Only the path counts, not the query.
+        ("https://example.com/search?q=a/a/a/a/a", None),
+        ("https://example.com/2026/10/20/10/", None),  # three tens
+    ],
+)
+def test_trap_rule(url: str, rule: str | None) -> None:
+    assert trap_rule(url) == rule
+
+
+def test_trap_rules_have_configurable_thresholds() -> None:
+    assert trap_rule("https://example.com/abc", max_length=22) == LONG_URL
+    assert trap_rule("https://example.com/a/a", max_repeats=1) == REPEATED_SEGMENT
+    assert trap_rule("https://example.com/a/a/a/a/a", max_repeats=5) is None
+
+
+@given(st.lists(st.sampled_from(["a", "b", "", "%61"]), max_size=12))
+def test_a_path_is_a_trap_only_if_a_segment_occurs_more_than_three_times(
+    segments: list[str],
+) -> None:
+    url = "https://example.com/" + "/".join(segments)
+    path_segments = url.removeprefix("https://example.com/").split("/")
+    repeated = max(path_segments.count(segment) for segment in path_segments) > 3
+    assert (trap_rule(url) == REPEATED_SEGMENT) is repeated
+
+
+@pytest.mark.parametrize(
+    ("url", "skipped"),
+    [
+        ("https://example.com/report.pdf", True),
+        ("https://example.com/REPORT.PDF", True),
+        ("https://example.com/report.pdf?download=1", True),
+        ("https://example.com/backup.tar.gz", True),
+        ("https://example.com/photo.jpeg", True),
+        ("https://example.com/a/b/style.css", True),
+        ("https://example.com/app.js", True),
+        ("https://example.com/font.woff2", True),
+        ("https://example.com/talk.mp4", True),
+        ("https://example.com/sheet.xlsx", True),
+        ("https://example.com/page.html", False),
+        ("https://example.com/page.php", False),
+        ("https://example.com/feed.xml", False),
+        ("https://example.com/", False),
+        ("https://example.com/report.pdf/", False),  # a directory
+        ("https://example.com/v1.2/page", False),  # the last segment has no extension
+        ("https://example.com/.pdf.d/", False),
+        ("https://example.com/download?file=report.pdf", False),  # a query isn't a path
+        ("https://example.com/pdf", False),
+    ],
+)
+def test_has_skipped_extension(url: str, skipped: bool) -> None:
+    assert has_skipped_extension(url) is skipped
+
+
+def test_skipped_extensions_are_lowercase_names_without_a_dot() -> None:
+    assert all(name == name.lower() and "." not in name for name in SKIPPED_EXTENSIONS)
+    assert {"html", "htm", "php", "asp", "aspx", "xml", "txt", "json"}.isdisjoint(
+        SKIPPED_EXTENSIONS
+    )
+
+
+def test_without_query() -> None:
+    assert without_query("https://example.com/cal?m=1&y=2") == "https://example.com/cal"
+    assert without_query("https://example.com/cal?") == "https://example.com/cal"
+    assert without_query("https://example.com/cal") == "https://example.com/cal"

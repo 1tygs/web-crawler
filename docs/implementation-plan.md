@@ -60,6 +60,9 @@ Checked on 2026-10-20 against the versions pinned in Appendix A (Python 3.14.6, 
 | Found in PR 3: Python's brotli binding rejects bytes after the end of a stream, output and all, where Chrome ignores them. Chrome and Firefox read only the first member of a gzip body and skip its CRC; Firefox skips codings it doesn't know and undoes at most 16 | `decode_body` finds the end of a brotli stream by bisection when decoding fails; reads every gzip member, as RFC 1952 has it, and lets zlib check the CRC; skips unknown codings; refuses more than 16 |
 | Found in PR 3: aiohttp's headers give only the first value of a field sent twice | The transport joins a repeated field's values with ", " (RFC 9110 §5.3), so two Content-Encoding fields stack |
 | Found in PR 3: per-link calls to small helpers cost MDN's 376 links 11–12% over the A.2 prototype | `parse.py` strips fragments and takes the dedupe key's fast path inline, and keeps each URL's first occurrence with one dict operation: within 10% on every page (DESIGN A.2) |
+| Found in PR 4: `email.utils.parsedate_to_datetime` reads HTTP's asctime date format, which has no zone, as local time; RFC 9110 has every HTTP date in GMT | `parse_retry_after` reads a date without a zone as UTC |
+| Found in PR 4: aiohttp's total timeout raises the same `TimeoutError` whether it runs out while connecting or while waiting for headers, and with `--timeout` under 10 s the connect timeout never fires first | The transport counts a total timeout as a connect timeout when its connector hadn't yet handed the request a connection, so that the circuit breaker hears of a host it can't reach |
+| Found in PR 4: a retry that starts again from an item's first URL finds the targets of the redirects it followed claimed, by the item itself, and nothing prints the page | A retry resumes where its chain failed: `CrawlItem.redirected_from` holds the redirects already followed |
 
 ## 3. Repository layout and tooling
 
@@ -162,6 +165,7 @@ class ParseResult(NamedTuple):
     links_found: int                      # links printed on the page, for stats
     decoded_bytes: int                    # for stats: wire vs decoded
     error: str | None                     # e.g. "bad content-encoding": deterministic, so final
+    truncated: bool = False               # cut at the size cap, or its stream ended early (PR 4)
 
 @dataclass(frozen=True, slots=True)
 class WorkerContext:                      # sent once, through the pool initializer
@@ -305,9 +309,9 @@ Golden fixtures (`tests/fixtures/parse/*.html` with expected JSON) cover:
   - Both methods return a `Decision` (grow, hold, slow-start exit, probe start, probe verdict, cut), so the engine logs it at `-v` and tests assert on it.
   - Samples come from responses with status below 500, excluding 429.
 - **`PauseGate`**: the Retry-After pause (the later of the current and new pause, capped at 300 s), plus the rate ceiling. PR 3 built the rate ceiling; the pause comes with PR 4's retries. Each request start sets the next allowed start to now + 1/rate, with rate = min(`--max-rps`, 1/Crawl-delay). That spaces requests evenly, with no bursts.
-- **`CircuitBreaker`**: opens after 20 consecutive connection-level failures (DNS, connect, TLS, connect timeout). Health probes back off from 1 s to 60 s, and any HTTP response closes it. If it stays open for 5 minutes, the crawl aborts with exit 4. While it's open, connection failures don't use up the items' retry budgets.
+- **`CircuitBreaker`**: opens after 20 consecutive connection-level failures (DNS, connect, TLS, connect timeout). Health probes back off from 1 s to 60 s, and any HTTP response closes it. If it stays open for 5 minutes, the crawl aborts with exit 4. While it's open, connection failures don't use up the items' retry budgets. As built in PR 4: only a response to a request sent after the failures counts, as for the law's cuts, and a reset or a timeout neither counts nor breaks a run.
 - **`BlockGuard`** (the 403 rule) counts consecutive 403s after at least one page. A 403'd item is held while the run is under 20: it stays outstanding, so `--max-depth` stays exact and a URL that's requeued never gets two records (§9). A run is settled in one of three ways:
-  - by a non-403 response: the held items become final;
+  - by a non-403 response, to a request sent after the run's earliest (PR 4: one sent before may predate the block): the held items become final;
   - by tripping at 20: pause, probe the start URL with backoff, then requeue the held items once on recovery, or abort after 5 minutes;
   - when nothing else can make progress: the held items become final.
 - **`parse_retry_after(value, now_wall)`**: seconds or an HTTP date.
@@ -320,7 +324,7 @@ Golden fixtures (`tests/fixtures/parse/*.html` with expected JSON) cover:
 ### 5.8 `retry.py` (pure)
 
 - `classify(status_or_error_kind) -> Class`: the DESIGN §5.4 table.
-- `next_attempt(item, cls, retry_after, cfg, rng) -> (CrawlItem, delay) | None`. Backoff uses full jitter, `uniform(0, min(30, 0.5 · 2^attempt))`. 429 and 503 draw on their own budget of 5. When the budget runs out, the result is `None`, meaning final.
+- `next_attempt(item, cls, *, retries, rng, retry_after=None) -> (CrawlItem, delay) | None`. Backoff uses full jitter, `uniform(0, min(30, 0.5 · 2^attempt))`. 429 and 503 draw on their own budget of 5, and wait out their `Retry-After` when they have one. When the budget runs out, the result is `None`, meaning final.
 
 ### 5.9 `robots.py`
 
@@ -346,13 +350,13 @@ Golden fixtures (`tests/fixtures/parse/*.html` with expected JSON) cover:
 
 ### 5.11 `fetcher.py`
 
-`fetch(item, hops: HopPolicy) -> FetchOutcome` returns one of `Page(ParseJob)`, `NotPage(status, mime)`, `Claimed`, `Retry(item_at_hop, cls, retry_after)` or `Final(reason, status, chain)`.
+`fetch(item, hops: HopPolicy) -> FetchOutcome` returns one of `Page(ParseJob)`, `NotPage(status, mime)`, `Claimed`, `Retry(item_at_hop, cls, final, retry_after)` or `Final(reason, status, chain)`. A `Retry` carries the `Final` the item ends with if it isn't tried again.
 
 It loops over at most 10 hops. Each iteration opens the request, feeds the limiter, breaker and guard, then calls the pure `triage(status, headers)`:
 - **301, 302, 303, 307, 308 with `Location`:** drain up to 64 KiB, resolve with ada-url and strip the fragment. Then, with the response released, `await hops.admit_hop(chain_keys, url, key)` and continue on `FOLLOW`; `CLAIMED` returns `Claimed`, and `OUT_OF_SCOPE` a `Final`. Past the 10th redirect, the result is `Final("redirect loop")` if the chain requested a URL twice, and `Final("too many redirects")` otherwise.
 - **2xx HTML:** `read(max_page_bytes)`.
 - **2xx with no Content-Type:** read the first 16 KiB, sniff the decoded prefix, and keep reading only if it's HTML.
-- **Any other 2xx:** drain if `Content-Length ≤ 64 KiB`, otherwise close.
+- **Any other 2xx, and error statuses (PR 4):** drain if `Content-Length ≤ 64 KiB`, otherwise close. A drain that fails is no matter.
 - **429 or 503:** `Retry` (throttle class, with Retry-After).
 - **408, 500, 502, 504:** `Retry` (error class).
 - **Any other status ≥ 400:** `Final`.
@@ -373,7 +377,7 @@ It loops over at most 10 hops. Each iteration opens the request, feeds the limit
 
 ### 5.13 `output.py`
 
-- **`Sink` protocol:** `start(on_drained)`, `write(record)`, `backlogged` and `close()`. This is the seam DESIGN §14.1 names. `start` hands the sink the callback that wakes the dispatcher, since the CLI builds the sink before the event loop runs.
+- **`Sink` protocol:** `start(on_drained, on_closed)`, `write(record)`, `backlogged` and `close()`. This is the seam DESIGN §14.1 names. `start` hands the sink the callbacks that wake the dispatcher and that stop the crawl when the reader goes (PR 4), since the CLI builds the sink before the event loop runs.
 - **`ThreadedSink(binary_stream)`** puts records on a `SimpleQueue` for a writer thread:
   - each batch of queued records goes out in one `write()`, and the thread flushes at most every 100 ms and whenever it's idle;
   - the backlog is two single-writer counters, bytes enqueued on the loop thread and bytes written on the writer thread, so no lock is needed;
@@ -499,6 +503,8 @@ Branches `v1/1-skeleton` through `v1/5-limits-output`, each based on the one bef
 
 **Done when** every row of DESIGN §5.4's table has a test, and the fault suite passes on both OSes.
 
+**Measured:** admission's new rules cost 0.6 µs per URL a crawl hasn't seen (DESIGN A.16). In twelve 50,000-page crawls alternating with PR 3's code, coordinator CPU per page was 269–280 µs against 262–272, and pages/s and peak RSS the same within the runs' spread (DESIGN A.15).
+
 ### PR 5: Limits and output
 1. `--max-pages` dispatch gating.
 2. The `--max-depth` window and depth lowering, with the property tests against BFS.
@@ -528,9 +534,9 @@ Each lands in the PR that implements it:
 2. **One cut per congestion event:** a cut happens only for congestion on requests issued after the previous cut, the exact form of "once per RTT". A cut also discards the partial round. PR 3.
 3. **Cookie-gated redirects:** a redirect back to a URL already in the same chain is followed. Real loops end at the 10-hop limit and are reported as loops. PR 2 (folded into DESIGN §4.2, §5.2 and §5.4).
 4. **The pool starts once the scope is fixed,** after the start URL's redirects, because its initializer carries the scope prefixes. The cost is one worker start before the first parse. PR 3.
-5. **403s are held until their run is settled,** which keeps `--max-depth` exact and gives a requeued URL only one record. PR 4.
-6. **A closed stdout exits 141** (128 + SIGPIPE), consistent with 130 and 143; DESIGN §6.1 is silent on it. PR 4.
-7. **`ParseResult` gains `links_found`, `decoded_bytes` and `error`.** PRs 1 and 3.
+5. **403s are held until their run is settled,** which keeps `--max-depth` exact and gives a requeued URL only one record. PR 4 (folded into DESIGN §5.4).
+6. **A closed stdout exits 141** (128 + SIGPIPE), consistent with 130 and 143; DESIGN §6.1 is silent on it. PR 4 (folded into DESIGN §5.9 and §6.1).
+7. **`ParseResult` gains `links_found`, `decoded_bytes` and `error`.** PRs 1 and 3; and `truncated`, PR 4.
 8. **A compressed stream that ends cleanly but early** is parsed as far as it got and flagged `truncated`, as a browser renders it; only corrupt data is a final error. PR 3.
 9. **`--include-errors` requires `--format jsonl`.** PR 5.
 10. **A.11 gains a 429-ing origin,** covering the cut path that ADR-001's table doesn't. PR 3.

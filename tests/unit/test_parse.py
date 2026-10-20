@@ -52,7 +52,7 @@ def test_renders_the_text_record() -> None:
 
 def test_a_page_without_links() -> None:
     result = parse_page(ParseJob(url=PAGE, body=b"<p>nothing here</p>"), CTX)
-    assert result == (b"https://example.com/dir/page.html\n\n", [], 0, 19, None)
+    assert result == (b"https://example.com/dir/page.html\n\n", [], 0, 19, None, False)
 
 
 @pytest.mark.parametrize(
@@ -70,7 +70,7 @@ def test_decompresses_the_body(content_encoding: str, compress: Callable[[bytes]
 
 def test_a_body_that_cant_be_decompressed_is_an_error() -> None:
     job = ParseJob(url=PAGE, body=anchors("/a").encode(), content_encoding="gzip")
-    assert parse_page(job, CTX) == (b"", [], 0, 0, "bad content-encoding")
+    assert parse_page(job, CTX) == (b"", [], 0, 0, "bad content-encoding", False)
 
 
 def test_reads_a_body_up_to_the_cap() -> None:
@@ -82,6 +82,22 @@ def test_reads_a_body_up_to_the_cap() -> None:
     result = parse_page(job, WorkerContext(CTX.scope_prefixes, max_bytes=cap))
     assert result.links == [("https://example.com/caf%C3%A9", "https://example.com/caf%C3%A9")]
     assert result.decoded_bytes == cap
+    assert result.truncated  # cut at the cap as it decompressed
+
+
+def test_a_body_cut_off_as_it_arrived_is_truncated() -> None:
+    result = parse_page(ParseJob(url=PAGE, body=b"<a href=/a>a</a><a hr", truncated=True), CTX)
+    assert result.truncated
+    assert result.links == [("https://example.com/a", "https://example.com/a")]
+
+
+def test_a_gzip_stream_that_ends_early_is_truncated() -> None:
+    whole = gzip.compress(anchors("/a", "/b", "/c").encode() * 50)
+    job = ParseJob(url=PAGE, body=whole[: len(whole) // 2], content_encoding="gzip")
+    result = parse_page(job, CTX)
+    assert result.error is None
+    assert result.truncated
+    assert ("https://example.com/a", "https://example.com/a") in result.links
 
 
 def test_finds_navigational_links_in_document_order() -> None:
@@ -227,7 +243,14 @@ def test_a_byte_order_mark_is_not_text() -> None:
 def test_a_page_in_the_replacement_encoding_has_no_links() -> None:
     # Some encodings aren't safe to decode; a browser shows such a page as one U+FFFD.
     job = ParseJob(url=PAGE, body=b'<a href="/x">x</a>', http_charset="iso-2022-kr")
-    assert parse_page(job, CTX) == (b"https://example.com/dir/page.html\n\n", [], 0, 18, None)
+    assert parse_page(job, CTX) == (
+        b"https://example.com/dir/page.html\n\n",
+        [],
+        0,
+        18,
+        None,
+        False,
+    )
 
 
 def test_a_truncated_page_may_end_inside_a_utf8_character() -> None:
