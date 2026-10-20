@@ -26,6 +26,7 @@ class Config:
     max_concurrency: int = 64  # upper bound on requests in flight
     timeout: float = 60.0  # seconds, for one whole request
     max_page_bytes: int = 32 * MIB  # body bytes read from one page
+    max_pages: int | None = None  # stop once this many pages are printed
     all_urls: bool = False  # print every URL-bearing attribute; still crawl only links
     ignore_robots: bool = False  # for crawling your own site
     strict_host: bool = False  # a start URL that redirects to its www. variant can't start
@@ -47,6 +48,8 @@ class Config:
             )
         if self.max_page_bytes < 1:
             raise ConfigError(f"max_page_bytes must be at least 1, not {self.max_page_bytes}")
+        if self.max_pages is not None and self.max_pages < 1:
+            raise ConfigError(f"max_pages must be at least 1, not {self.max_pages}")
         if not (self.user_agent.strip() and self.user_agent.isascii()):
             raise ConfigError(f"user_agent must be non-blank ASCII, not {self.user_agent!r}")
         if not self.user_agent.isprintable():

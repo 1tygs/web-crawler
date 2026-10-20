@@ -1,6 +1,7 @@
 """Whole crawls of in-process sites over real sockets, checked against ground truth."""
 
 import asyncio
+import os
 import signal
 import sys
 from collections import Counter
@@ -287,7 +288,13 @@ WITH_SIGINT = (
 )
 
 
-async def test_ctrl_c_exits_130_with_whole_records() -> None:
+@pytest.mark.parametrize(
+    ("sig", "code"),
+    [(signal.SIGINT, ExitCode.INTERRUPTED), (signal.SIGTERM, ExitCode.TERMINATED)],
+)
+async def test_a_signal_stops_the_crawl_with_whole_records(
+    sig: signal.Signals, code: ExitCode
+) -> None:
     started = asyncio.Event()
 
     async def slow(request: web.Request) -> web.StreamResponse:
@@ -305,12 +312,84 @@ async def test_ctrl_c_exits_130_with_whole_records() -> None:
             stderr=asyncio.subprocess.PIPE,
         )
         await asyncio.wait_for(started.wait(), 10)  # the start page is done; fetches wait
-        process.send_signal(signal.SIGINT)
+        process.send_signal(sig)
         stdout, stderr = await asyncio.wait_for(process.communicate(), 10)
-    assert process.returncode == ExitCode.INTERRUPTED
+    assert process.returncode == code
     assert split_records(stdout) == [
         b"http://127.0.0.1:%d/\n" % site.port
         + b"".join(b"  http://127.0.0.1:%d/%d\n" % (site.port, n) for n in range(20))
         + b"\n"
     ]
     assert b"Traceback" not in stderr
+    assert "1 page in" in stderr.decode()  # the summary
+
+
+class _InterruptedWhileClosing(MemorySink):
+    """Gets a second Ctrl-C while it closes."""
+
+    def close(self) -> None:
+        os.kill(os.getpid(), signal.SIGINT)
+        super().close()
+
+
+def _slow_after(sig: signal.Signals, times: int = 1) -> dict[str, Resource | Handler]:
+    """A site whose start page links to a page that sends sig to the crawler, in-process."""
+
+    async def slow(request: web.Request) -> web.StreamResponse:
+        for _ in range(times):
+            os.kill(os.getpid(), sig)
+        await asyncio.sleep(30)
+        return web.Response()
+
+    return {"/": page("/slow"), "/slow": slow}
+
+
+async def test_a_second_ctrl_c_exits_at_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    exits: list[int] = []
+    monkeypatch.setattr(os, "_exit", exits.append)
+    before = signal.getsignal(signal.SIGINT)
+    async with Site(_slow_after(signal.SIGINT)) as site:
+        sink = _InterruptedWhileClosing()
+        report = await crawl(Config(start_url=site.url(), ignore_robots=True), sink)
+    assert report.exit_code is ExitCode.INTERRUPTED
+    assert exits == [ExitCode.INTERRUPTED]
+    assert sink.records == [b"%s\n  %s\n\n" % (site.url().encode(), site.url("/slow").encode())]
+    assert signal.getsignal(signal.SIGINT) is before
+
+
+async def test_sigterm_stops_the_crawl_and_an_ignored_sigint_stays_ignored() -> None:
+    before = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        async with Site(_slow_after(signal.SIGTERM, times=2)) as site:
+            sink = MemorySink()
+            report = await crawl(Config(start_url=site.url(), ignore_robots=True), sink)
+        assert signal.getsignal(signal.SIGINT) is signal.SIG_IGN
+    finally:
+        signal.signal(signal.SIGINT, before)
+    assert report.exit_code is ExitCode.TERMINATED
+    assert sink.closed
+    assert len(sink.records) == 1
+    assert signal.getsignal(signal.SIGTERM) is signal.SIG_DFL
+
+
+def _wide_site(size: int) -> dict[str, Resource | Handler]:
+    """size pages, each linking to all of them, and to a missing page and a non-page."""
+    links = ["/missing", "/file.bin", *(f"/{n}" for n in range(1, size))]
+    pages: dict[str, Resource | Handler] = {f"/{n}": page(*links) for n in range(1, size)}
+    return pages | {
+        "/": page(*links),
+        "/file.bin": Resource(body=b"\0", headers=(("Content-Type", "application/zip"),)),
+    }
+
+
+@pytest.mark.parametrize(("max_pages", "printed"), [(1, 1), (3, 3), (20, 20), (100, 30)])
+async def test_max_pages_prints_and_fetches_at_most_n_pages(max_pages: int, printed: int) -> None:
+    async with Site(_wide_site(30)) as site:
+        sink = MemorySink()
+        cfg = Config(start_url=site.url(), max_pages=max_pages, ignore_robots=True)
+        report = await crawl(cfg, sink)
+    assert report.exit_code is ExitCode.OK
+    assert len(sink.records) == printed  # exactly N, or every page of a smaller site
+    page_fetches = [t for t in site.targets() if t not in ("/missing", "/file.bin")]
+    assert len(page_fetches) == printed  # no page fetched only to be thrown away
+    assert len(set(page_fetches)) == printed

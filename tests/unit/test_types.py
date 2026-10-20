@@ -34,4 +34,5 @@ def test_exit_codes_match_the_design() -> None:
         "USAGE": 2,
         "CANNOT_START": 3,
         "INTERRUPTED": 130,
+        "TERMINATED": 143,
     }

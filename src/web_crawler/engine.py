@@ -3,16 +3,21 @@
 crawl() is the one place that builds concrete objects; everything else receives its
 collaborators, so tests can swap in fakes. Start-up settles the start URL, its scope and
 robots.txt before anything else is fetched. Then the dispatcher keeps a fixed number of
-fetches in flight, and parses each page inline on the event loop.
+fetches in flight, and parses each page inline on the event loop. The first SIGINT or
+SIGTERM stops it cleanly.
 """
 
 import asyncio
 import logging
+import os
 import random
+import signal
 import time
 from collections import Counter
 from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
+from types import FrameType
+from typing import Any, NoReturn
 
 from web_crawler.config import Config
 from web_crawler.fetcher import (
@@ -43,6 +48,11 @@ INITIAL_CONCURRENCY = 8
 # Failures to reach a start URL given without a scheme after which http:// might work.
 _HTTPS_FAILURES = frozenset({ErrorKind.CONNECT, ErrorKind.CONNECT_TIMEOUT, ErrorKind.TLS})
 _ROBOTS_HINT = "if the site is yours, --ignore-robots skips robots.txt"
+
+# The signals that stop a crawl cleanly, and the exit code each gives (DESIGN.md §5.9).
+_STOP_SIGNALS = {signal.SIGINT: ExitCode.INTERRUPTED, signal.SIGTERM: ExitCode.TERMINATED}
+
+type _SignalHandler = Callable[[int, FrameType | None], Any] | int | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,24 +107,89 @@ async def crawl(
         stats=stats,
         all_urls=cfg.all_urls,
         concurrency=min(INITIAL_CONCURRENCY, cfg.max_concurrency),
+        max_pages=cfg.max_pages,
         robots=robots,
         product=product,
         robots_refresh=cfg.robots_refresh,
     )
-    try:
-        sink.start(dispatcher.pump)
-        started = await start.run(start_url, scheme_was_implicit)
-        exit_code = ExitCode.CANNOT_START if started is None else await dispatcher.run(*started)
-    finally:
+    interrupts = _Interrupts(dispatcher)
+    with interrupts:  # until the sink is closed, so a second Ctrl-C can cut closing short
         try:
-            await dispatcher.stop()
-            if owned:
-                await transport.close()
+            sink.start(dispatcher.pump)
+            work = asyncio.create_task(_run(start, dispatcher, start_url, scheme_was_implicit))
+            exit_code = await interrupts.wait(work)
         finally:
-            sink.close()
+            try:
+                await dispatcher.stop()
+                if owned:
+                    await transport.close()
+            finally:
+                sink.close()
     return CrawlReport(
         exit_code, stats, len(admission.seen), clock(), admission.rejected, admission.examples
     )
+
+
+async def _run(
+    start: _Start, dispatcher: _Dispatcher, start_url: str, scheme_was_implicit: bool
+) -> ExitCode:
+    started = await start.run(start_url, scheme_was_implicit)
+    return ExitCode.CANNOT_START if started is None else await dispatcher.run(*started)
+
+
+@dataclass(slots=True)
+class _Interrupts:
+    """Stops the crawl cleanly on the first SIGINT or SIGTERM (DESIGN.md §5.9).
+
+    Dispatching stops and the crawl's task is cancelled; crawl() then cancels the fetches
+    in flight and closes the sink, so only whole records are printed. A second SIGINT exits
+    at once, even while closing the sink blocks the event loop. A signal the process
+    inherited as ignored stays ignored, as nohup relies on.
+    """
+
+    dispatcher: _Dispatcher
+    exit_code: ExitCode | None = None  # the first signal's
+    _work: asyncio.Task[ExitCode] = field(init=False)
+    _previous: dict[signal.Signals, _SignalHandler] = field(default_factory=dict)
+
+    def __enter__(self) -> None:
+        loop = asyncio.get_running_loop()
+        for sig in _STOP_SIGNALS:
+            previous = signal.getsignal(sig)
+            if previous is signal.SIG_IGN or previous is None:
+                continue
+            self._previous[sig] = previous
+            loop.add_signal_handler(sig, self._received, sig)
+
+    def __exit__(self, *exc_info: object) -> None:
+        loop = asyncio.get_running_loop()
+        for sig, previous in self._previous.items():
+            loop.remove_signal_handler(sig)
+            signal.signal(sig, previous)
+
+    async def wait(self, work: asyncio.Task[ExitCode]) -> ExitCode:
+        """work's exit code, or the signal's if one stopped it."""
+        self._work = work
+        try:
+            return await work
+        except asyncio.CancelledError:
+            if self.exit_code is None:  # cancelled by crawl()'s caller, not by a signal
+                raise
+            return self.exit_code
+
+    def _received(self, sig: signal.Signals) -> None:
+        if self.exit_code is not None:  # a second SIGTERM: closing is already under way
+            return
+        self.exit_code = _STOP_SIGNALS[sig]
+        self.dispatcher.halt()
+        self._work.cancel()
+        if signal.SIGINT in self._previous:
+            signal.signal(signal.SIGINT, _exit_now)
+
+
+def _exit_now(signum: int, frame: FrameType | None) -> NoReturn:
+    """A second Ctrl-C: exit without waiting for anything."""
+    os._exit(ExitCode.INTERRUPTED)
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,7 +342,8 @@ def _count(stats: Stats, outcome: NotPage | Claimed | Final) -> None:
 
 @dataclass(slots=True, kw_only=True)
 class _Dispatcher:
-    """Starts a fetch whenever one finishes, until nothing is outstanding."""
+    """Starts a fetch whenever one finishes, until nothing is outstanding or, under
+    --max-pages, until that many pages are printed."""
 
     fetcher: Fetcher
     hops: HopPolicy
@@ -277,6 +353,7 @@ class _Dispatcher:
     stats: Stats
     all_urls: bool
     concurrency: int
+    max_pages: int | None  # stop once this many pages are printed
     robots: RobotsFetcher | None  # None under --ignore-robots
     product: str  # the User-Agent's product token, which robots.txt groups name
     robots_refresh: float  # seconds between fetches of robots.txt
@@ -310,6 +387,9 @@ class _Dispatcher:
         if self._stopping:
             return
         while self._in_flight < self.concurrency and not self.sink.backlogged:
+            # Under --max-pages, no page is fetched only to be thrown away (DESIGN.md §5.1).
+            if self.max_pages is not None and self.stats.pages + self._in_flight >= self.max_pages:
+                break
             item = self.frontier.pop()
             if item is None:
                 break
@@ -317,12 +397,17 @@ class _Dispatcher:
             task = asyncio.create_task(self._process(item))
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
-        if self.frontier.outstanding == 0 and not self._done.done():
+        complete = self.frontier.outstanding == 0 or self.stats.pages == self.max_pages
+        if complete and not self._done.done():
             self._done.set_result(None)
+
+    def halt(self) -> None:
+        """Start no more fetches."""
+        self._stopping = True
 
     async def stop(self) -> None:
         """Cancel the fetches still running, and wait for them to end."""
-        self._stopping = True
+        self.halt()
         if self._refresh is not None:
             self._refresh.cancel()
         tasks = list(self._tasks)

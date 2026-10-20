@@ -41,6 +41,12 @@ def build_parser() -> argparse.ArgumentParser:
         "every scheme; only links are crawled",
     )
     parser.add_argument(
+        "--max-pages",
+        type=int,
+        metavar="N",
+        help="stop once N pages are printed; Ctrl-C also stops cleanly, printing whole records",
+    )
+    parser.add_argument(
         "--ignore-robots",
         action="store_true",
         help="don't fetch or obey robots.txt: for crawling your own site",
@@ -75,6 +81,7 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
             start_url=args.url,
             user_agent=args.user_agent,
             all_urls=args.all_urls,
+            max_pages=args.max_pages,
             ignore_robots=args.ignore_robots,
             strict_host=args.strict_host,
             insecure=args.insecure,

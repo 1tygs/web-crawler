@@ -14,6 +14,7 @@ def test_defaults_follow_the_design() -> None:
     assert cfg.timeout == 60.0
     assert cfg.max_page_bytes == 32 * MIB
     assert not cfg.all_urls
+    assert cfg.max_pages is None
     assert not cfg.ignore_robots
     assert cfg.robots_refresh == 24 * 3600  # RFC 9309 §2.4
 
@@ -36,6 +37,7 @@ def test_is_immutable() -> None:
         ("robots_refresh", 0.0, "robots_refresh must be a positive number"),
         ("robots_refresh", math.inf, "robots_refresh must be a positive number"),
         ("max_page_bytes", 0, "max_page_bytes must be at least 1"),
+        ("max_pages", 0, "max_pages must be at least 1"),
         ("user_agent", "", "user_agent must be non-blank ASCII"),
         ("user_agent", "   ", "user_agent must be non-blank ASCII"),
         ("user_agent", "crawler/1.0 (über)", "user_agent must be non-blank ASCII"),
