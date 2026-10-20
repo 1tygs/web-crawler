@@ -59,3 +59,12 @@ def test_usage_errors_exit_2(
     stderr = capsys.readouterr().err
     assert stderr.startswith("usage: crawl")
     assert message in stderr
+
+
+def test_an_uncrawlable_url_is_a_usage_error(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        parse_args(["ftp://example.com/"])
+    assert exit_info.value.code == 2
+    assert (
+        "crawl: error: 'ftp://example.com/' isn't an http or https URL" in capsys.readouterr().err
+    )

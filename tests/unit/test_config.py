@@ -44,3 +44,16 @@ def test_rejects_values_out_of_range(field: str, value: object, message: str) ->
 
 def test_config_error_is_a_value_error() -> None:
     assert issubclass(ConfigError, ValueError)
+
+
+@pytest.mark.parametrize(
+    ("start_url", "message"),
+    [
+        ("ftp://example.com/", "isn't an http or https URL"),
+        ("https://user:pw@example.com/", "contains credentials"),
+        ("https://exa mple.com/", "isn't a valid URL"),
+    ],
+)
+def test_rejects_a_start_url_that_cant_be_crawled(start_url: str, message: str) -> None:
+    with pytest.raises(ConfigError, match=message):
+        Config(start_url=start_url)
