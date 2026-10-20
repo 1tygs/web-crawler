@@ -40,13 +40,14 @@ Requires Python 3.14 or later. No JavaScript runs, so links created only by clie
 
 The brief asks which tools were used, including AI, and how the work was checked.
 
-- **Learning the domain.** Primary sources, as cited in DESIGN.md: RFC 9309 (robots.txt), RFC 6797 (HSTS) and RFC 3986 (URI equivalence); the WHATWG URL, HTML and Encoding standards; the CPython 3.14 documentation; and, for adaptive concurrency, TCP congestion control, Netflix's concurrency-limits and BBR. **TODO:** anything else you read, watched or asked.
+- **Learning the domain.** Primary sources, as cited in DESIGN.md: RFC 9309 (robots.txt), RFC 6797 (HSTS) and RFC 3986 (URI equivalence); the WHATWG URL, HTML and Encoding standards; the CPython 3.14 documentation; and, for adaptive concurrency, TCP congestion control, Netflix's concurrency-limits and BBR.
 - **Measuring instead of assuming.** Performance and behaviour claims in DESIGN.md come from the scripts in `bench/`, run on the development machine (an Apple M5), or from simulations where a real server can't be controlled. Appendix A has the methods and results.
-- **Editor.** **TODO:** IDE and version, extensions, and whether inline AI completion such as Copilot was on.
+- **Editor.** Cursor for diff review and small manual changes without AI.
 - **AI tools.**
-  - **Claude Code**, Anthropic's coding agent. **TODO:** how it was used for the first draft of the design and the benchmarks. In a review session on 2026-10-19 and 20 (Claude Opus 5.5, in the Claude desktop app), it reviewed the design against this brief, wrote and ran the checks and simulations in Appendix A.9–A.13, and applied the resulting changes to DESIGN.md, including [ADR-001](docs/adr/001-concurrency-control.md).
-  - **TODO:** any other AI tools, or "none".
-- **Checking AI output.** Claims were tested rather than taken on trust, and the scripts that test them are kept in `bench/`. The review's simulations rejected the first draft's limiter law and its `--max-depth` rules, and caught a bug in the review's own first proposal for the limiter; re-running a real-site measurement changed one of its numbers (A.12). **TODO:** how you reviewed the changes yourself.
+  - **Claude Code**, Anthropic's coding agent, in the Claude desktop app with Claude Opus 5.5. The first draft of the design came from a session that started from the brief through the `system-design` skill of Anthropic's engineering plugin. It installed candidate libraries in a scratch virtual environment, then wrote and ran the benchmarks for HTML parsers, URL resolution, HTTP clients, the parse pipeline, robots.txt matching and memory per URL on the development machine. It picked each technology from those results and wrote DESIGN.md with the scripts moved into `bench/`. Separate short sessions wrote the README and set up the public repository and licence. In a review session it reviewed the design against this brief, wrote and ran the checks and simulations in Appendix A.9–A.13, and applied the resulting changes to DESIGN.md, including [ADR-001](docs/adr/001-concurrency-control.md).
+- **Checking AI output.** Claims were tested rather than taken on trust, and the scripts that test them are kept in `bench/`. The review's simulations rejected the first draft's limiter law and its `--max-depth` rules, and caught a bug in the review's own first proposal for the limiter; re-running a real-site measurement changed one of its numbers (A.12).
+
+
 
 ## Benchmarks
 
@@ -65,20 +66,23 @@ mkdir -p bench/fixtures
 curl --compressed -o bench/fixtures/python.html https://www.python.org/
 ```
 
-| Command | Measures | Appendix |
-|---|---|---|
-| `python bench/parse_bench.py bench/fixtures` | Link extraction: lexbor vs lxml, html.parser and BeautifulSoup | A.1 |
-| `python bench/pipeline_bench.py bench/fixtures` | Full parse pipeline per page; coordinator throughput with 0–8 parser processes | A.2, A.3 |
-| `python bench/client_bench.py CLIENT 64 20000` | HTTP client CPU per request | A.4 |
-| `python bench/url_bench.py bench/fixtures` | URL resolution: `urljoin` vs yarl vs ada-url | A.5 |
-| `python bench/robots_bench.py bench/fixtures` | robots.txt matching: Protego vs `urllib.robotparser` | A.6 |
-| `python bench/memory_bench.py` | Memory per URL in the seen set and frontier | A.7 |
-| `python bench/pool_check.py MODE` | Process pool: on-demand workers, what one crash takes down, Ctrl-C while workers start | A.9 |
-| `python bench/depth_sim.py` | `--max-depth` rules against breadth-first-search ground truth, in simulation | A.10 |
-| `python bench/limiter_sim.py` | Concurrency laws on simulated servers | A.11 |
-| `python bench/ttfb_spread.py URL` | How widely a real site's response times spread | A.12 |
+
+| Command                                         | Measures                                                                               | Appendix |
+| ----------------------------------------------- | -------------------------------------------------------------------------------------- | -------- |
+| `python bench/parse_bench.py bench/fixtures`    | Link extraction: lexbor vs lxml, html.parser and BeautifulSoup                         | A.1      |
+| `python bench/pipeline_bench.py bench/fixtures` | Full parse pipeline per page; coordinator throughput with 0–8 parser processes         | A.2, A.3 |
+| `python bench/client_bench.py CLIENT 64 20000`  | HTTP client CPU per request                                                            | A.4      |
+| `python bench/url_bench.py bench/fixtures`      | URL resolution: `urljoin` vs yarl vs ada-url                                           | A.5      |
+| `python bench/robots_bench.py bench/fixtures`   | robots.txt matching: Protego vs `urllib.robotparser`                                   | A.6      |
+| `python bench/memory_bench.py`                  | Memory per URL in the seen set and frontier                                            | A.7      |
+| `python bench/pool_check.py MODE`               | Process pool: on-demand workers, what one crash takes down, Ctrl-C while workers start | A.9      |
+| `python bench/depth_sim.py`                     | `--max-depth` rules against breadth-first-search ground truth, in simulation           | A.10     |
+| `python bench/limiter_sim.py`                   | Concurrency laws on simulated servers                                                  | A.11     |
+| `python bench/ttfb_spread.py URL`               | How widely a real site's response times spread                                         | A.12     |
+
 
 - `client_bench.py` needs `python bench/server.py PAGE.html` running in another shell; it serves that page on 127.0.0.1:8899. `CLIENT` is one of `aiohttp`, `aiohttp+uvloop`, `aiohttp+uvloop+raw` (no decompression), `curl_cffi`, `niquests` or `httpx`.
-- `robots_bench.py` expects `wikipedia.html` and `wikipedia.robots.txt` from en.wikipedia.org, and `guardian.html` and `guardian.robots.txt` from www.theguardian.com.
+- `robots_bench.py` expects `wikipedia.html` and `wikipedia.robots.txt` from en.wikipedia.org, and `guardian.html` and `guardian.robots.txt` from [www.theguardian.com](http://www.theguardian.com).
 - `pool_check.py` takes a `MODE` of `ondemand`, `crash` or `sigint`, and `--method spawn` or `--method forkserver`. It and the two simulations use only the standard library.
 - `ttfb_spread.py` needs curl, and sends about 40 requests, one at a time, to the site you give it.
+
