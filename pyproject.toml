@@ -12,7 +12,7 @@ license-files = ["LICENSE"]
 authors = [{ name = "Tiago Delgado" }]
 requires-python = ">=3.14"
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 5 - Production/Stable",
     "Environment :: Console",
     "Framework :: AsyncIO",
     "Operating System :: MacOS",
