@@ -1,5 +1,7 @@
 import asyncio
 import gzip
+import socket
+import time
 import zlib
 from collections.abc import Callable
 from compression import zstd
@@ -9,7 +11,9 @@ import brotli
 import pytest
 import yarl
 from aiohttp import web
+from aiohttp.abc import ResolveResult
 
+from tests.support.hosts import LocalResolver
 from tests.support.site import RawServer, Resource, Site, page, redirect, unused_port
 from web_crawler.config import USER_AGENT, Config
 from web_crawler.transport import (
@@ -320,3 +324,35 @@ async def test_ignores_an_https_proxy(
         async with make_transport() as transport:
             assert (await fetch(transport, site.url()))[0] == 200
     assert "only http:// proxies work" in caplog.text
+
+
+class SlowResolver(LocalResolver):
+    """Takes 0.3 s to resolve, as a slow DNS server would."""
+
+    async def resolve(
+        self, host: str, port: int = 0, family: socket.AddressFamily = socket.AF_INET
+    ) -> list[ResolveResult]:
+        await asyncio.sleep(0.3)
+        return await super().resolve(host, port, family)
+
+
+async def wait_then_answer(request: web.Request) -> web.StreamResponse:
+    await asyncio.sleep(0.2)
+    return web.Response(body=b"<p>late", content_type="text/html")
+
+
+async def test_time_to_first_byte_counts_from_when_the_connection_is_ready() -> None:
+    # Connecting takes 0.3 s and the server 0.2 s more: only the server's time counts, so
+    # that a new connection's set-up doesn't look like a slow server (DESIGN.md §5.2).
+    resolver = SlowResolver()
+    async with Site({"/": page(), "/wait": wait_then_answer}) as site:
+        resolver.ports["slow.test", 80] = site.port
+        cfg = Config(start_url="http://slow.test/")
+        async with AiohttpTransport(cfg, resolver=resolver) as transport:
+            started = time.perf_counter()
+            async with transport.open("http://slow.test/") as response:
+                assert time.perf_counter() - started >= 0.3
+                assert response.ttfb < 0.2
+                await response.read(1 << 20)
+            async with transport.open("http://slow.test/wait") as response:  # reused
+                assert 0.2 <= response.ttfb < 0.4

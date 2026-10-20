@@ -4,6 +4,7 @@ The fetcher works against the Transport protocol, and AiohttpTransport implement
 Nothing above this module imports aiohttp: its exceptions arrive as TransportError.
 """
 
+import contextvars
 import enum
 import logging
 import ssl
@@ -17,6 +18,9 @@ from typing import Protocol, Self
 
 import aiohttp
 import yarl
+from aiohttp.client_reqrep import ClientRequest
+from aiohttp.connector import Connection
+from aiohttp.tracing import Trace
 from multidict import CIMultiDictProxy
 
 from web_crawler.config import Config
@@ -66,7 +70,8 @@ class Response(Protocol):
 
     @property
     def ttfb(self) -> float:
-        """Time to first byte: seconds from the request's start until its headers arrived."""
+        """Time to first byte: seconds from when the request had a connection, pooled or new,
+        until its headers arrived. Connection set-up, DNS and TLS included, isn't counted."""
         ...
 
     async def read(self, limit: int) -> tuple[bytes, bool]:
@@ -104,7 +109,7 @@ class AiohttpTransport:
         # count, such as robots.txt refetches and health probes.
         connections = cfg.max_concurrency + 4
         self._session = aiohttp.ClientSession(
-            connector=aiohttp.TCPConnector(
+            connector=_TimedConnector(
                 limit=connections,
                 limit_per_host=connections,
                 ttl_dns_cache=300,
@@ -179,7 +184,7 @@ class _Exchange:
                 headers=route.headers,
                 proxy_headers=route.proxy_headers,
             )
-            ttfb = time.perf_counter() - started
+            ttfb = time.perf_counter() - max(started, _connected.get(started))
         except (aiohttp.ClientError, TimeoutError, ValueError) as error:
             raise transport_error(error) from error
         return _AiohttpResponse(self._url, self._response, ttfb)
@@ -194,6 +199,28 @@ class _Exchange:
         # the end.
         self._response.release()
         await self._response.wait_for_close()
+
+
+# When the connector last handed a connection to a request of this task. The connector runs
+# in the task that makes the request, so it's that request's.
+_connected: contextvars.ContextVar[float] = contextvars.ContextVar("connected")
+
+
+class _TimedConnector(aiohttp.TCPConnector):
+    """Notes when it hands a request its connection: at once from the pool, or once a new
+    one is up, through DNS, TCP, TLS and any proxy. A response's time to first byte counts
+    from then (DESIGN.md §5.2), as aiohttp's TraceConfig could also report, but at 1.3 µs of
+    CPU per request rather than 8.3 (DESIGN.md A.4)."""
+
+    async def connect(  # aiohttp's own signature, timeout and all
+        self,
+        req: ClientRequest,
+        traces: list[Trace],
+        timeout: aiohttp.ClientTimeout,  # noqa: ASYNC109
+    ) -> Connection:
+        connection = await super().connect(req, traces, timeout)
+        _connected.set(time.perf_counter())
+        return connection
 
 
 class _AiohttpResponse:
