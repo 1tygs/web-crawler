@@ -13,10 +13,11 @@ from tests.support.jitter import Fixed, Lowest
 from web_crawler import engine
 from web_crawler.config import Config
 from web_crawler.engine import CrawlReport
+from web_crawler.limiter import OPENS_AFTER, CircuitBreaker, ConcurrencyLaw
 from web_crawler.limiter import START as INITIAL_LIMIT
-from web_crawler.limiter import ConcurrencyLaw
 from web_crawler.output import MemorySink, Sink
 from web_crawler.pool import InlineParser
+from web_crawler.transport import TransportError
 from web_crawler.types import ErrorKind, ExitCode, ParseJob, ParseResult, WorkerContext
 
 START = "https://example.com/"
@@ -159,7 +160,7 @@ def test_samples_are_responses_below_500_other_than_429(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     caplog.set_level(logging.INFO, "web_crawler.engine")
-    limiter = engine._Limiter(ConcurrencyLaw(64), clock=lambda: 1.0)
+    limiter = engine._Limiter(ConcurrencyLaw(64), CircuitBreaker(), clock=lambda: 1.0)
     for status in (500, 502, 504):  # not samples, slow as they are
         limiter.answered(status, 9.0, issued_at=0.0)
     for status in (200, 301, 404, 410, 499, 200, 200, 200):
@@ -786,6 +787,102 @@ async def test_the_start_url_is_tried_again_before_the_crawl_gives_up(
     assert report.exit_code is ExitCode.CANNOT_START
     assert tries(transport) == [START] * 3
     assert "can't start: https://example.com/: reset: scripted" in caplog.text
+
+
+class Outage(FakeTransport):
+    """A host that goes once its start page is served: every request fails, as when DNS no
+    longer answers for it, until `failing` probes of the start page have failed too."""
+
+    def __init__(self, replies: Mapping[str, Answer | list[Answer]], failing: int) -> None:
+        super().__init__(replies)
+        self.failing = failing
+        self.served = self.down = False
+        self.failed: list[str] = []  # the requests that failed, in order
+
+    @asynccontextmanager
+    async def open(self, url: str) -> AsyncIterator[FakeResponse]:
+        if self.down and url == START:  # a probe
+            self.down = self.failing > 0
+            self.failing -= 1
+        if self.down:
+            self.failed.append(url)
+            await asyncio.sleep(0)
+            raise TransportError(ErrorKind.DNS, "scripted")
+        async with super().open(url) as response:
+            yield response
+        if url == START and not self.served:
+            self.served = self.down = True
+
+
+async def test_a_host_that_cant_be_reached_pauses_the_crawl_until_it_can(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The host goes once the start page is served. Eight pages are in flight at a time (DNS
+    # failures don't cut the limit), and the 20th failure in a row opens the breaker: the
+    # seven requests still in flight fail too, and then nothing is requested but probes of
+    # the start page, the second of which finds the host. Every page is printed.
+    transport = Outage(fan_out(pages=40, delay=0.0), failing=1)
+    cfg = Config(start_url=START, first_probe=0.01)
+    report = await crawl(cfg, MemorySink(), transport=transport, rng=Lowest())
+    assert report.exit_code is ExitCode.OK
+    assert report.stats.pages == 41
+    assert not report.stats.failures
+    assert len(transport.failed) == OPENS_AFTER + (INITIAL_LIMIT - 1) + 1  # and a probe
+    assert transport.failed[-1] == START
+    assert caplog.messages == [
+        "20 requests in a row got no answer (dns): pausing the crawl, and checking "
+        "https://example.com/ until it answers, for up to 300 s",
+        "https://example.com/ answers again: resuming the crawl",
+    ]
+
+
+async def test_failures_while_the_host_cant_be_reached_cost_no_retries() -> None:
+    # With no retries, each of the first 19 failures ends its page. The 20th opens the
+    # breaker, and it and those of the seven requests still in flight cost nothing: those
+    # pages are tried again once the host is back.
+    transport = Outage(fan_out(pages=40, delay=0.0), failing=0)
+    cfg = Config(start_url=START, first_probe=0.01, retries=0)
+    report = await crawl(cfg, MemorySink(), transport=transport, rng=Lowest())
+    assert report.stats.failures == {"dns": OPENS_AFTER - 1}
+    assert report.stats.pages == 1 + 40 - (OPENS_AFTER - 1)
+    assert report.stats.retries == {"dns": 1 + (INITIAL_LIMIT - 1)}
+
+
+async def test_a_response_sent_after_the_failures_resumes_the_crawl_before_a_probe(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # /ok was requested after the 20th failure's request, and it answers once the breaker is
+    # open: the host can be reached after all, and the crawl resumes without a probe.
+    replies: dict[str, Answer | list[Answer]] = {
+        START: html(*(f"/{n}" for n in range(OPENS_AFTER)), "/ok"),
+        "https://example.com/ok": html(delay=0.05),
+    }
+    replies |= {f"https://example.com/{n}": [ErrorKind.DNS, html()] for n in range(OPENS_AFTER)}
+    transport = FakeTransport(replies)
+    cfg = Config(start_url=START, retries=0)
+    report = await crawl(cfg, MemorySink(), transport=transport, rng=Lowest())
+    assert report.exit_code is ExitCode.OK
+    assert report.stats.failures == {"dns": OPENS_AFTER - 1}  # no retries
+    assert report.stats.pages == 3  # the start page, /ok, and the page that opened it
+    assert tries(transport).count(START) == 1  # no probe
+    assert caplog.messages[-1] == "https://example.com/ answers again: resuming the crawl"
+
+
+async def test_a_host_that_stays_out_of_reach_aborts_the_crawl(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    transport = Outage(fan_out(pages=40, delay=0.0), failing=1000)
+    sink = MemorySink()
+    cfg = Config(start_url=START, first_probe=0.05, give_up_after=0.2)
+    started = time.monotonic()
+    report = await crawl(cfg, sink, transport=transport, rng=Lowest())
+    assert 0.2 <= time.monotonic() - started < 2
+    assert report.exit_code is ExitCode.ABORTED
+    assert len(sink.records) == 1  # the start page, kept
+    assert sink.closed
+    assert transport.failed.count(START) == 2  # probes at 0.05 s and 0.15 s; the next is too late
+    assert "aborting: https://example.com/ has given no answer for 0.2 s (dns)" in caplog.messages
+    assert report.summary.startswith("1 page in ")
 
 
 async def test_records_stream_in_the_order_pages_complete() -> None:

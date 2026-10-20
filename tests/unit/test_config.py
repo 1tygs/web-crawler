@@ -20,6 +20,7 @@ def test_defaults_follow_the_design() -> None:
     assert cfg.max_pages is None
     assert not cfg.ignore_robots
     assert cfg.robots_refresh == 24 * 3600  # RFC 9309 §2.4
+    assert (cfg.first_probe, cfg.give_up_after) == (1.0, 300.0)
 
 
 def test_is_immutable() -> None:
@@ -43,6 +44,9 @@ def test_is_immutable() -> None:
         ("timeout", math.nan, "timeout must be a positive number"),
         ("robots_refresh", 0.0, "robots_refresh must be a positive number"),
         ("robots_refresh", math.inf, "robots_refresh must be a positive number"),
+        ("first_probe", 0.0, "first_probe must be a positive number of seconds, not 0.0"),
+        ("give_up_after", -1.0, "give_up_after must be a positive number of seconds"),
+        ("give_up_after", math.nan, "give_up_after must be a positive number of seconds"),
         ("max_page_bytes", 0, "max_page_bytes must be at least 1"),
         ("retries", -1, "retries must be at least 0"),
         ("max_pages", 0, "max_pages must be at least 1"),

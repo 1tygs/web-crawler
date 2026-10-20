@@ -75,5 +75,6 @@ class ExitCode(IntEnum):
     INTERNAL_ERROR = 1
     USAGE = 2
     CANNOT_START = 3
+    ABORTED = 4  # the host stopped answering, or kept refusing requests
     INTERRUPTED = 130  # SIGINT
     TERMINATED = 143  # SIGTERM

@@ -254,6 +254,16 @@ class Fetcher:
                 detail = f"HTTP {status} to {target}, {why}"
                 return Final(reason, detail, tuple(chain), status, target)
 
+    async def probe(self, url: str) -> int | None:
+        """The status of one request for url, with no redirect followed and no body read,
+        or None if it got no response: a check on a host the crawl paused for, which the
+        concurrency limit doesn't count (DESIGN.md §5.3)."""
+        try:
+            async with self._transport.open(url) as response:
+                return response.status
+        except TransportError:
+            return None
+
     async def _handle(
         self, response: Response, chain: tuple[str, ...], item: CrawlItem
     ) -> FetchOutcome | _Redirect:

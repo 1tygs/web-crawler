@@ -3,8 +3,9 @@
 ConcurrencyLaw is ADR-001's law: errors cut the limit, latency only stops it growing, and a
 probe confirms that a slowdown is the crawl's own doing. PauseGate holds request starts back
 for as long as a Retry-After asks, and spaces them under --max-rps and robots.txt's
-Crawl-delay. All of it is pure: the engine passes the time in, and bench/limiter_sim.py runs
-the same law on simulated servers.
+Crawl-delay. CircuitBreaker stops the crawl when the host can't be reached, until a probe
+finds it again. All of it is pure: the engine passes the time in, and bench/limiter_sim.py
+runs the same law on simulated servers.
 """
 
 import email.utils
@@ -14,12 +15,16 @@ import statistics
 from dataclasses import dataclass
 from datetime import UTC
 
+from web_crawler.types import ErrorKind
+
 START = 8  # the limit a crawl starts with, in slow start
 INFLATED = 1.5  # a round's median this many times the base: the server is queueing
 HELD_ROUNDS = 10  # rounds held in a row before a probe checks whose queueing it is
 PROBE_ROUNDS = 2
 OURS = 0.8  # a probe whose median falls to this share of the held one: the queueing was ours
 MAX_PAUSE = 300.0  # seconds: the longest a Retry-After holds requests back
+OPENS_AFTER = 20  # connection-level failures in a row that open the circuit breaker
+LONGEST_PROBE = 60.0  # seconds between probes of a host the crawl paused for, at most
 
 
 class Kind(enum.Enum):
@@ -208,6 +213,89 @@ def parse_retry_after(value: str | None, now_wall: float) -> float | None:
     if date.tzinfo is None:
         date = date.replace(tzinfo=UTC)
     return min(max(date.timestamp() - now_wall, 0.0), MAX_PAUSE)
+
+
+class Probes:
+    """When to check on a host the crawl has paused for, and when to give up on it
+    (DESIGN.md §5.3, §5.4). The first probe is due `first` seconds after the pause began.
+    After each probe that fails, the wait for the next doubles, up to LONGEST_PROBE. The
+    crawl gives up give_up_after seconds after the pause began."""
+
+    def __init__(self, first: float, give_up_after: float) -> None:
+        self.first = first
+        self.give_up_after = give_up_after
+        self.began = -math.inf  # when the pause began
+        self.next = -math.inf  # when the next probe is due
+        self._wait = first
+
+    def start(self, now: float) -> None:
+        """A pause begins now."""
+        self.began = now
+        self._wait = self.first
+        self.next = now + self._wait
+
+    def failed(self, now: float) -> None:
+        """A probe, at now, found the host no better."""
+        self._wait = min(2 * self._wait, LONGEST_PROBE)
+        self.next = now + self._wait
+
+    @property
+    def deadline(self) -> float:
+        """When to give up."""
+        return self.began + self.give_up_after
+
+
+# Failures to set up a connection: they say the host can't be reached, where a reset or a
+# timeout, once connected, says it can.
+UNREACHABLE = frozenset(
+    {ErrorKind.DNS, ErrorKind.CONNECT, ErrorKind.TLS, ErrorKind.CONNECT_TIMEOUT}
+)
+
+
+class CircuitBreaker:
+    """Stops a crawl spending its retries on a host it can't reach (DESIGN.md §5.3).
+
+    OPENS_AFTER connection-level failures in a row, DNS, connect, TLS or connect timeout,
+    open it: the crawl starts no requests, and probes of the start page check whether the
+    host can be reached again, backing off from `first_probe` seconds to LONGEST_PROBE. A
+    response closes it, and starts the count again. One that stays open for give_up_after
+    seconds gives up, and the crawl aborts.
+
+    Only a response to a request sent after the failures counts, as for the concurrency
+    law's cuts: one already on its way when the host went says nothing about it now. A
+    reset or a timeout came after the connection was made, so it neither counts nor
+    breaks a run.
+    """
+
+    def __init__(self, *, first_probe: float = 1.0, give_up_after: float = 300.0) -> None:
+        self.open = False
+        self.probes = Probes(first_probe, give_up_after)
+        self.last: ErrorKind | None = None  # the latest failure that counted
+        self._failures = 0  # in a row
+        self._since = -math.inf  # when the request of the latest that counted was sent
+
+    def failed(self, kind: ErrorKind, issued_at: float, now: float) -> bool:
+        """A request sent at issued_at got no response. Returns whether that opened the
+        breaker."""
+        if kind not in UNREACHABLE or self.open:
+            return False
+        self.last = kind
+        self._failures += 1
+        self._since = max(self._since, issued_at)
+        if self._failures < OPENS_AFTER:
+            return False
+        self.open = True
+        self.probes.start(now)
+        return True
+
+    def answered(self, issued_at: float) -> bool:
+        """A request sent at issued_at got a response. Returns whether that closed the
+        breaker."""
+        if issued_at <= self._since:
+            return False
+        self._failures = 0
+        was_open, self.open = self.open, False
+        return was_open
 
 
 def rate_ceiling(max_rps: float | None, crawl_delay: float | None) -> float | None:

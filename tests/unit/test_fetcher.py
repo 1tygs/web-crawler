@@ -468,6 +468,25 @@ async def test_the_hop_limit_counts_the_redirects_before_a_retry() -> None:
     assert transport.requested == [chain[-1], "https://example.com/10"]
 
 
+@pytest.mark.parametrize(
+    ("answer", "status"),
+    [
+        (Reply(200, HTML, b"page"), 200),
+        (Reply(301, {"Location": "/a"}), 301),
+        (Reply(503), 503),
+        (ErrorKind.DNS, None),
+        (ErrorKind.RESET, None),
+    ],
+)
+async def test_a_probe_reads_only_the_status(answer: Answer, status: int | None) -> None:
+    transport = FakeTransport({START: answer})
+    fetcher = Fetcher(transport, 1 << 20, stats := Stats(started=0.0))
+    assert await fetcher.probe(START) == status
+    assert transport.opened == [START]  # no redirect followed
+    assert all(response.position == 0 for response in transport.responses)  # no body read
+    assert not stats.statuses  # a probe isn't part of the crawl
+
+
 def test_resume_is_the_item_itself_when_it_failed_where_it_began() -> None:
     start = item()
     assert resume(start, (START,)) is start

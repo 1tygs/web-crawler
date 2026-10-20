@@ -262,7 +262,9 @@ on 429 / 503 / timeout / connection reset or refused / body cut off:
 - Optional hard ceilings:
   - `--max-rps R` spaces request starts evenly, 1/R seconds apart, with no bursts: a quiet spell earns no catching up.
   - A robots.txt `Crawl-delay: d` becomes a 1/d requests-per-second ceiling. This is on by default; `--ignore-robots` turns it off along with the rules.
-- **Circuit breaker.** After 20 consecutive connection-level failures (DNS, connect, TLS), dispatch pauses and single probe requests back off from 1 s to 60 s. If the host stays unreachable for 5 minutes, the crawl aborts with exit code 4 and keeps its partial results. That's better than burning every URL's retry budget.
+- **Circuit breaker.** After 20 consecutive connection-level failures (DNS, connect, TLS, connect timeout), dispatch pauses, and single probes of the start page back off from 1 s to 60 s. A response closes the breaker. If the host stays unreachable for 5 minutes, the crawl aborts with exit code 4 and keeps its partial results. That's better than burning every URL's retry budget: a failure while the breaker is open, or the one that opens it, costs its page no retry.
+  - Only a response to a request sent after the failures counts, as for the limiter's cuts: one that was already on its way when the host went says nothing about it now.
+  - A reset or a timeout means the connection was made, so it neither counts towards a run nor breaks one.
 
 ### 5.4 Errors and retries
 

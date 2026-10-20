@@ -39,6 +39,7 @@ def test_exit_codes_match_the_design() -> None:
         "INTERNAL_ERROR": 1,
         "USAGE": 2,
         "CANNOT_START": 3,
+        "ABORTED": 4,
         "INTERRUPTED": 130,
         "TERMINATED": 143,
     }

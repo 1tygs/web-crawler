@@ -36,10 +36,18 @@ from web_crawler.fetcher import (
     RobotsFetcher,
 )
 from web_crawler.frontier import Admission, Frontier, Hop
-from web_crawler.limiter import ConcurrencyLaw, Decision, PauseGate, rate_ceiling
+from web_crawler.limiter import (
+    OPENS_AFTER,
+    CircuitBreaker,
+    ConcurrencyLaw,
+    Decision,
+    PauseGate,
+    rate_ceiling,
+)
 from web_crawler.output import Sink
 from web_crawler.pool import ParseCrashed, Parser, worker_count
 from web_crawler.pool import start as start_parser
+from web_crawler.retry import Class
 from web_crawler.robots import Availability, RobotsPolicy, RobotsTxt, product_token
 from web_crawler.stats import Stats
 from web_crawler.transport import AiohttpTransport, Transport
@@ -112,9 +120,9 @@ async def crawl(  # noqa: PLR0913  (the collaborators that tests replace)
     rng = rng or random.Random()
     robots = None if cfg.ignore_robots else RobotsFetcher(transport, rng=rng)
     law = ConcurrencyLaw(cfg.max_concurrency)
-    fetcher = Fetcher(
-        transport, cfg.max_page_bytes, stats, signals=_Limiter(law, clock), clock=clock
-    )
+    breaker = CircuitBreaker(first_probe=cfg.first_probe, give_up_after=cfg.give_up_after)
+    signals = _Limiter(law, breaker, clock)
+    fetcher = Fetcher(transport, cfg.max_page_bytes, stats, signals=signals, clock=clock)
     product = product_token(cfg.user_agent)
     if parser is None:
         workers = worker_count(cfg.parse_workers)
@@ -142,6 +150,7 @@ async def crawl(  # noqa: PLR0913  (the collaborators that tests replace)
         max_bytes=cfg.max_page_bytes,
         make_parser=parser,
         law=law,
+        breaker=breaker,
         max_concurrency=cfg.max_concurrency,
         max_rps=cfg.max_rps,
         clock=clock,
@@ -171,20 +180,26 @@ async def crawl(  # noqa: PLR0913  (the collaborators that tests replace)
 
 
 class _Limiter:
-    """Feeds the concurrency law what the fetcher hears (DESIGN.md §5.3), and logs what it
-    decides. Responses below 500, but for 429, are samples of the server's latency."""
+    """Feeds the concurrency law and the circuit breaker what the fetcher hears (DESIGN.md
+    §5.3), and logs what the law decides. Responses below 500, but for 429, are samples of
+    the server's latency."""
 
-    def __init__(self, law: ConcurrencyLaw, clock: Callable[[], float]) -> None:
+    def __init__(
+        self, law: ConcurrencyLaw, breaker: CircuitBreaker, clock: Callable[[], float]
+    ) -> None:
         self._law = law
+        self._breaker = breaker
         self._clock = clock
 
     def answered(self, status: int, ttfb: float, issued_at: float) -> None:
+        self._breaker.answered(issued_at)
         if status in _THROTTLED:
             self._decided(self._law.on_congestion(issued_at, self._clock()))
         elif status < HTTPStatus.INTERNAL_SERVER_ERROR:
             self._decided(self._law.on_sample(ttfb, issued_at, self._clock()))
 
     def failed(self, kind: ErrorKind, issued_at: float) -> None:
+        self._breaker.failed(kind, issued_at, self._clock())
         if kind in _CONGESTED:
             self._decided(self._law.on_congestion(issued_at, self._clock()))
 
@@ -450,6 +465,7 @@ class _Dispatcher:
     max_bytes: int  # the most a page's body may decompress to
     make_parser: Callable[[WorkerContext], Parser]
     law: ConcurrencyLaw
+    breaker: CircuitBreaker
     max_concurrency: int
     max_rps: float | None
     clock: Callable[[], float]
@@ -467,16 +483,18 @@ class _Dispatcher:
     _fetching: set[asyncio.Task[None]] = field(default_factory=set, init=False)
     _parsing: set[asyncio.Task[None]] = field(default_factory=set, init=False)
     _stopping: bool = field(default=False, init=False)
-    _done: asyncio.Future[None] = field(init=False)
+    _done: asyncio.Event = field(default_factory=asyncio.Event, init=False)
     _wake: asyncio.TimerHandle | None = field(default=None, init=False)
     _refresh: asyncio.TimerHandle | None = field(default=None, init=False)
     _refreshing: asyncio.Task[None] | None = field(default=None, init=False)
-
-    def __post_init__(self) -> None:
-        self._done = asyncio.get_running_loop().create_future()
+    _home: str = field(default="", init=False)  # the start page's URL, which probes request
+    _unreachable: bool = field(default=False, init=False)  # the breaker, at the last pump
+    _prober: asyncio.Task[None] | None = field(default=None, init=False)
+    _aborted: bool = field(default=False, init=False)
 
     async def run(self, start: CrawlItem, page: Page) -> ExitCode:
-        """Crawl from the start page until nothing is outstanding."""
+        """Crawl from the start page until nothing is outstanding, or until the crawl gives
+        up on its host."""
         # The scope is fixed now, so the parsers' context can be, and the gateway can start:
         # each worker gets the context once, as it starts (DESIGN.md §5.5).
         ctx = WorkerContext(self.admission.scope.prefixes, self.max_bytes, self.all_urls)
@@ -489,19 +507,25 @@ class _Dispatcher:
             self._refresh = asyncio.get_running_loop().call_later(
                 self.robots_refresh, self._start_refresh
             )
+        self._home = page.job.url
         self._start(start, page)
         self.pump()
-        await self._done
+        await self._done.wait()
+        if self._aborted:
+            return ExitCode.ABORTED
         return ExitCode.INTERNAL_ERROR if self.stats.internal_errors else ExitCode.OK
 
     def pump(self) -> None:
         """Start fetches while there's room. It runs after every completion and every
-        release of a permit, when the rate ceiling allows the next start, and when the
-        sink's backlog clears."""
+        release of a permit, when the rate ceiling allows the next start, when the sink's
+        backlog clears, and when a probe finds the host again."""
         if self._stopping:
             return
+        if self.breaker.open is not self._unreachable:
+            self._breaker_moved()
         while (
-            self._in_pipeline < self._slots
+            not self.breaker.open
+            and self._in_pipeline < self._slots
             and self._requests < self.law.limit
             and not self.sink.backlogged
         ):
@@ -523,8 +547,56 @@ class _Dispatcher:
             self._gate.take(now)
             self._start(item)
         complete = self.frontier.outstanding == 0 or self.stats.pages == self.max_pages
-        if complete and not self._done.done():
-            self._done.set_result(None)
+        if complete:
+            self._done.set()
+
+    def _breaker_moved(self) -> None:
+        """The circuit breaker opened or closed since the last pump (DESIGN.md §5.3)."""
+        self._unreachable = self.breaker.open
+        if self._unreachable:
+            log.warning(
+                "%d requests in a row got no answer (%s): pausing the crawl, and checking %s "
+                "until it answers, for up to %g s",
+                OPENS_AFTER,
+                self.breaker.last,
+                self._home,
+                self.breaker.probes.give_up_after,
+            )
+            self._prober = asyncio.create_task(self._probe_until_reachable())
+            return
+        log.warning("%s answers again: resuming the crawl", self._home)
+        if self._prober is not None:  # a response closed it before a probe did
+            self._prober.cancel()
+            self._prober = None
+
+    async def _probe_until_reachable(self) -> None:
+        """Request the start page now and then while the breaker is open, until a response
+        closes it; abort the crawl if none does in time."""
+        breaker, probes = self.breaker, self.breaker.probes
+        while breaker.open:
+            now = self.clock()
+            if now >= probes.deadline:
+                self._abort(
+                    f"{self._home} has given no answer for {probes.give_up_after:g} s "
+                    f"({breaker.last})"
+                )
+                return
+            if now < probes.next:
+                await asyncio.sleep(min(probes.next, probes.deadline) - now)
+            elif await self.fetcher.probe(self._home) is None:
+                probes.failed(self.clock())
+            else:
+                breaker.answered(now)
+        self._prober = None
+        self.pump()
+
+    def _abort(self, why: str) -> None:
+        """Give up on the crawl: it ends as a signal ends it, keeping what it printed, and
+        exits 4 (DESIGN.md §5.3)."""
+        log.error("aborting: %s", why)
+        self._aborted = True
+        self.halt()
+        self._done.set()
 
     def _start(self, item: CrawlItem, page: Page | None = None) -> None:
         self._in_pipeline += 1
@@ -574,9 +646,8 @@ class _Dispatcher:
         for timer in (self._wake, self._refresh):
             if timer is not None:
                 timer.cancel()
-        cancelled = list(self._fetching)
-        if self._refreshing is not None:
-            cancelled.append(self._refreshing)
+        others = (self._refreshing, self._prober)
+        cancelled = [*self._fetching, *(task for task in others if task is not None)]
         for task in cancelled:
             task.cancel()
         await asyncio.gather(*cancelled, *self._parsing, return_exceptions=True)
@@ -647,6 +718,14 @@ class _Dispatcher:
         did; otherwise the item's failure is final. Waiting there, the item holds no permit
         and no pipeline slot (DESIGN.md §5.4). A Retry-After holds every request back."""
         now = self.clock()
+        if outcome.cls is Class.ERROR and self.breaker.open:
+            # The host can't be reached, which says nothing about this page: trying again
+            # once it can costs the page none of its retries (DESIGN.md §5.3).
+            final = outcome.final
+            self.stats.retries[final.reason] += 1
+            log.info("%s: %s; trying again once the host answers", final.url, final.detail)
+            self.frontier.schedule_retry(outcome.item, now)
+            return True
         if (pause := outcome.retry_after) is not None:
             # The server asks for no requests for a while, not just this one.
             final = outcome.final

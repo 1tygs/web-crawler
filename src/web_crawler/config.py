@@ -35,6 +35,11 @@ class Config:
     strict_host: bool = False  # a start URL that redirects to its www. variant can't start
     insecure: bool = False  # don't verify TLS certificates
     robots_refresh: float = 24 * 3600.0  # seconds between fetches of robots.txt (RFC 9309)
+    # A host the crawl pauses for, as unreachable, is checked first_probe seconds after the
+    # pause began, then twice as long after each check, up to a minute apart; after
+    # give_up_after seconds the crawl aborts.
+    first_probe: float = 1.0
+    give_up_after: float = 300.0
 
     def __post_init__(self) -> None:
         try:
@@ -53,10 +58,10 @@ class Config:
             raise ConfigError(f"timeout must be a positive number of seconds, not {self.timeout}")
         if self.retries < 0:
             raise ConfigError(f"retries must be at least 0, not {self.retries}")
-        if not (math.isfinite(self.robots_refresh) and self.robots_refresh > 0):
-            raise ConfigError(
-                f"robots_refresh must be a positive number of seconds, not {self.robots_refresh}"
-            )
+        for name in ("robots_refresh", "first_probe", "give_up_after"):
+            seconds = getattr(self, name)
+            if not (math.isfinite(seconds) and seconds > 0):
+                raise ConfigError(f"{name} must be a positive number of seconds, not {seconds}")
         if self.max_page_bytes < 1:
             raise ConfigError(f"max_page_bytes must be at least 1, not {self.max_page_bytes}")
         if self.max_pages is not None and self.max_pages < 1:
