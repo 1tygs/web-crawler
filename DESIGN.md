@@ -630,7 +630,7 @@ The brief asks how the crawler would extend to many domains at once, and whether
 
 ### 14.1 The engine as a library
 
-- `crawl(spec: CrawlSpec, sink: Sink) -> CrawlStats`. `CrawlSpec` is today's `Config` plus a scope policy. `Sink` is a protocol with `write(record)` and `close()`: text and JSONL now; Kafka, object storage or a database later.
+- `crawl(spec: CrawlSpec, sink: Sink) -> CrawlStats`. `CrawlSpec` is today's `Config` plus a scope policy. `Sink` is a protocol with `write(record)`, `backlogged` and `close()`, plus `start(on_drained)`, through which a sink that fell behind wakes the dispatcher: text and JSONL now; Kafka, object storage or a database later.
 - The CLI shrinks to argument parsing, a stdout sink and exit codes.
 - The parts without I/O (`parse_page`, the URL rules, the robots policy, the limiter's law, admission) are reused unchanged by every front end below. That's the payoff of keeping them free of I/O ([§4.1](#41-process-and-component-view)).
 

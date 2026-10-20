@@ -97,6 +97,8 @@ parallel = true
 patch = ["subprocess"]
 
 [tool.coverage.report]
+# The walking skeleton is fully covered; lowering this needs a reason.
+fail_under = 100
 show_missing = true
 skip_covered = true
 exclude_also = ["if TYPE_CHECKING:", "if __name__ == .__main__.:", "@overload", "class .*\\(Protocol\\):"]

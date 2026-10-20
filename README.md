@@ -2,7 +2,7 @@
 
 A fast, accurate and polite web crawler for the command line, written in Python. Give it a start URL and it crawls that host, printing each page's URL followed by every link found on the page.
 
-> **Status: design stage.** [DESIGN.md](DESIGN.md) is the proposed design, and [docs/implementation-plan.md](docs/implementation-plan.md) is the plan for building v1; the crawler itself isn't implemented yet. The measurements behind the design can be reproduced with the scripts in [`bench/`](bench/).
+> **Status: in development, step 1 of the 5 in [the v1 plan](docs/implementation-plan.md).** The walking skeleton crawls: `crawl URL` fetches the start URL's host breadth-first, eight requests at a time, and prints each page's links. It doesn't read robots.txt yet, so point it only at sites you run. Accuracy, speed, robustness, and the limits and output options come in the next four steps; until then [DESIGN.md](DESIGN.md) describes more than the code does. The measurements behind the design can be reproduced with the scripts in [`bench/`](bench/).
 
 ## Planned usage
 

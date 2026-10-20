@@ -1,12 +1,14 @@
 import importlib.metadata
 import subprocess
 import sys
+from typing import NoReturn
 
 import pytest
 
 import web_crawler
 from web_crawler.cli import main, parse_args
 from web_crawler.config import Config
+from web_crawler.types import ExitCode
 
 
 def test_version_matches_the_distribution_metadata() -> None:
@@ -68,3 +70,16 @@ def test_an_uncrawlable_url_is_a_usage_error(capsys: pytest.CaptureFixture[str])
     assert (
         "crawl: error: 'ftp://example.com/' isn't an http or https URL" in capsys.readouterr().err
     )
+
+
+def test_an_unexpected_exception_exits_1_with_its_traceback(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    async def broken(*args: object, **kwargs: object) -> NoReturn:
+        raise RuntimeError("a bug")
+
+    # main() builds the crawl itself, so the engine is replaced where main() looks it up.
+    monkeypatch.setattr("web_crawler.cli.crawl", broken)
+    assert main(["https://example.com/"]) == ExitCode.INTERNAL_ERROR
+    assert "internal error" in caplog.text
+    assert "RuntimeError: a bug" in caplog.text

@@ -356,7 +356,7 @@ It loops over at most 10 hops. Each iteration opens the request, feeds the limit
 
 ### 5.13 `output.py`
 
-- **`Sink` protocol:** `write(record)`, `backlogged` and `close()`. This is the seam DESIGN §14.1 names.
+- **`Sink` protocol:** `start(on_drained)`, `write(record)`, `backlogged` and `close()`. This is the seam DESIGN §14.1 names. `start` hands the sink the callback that wakes the dispatcher, since the CLI builds the sink before the event loop runs.
 - **`ThreadedSink(binary_stream)`** puts records on a `SimpleQueue` for a writer thread:
   - each batch of queued records goes out in one `write()`, and the thread flushes at most every 100 ms and whenever it's idle;
   - the backlog is two single-writer counters, bytes enqueued on the loop thread and bytes written on the writer thread, so no lock is needed;
