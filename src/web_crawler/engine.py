@@ -409,7 +409,9 @@ def _next_attempt(
     outcome: Retry, retries: int, rng: random.Random, stats: Stats
 ) -> tuple[CrawlItem, float] | None:
     """When to fetch outcome's item again, and as what; or None if it has no retries left."""
-    again = retry.next_attempt(outcome.item, outcome.cls, retries=retries, rng=rng)
+    again = retry.next_attempt(
+        outcome.item, outcome.cls, retries=retries, rng=rng, retry_after=outcome.retry_after
+    )
     if again is not None:
         final = outcome.final
         stats.retries[final.reason] += 1
@@ -643,13 +645,19 @@ class _Dispatcher:
     def _retry(self, outcome: Retry) -> bool:
         """Put outcome's item in the retry heap, if it has retries left, and say whether it
         did; otherwise the item's failure is final. Waiting there, the item holds no permit
-        and no pipeline slot (DESIGN.md §5.4)."""
+        and no pipeline slot (DESIGN.md §5.4). A Retry-After holds every request back."""
+        now = self.clock()
+        if (pause := outcome.retry_after) is not None:
+            # The server asks for no requests for a while, not just this one.
+            final = outcome.final
+            log.info("%s: %s, Retry-After: pausing for %g s", final.url, final.detail, pause)
+            self._gate.pause(now + pause)
         again = _next_attempt(outcome, self.retries, self.rng, self.stats)
         if again is None:
             _count(self.stats, outcome.final)
             return False
         item, delay = again
-        self.frontier.schedule_retry(item, self.clock() + delay)
+        self.frontier.schedule_retry(item, now + delay)
         return True
 
     async def _fetch(self, item: CrawlItem) -> FetchOutcome:

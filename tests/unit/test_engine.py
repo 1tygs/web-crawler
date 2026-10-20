@@ -115,8 +115,8 @@ def cuts(caplog: pytest.LogCaptureFixture) -> list[str]:
 @pytest.mark.parametrize(
     ("answer", "cut", "retried"),
     [
-        (Reply(429, HTML), True, False),
-        (Reply(503, HTML), True, False),
+        (Reply(429, HTML), True, True),
+        (Reply(503, HTML), True, True),
         (ErrorKind.TIMEOUT, True, True),
         (ErrorKind.CONNECT_TIMEOUT, True, True),
         (ErrorKind.RESET, True, True),
@@ -142,12 +142,17 @@ async def test_distress_cuts_the_limit(
 
 
 async def test_one_congestion_event_cuts_the_limit_once(caplog: pytest.LogCaptureFixture) -> None:
-    # Eight requests in flight all get a 429: one cut answers them all.
+    # Eight requests in flight all get a 429: one cut answers them all. Tried again, after
+    # the cut, they get their pages.
     caplog.set_level(logging.INFO, "web_crawler.engine")
-    replies = fan_out(pages=8, delay=0.01)
-    replies |= {f"https://example.com/{n}": Reply(429, HTML, delay=0.01) for n in range(8)}
-    await crawl(Config(start_url=START), MemorySink(), transport=FakeTransport(replies))
+    replies: dict[str, Answer | list[Answer]] = {**fan_out(pages=8, delay=0.01)}
+    replies |= {
+        f"https://example.com/{n}": [Reply(429, HTML, delay=0.01), html()] for n in range(8)
+    }
+    transport = FakeTransport(replies)
+    report = await crawl(Config(start_url=START), MemorySink(), transport=transport, rng=Lowest())
     assert cuts(caplog) == ["concurrency limit: cut: 8 -> 4"]
+    assert report.stats.pages == 9
 
 
 def test_samples_are_responses_below_500_other_than_429(
@@ -287,7 +292,8 @@ async def test_a_start_url_that_isnt_a_page_cant_start(
     reply: Reply | ErrorKind, message: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     sink = MemorySink()
-    report = await crawl(Config(start_url=START), sink, transport=FakeTransport({START: reply}))
+    transport = FakeTransport({START: reply})
+    report = await crawl(Config(start_url=START), sink, transport=transport, rng=Lowest())
     assert report.exit_code is ExitCode.CANNOT_START
     assert message in caplog.text
     assert sink.records == []
@@ -369,11 +375,13 @@ async def test_failures_are_counted_not_printed() -> None:
         "https://example.com/off": Reply(302, {"Location": "https://elsewhere.org/"}),
     }
     sink = MemorySink()
-    report = await crawl(Config(start_url=START), sink, transport=FakeTransport(replies))
+    transport = FakeTransport(replies)
+    report = await crawl(Config(start_url=START), sink, transport=transport, rng=Lowest())
     assert report.exit_code is ExitCode.OK
     assert len(sink.records) == 1
     assert report.stats.not_html == 1
     assert report.stats.failures == {"HTTP 404": 1, "reset": 1, "redirect out of scope": 1}
+    assert report.stats.retries == {"reset": 3}  # its retries, before it failed
 
 
 class Valve(MemorySink):
@@ -657,6 +665,55 @@ async def test_a_fetch_that_keeps_failing_ends_after_its_retries(retries: int) -
     assert tries(transport) == [START] + ["https://example.com/a"] * (1 + retries)
     assert report.stats.failures == {"connect": 1}
     assert report.stats.retries == ({"connect": retries} if retries else {})
+
+
+async def test_throttling_is_tried_again_on_a_budget_of_its_own() -> None:
+    # Five tries more whatever --retries says, and none of them use up its retries.
+    replies: dict[str, Answer | list[Answer]] = {
+        START: html("/busy", "/flaky"),
+        "https://example.com/busy": Reply(503, HTML),
+        "https://example.com/flaky": [Reply(429, HTML), ErrorKind.RESET, Reply(429, HTML), html()],
+    }
+    transport = FakeTransport(replies)
+    cfg = Config(start_url=START, retries=1)
+    report = await crawl(cfg, MemorySink(), transport=transport, rng=Lowest())
+    assert tries(transport).count("https://example.com/busy") == 6
+    assert tries(transport).count("https://example.com/flaky") == 4
+    assert report.stats.pages == 2
+    assert report.stats.failures == {"HTTP 503": 1}
+    assert report.stats.retries == {"HTTP 503": 5, "HTTP 429": 2, "reset": 1}
+
+
+async def test_retry_after_pauses_every_request(caplog: pytest.LogCaptureFixture) -> None:
+    # The server asks for a second's pause. The requests already in flight finish, but no
+    # other starts until the pause is over, and then the page that asked for it goes first.
+    caplog.set_level(logging.INFO, "web_crawler.engine")
+    replies: dict[str, Answer | list[Answer]] = {
+        START: html("/busy", *(f"/{n}" for n in range(30))),
+        "https://example.com/busy": [Reply(429, {"Retry-After": "1"}), html()],
+    }
+    replies |= {f"https://example.com/{n}": html(delay=0.01) for n in range(30)}
+    transport = Times(replies)
+    report = await crawl(Config(start_url=START), MemorySink(), transport=transport, rng=Lowest())
+    assert report.stats.pages == 32
+    started = [(url, at) for url, at in transport.started if not url.endswith("/robots.txt")]
+    first, after = started[1 : 1 + INITIAL_LIMIT], started[1 + INITIAL_LIMIT :]
+    assert first[0][0] == "https://example.com/busy"
+    assert after[0][0] == "https://example.com/busy"
+    assert after[0][1] - first[0][1] >= 1.0 - 0.01
+    assert "https://example.com/busy: HTTP 429, Retry-After: pausing for 1 s" in caplog.messages
+
+
+async def test_the_start_url_waits_as_long_as_retry_after_says(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, "web_crawler.engine")
+    transport = Times({START: [Reply(503, {"Retry-After": "1"}), html()]})
+    report = await crawl(Config(start_url=START), MemorySink(), transport=transport, rng=Lowest())
+    assert report.exit_code is ExitCode.OK
+    (_, first), (_, second) = [entry for entry in transport.started if entry[0] == START]
+    assert second - first >= 1.0 - 0.01
+    assert "https://example.com/: HTTP 503; trying again in 1.00 s" in caplog.messages
 
 
 async def test_an_error_that_would_recur_is_not_tried_again() -> None:

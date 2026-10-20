@@ -1,10 +1,23 @@
 """ADR-001's concurrency law (DESIGN.md §5.3): its state machine, step by step, and its
 behaviour on A.11's simulated servers, which bench/limiter_sim.py runs on this same class."""
 
+import email.utils
+import math
+
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from tests.support.bench import simulate
-from web_crawler.limiter import ConcurrencyLaw, Decision, Kind, PauseGate, rate_ceiling
+from web_crawler.limiter import (
+    MAX_PAUSE,
+    ConcurrencyLaw,
+    Decision,
+    Kind,
+    PauseGate,
+    parse_retry_after,
+    rate_ceiling,
+)
 
 BASE = 0.100  # seconds: the first round's median time to first byte
 
@@ -188,6 +201,76 @@ def test_without_a_rate_the_gate_never_waits() -> None:
     gate = PauseGate()
     gate.take(1.0)
     assert gate.delay(1.0) == 0
+
+
+def test_a_pause_holds_every_start_back_until_it_ends() -> None:
+    gate = PauseGate()
+    gate.pause(until=40.0)
+    assert gate.delay(10.0) == 30.0
+    gate.pause(until=20.0)  # an earlier end doesn't shorten it
+    assert gate.delay(10.0) == 30.0
+    gate.pause(until=50.0)  # a later one extends it
+    assert gate.delay(10.0) == 40.0
+    assert gate.delay(50.0) == 0
+
+
+def test_a_pause_and_the_rate_ceiling_each_hold_starts_back() -> None:
+    gate = PauseGate(rate=1)
+    gate.take(10.0)
+    gate.pause(until=10.5)
+    assert gate.delay(10.0) == 1.0  # the rate's turn is later than the pause's end
+    gate.pause(until=12.0)
+    assert gate.delay(10.0) == 2.0
+    assert gate.delay(12.0) == 0
+
+
+NOW = 784111777.0  # Sun, 06 Nov 1994 08:49:37 GMT, RFC 9110's example date
+
+
+@pytest.mark.parametrize(
+    ("value", "seconds"),
+    [
+        ("120", 120.0),
+        ("0", 0.0),
+        (" 5\t", 5.0),
+        ("300", MAX_PAUSE),
+        ("301", MAX_PAUSE),  # capped
+        ("9" * 400, MAX_PAUSE),
+        # An HTTP date, in each of the three formats HTTP allows: IMF-fixdate, RFC 850 and
+        # asctime, which has no zone and is GMT.
+        ("Sun, 06 Nov 1994 08:51:37 GMT", 120.0),
+        ("Sunday, 06-Nov-94 08:51:37 GMT", 120.0),
+        ("Sun Nov  6 08:51:37 1994", 120.0),
+        ("Sun, 06 Nov 1994 08:49:37 GMT", 0.0),  # now
+        ("Sun, 06 Nov 1994 08:00:00 GMT", 0.0),  # past
+        ("Sun, 06 Nov 1994 09:49:37 GMT", MAX_PAUSE),  # an hour from now: capped
+    ],
+)
+def test_retry_after_is_seconds_or_a_date(value: str, seconds: float) -> None:
+    assert parse_retry_after(value, NOW) == seconds
+
+
+@pytest.mark.parametrize(
+    "value",
+    [None, "", "soon", "-5", "1.5", "+30", "١٢٠", "1994-11-06T08:51:37Z", "Sun, 31 Feb 1994"],
+)
+def test_retry_after_that_says_neither_is_ignored(value: str | None) -> None:
+    assert parse_retry_after(value, NOW) is None
+
+
+@given(st.text(), st.floats(0, 4e9))
+def test_retry_after_is_never_more_than_the_cap(value: str, now: float) -> None:
+    seconds = parse_retry_after(value, now)
+    assert seconds is None or 0.0 <= seconds <= MAX_PAUSE
+
+
+@given(st.integers(0, 10**6))
+def test_retry_after_reads_a_date_that_email_utils_writes(ahead: int) -> None:
+    date = email.utils.formatdate(NOW + ahead, usegmt=True)
+    assert parse_retry_after(date, NOW) == min(ahead, MAX_PAUSE)
+    assert math.isclose(
+        parse_retry_after(date, NOW + 0.25) or 0.0, max(min(ahead, 300.25) - 0.25, 0.0)
+    )
 
 
 @pytest.mark.parametrize(

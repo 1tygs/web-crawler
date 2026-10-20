@@ -27,7 +27,7 @@ class Config:
     parse_workers: int | None = None  # parser processes; None: one fewer than the CPUs
     max_rps: float | None = None  # requests started per second, at most
     timeout: float = 60.0  # seconds, for one whole request
-    retries: int = 3  # how many times an item is tried again after an error
+    retries: int = 3  # how many times an item is tried again after an error; not a 429 or 503
     max_page_bytes: int = 32 * MIB  # body bytes read from one page
     max_pages: int | None = None  # stop once this many pages are printed
     all_urls: bool = False  # print every URL-bearing attribute; still crawl only links

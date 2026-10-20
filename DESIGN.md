@@ -269,7 +269,7 @@ on 429 / 503 / timeout / connection reset or refused / body cut off:
 | Condition | Action |
 |---|---|
 | DNS failure, connection refused or reset, TLS error, timeout, body cut off mid-transfer | Retry up to 3 times with exponential backoff and full jitter (base 0.5 s, cap 30 s). A hard signal to the limiter, except for DNS and TLS failures, which say nothing about the server's load |
-| 429, 503 | Honour `Retry-After` (seconds or HTTP-date), halve the limit, retry. These have their own budget of 5, so throttling doesn't use up the error retries |
+| 429, 503 | Honour `Retry-After` (seconds or HTTP-date): no request starts until it ends, at most 300 s later, and the page that asked goes first. Halve the limit, retry. These have their own budget of 5, so throttling doesn't use up the error retries; without a `Retry-After`, they back off as errors do |
 | 408, 500, 502, 504 | Retry up to 3 times with backoff |
 | Other 4xx/5xx (404, 410, 401, 403, …) | Final: counted, logged at `-v`, optional JSONL error record |
 | 20 consecutive 403s after successful pages | Likely a firewall block, not 20 forbidden pages. Pause dispatch and re-request the start URL with backoff. If it recovers, requeue those URLs once; if it's still blocked after 5 minutes, abort with exit code 4 and keep the partial results |

@@ -1,21 +1,25 @@
 """How many requests a crawl keeps in flight, and how fast it starts them (DESIGN.md §5.3).
 
 ConcurrencyLaw is ADR-001's law: errors cut the limit, latency only stops it growing, and a
-probe confirms that a slowdown is the crawl's own doing. PauseGate spaces request starts
-under --max-rps and robots.txt's Crawl-delay. Both are pure: the engine passes the time in,
-and bench/limiter_sim.py runs the same law on simulated servers.
+probe confirms that a slowdown is the crawl's own doing. PauseGate holds request starts back
+for as long as a Retry-After asks, and spaces them under --max-rps and robots.txt's
+Crawl-delay. All of it is pure: the engine passes the time in, and bench/limiter_sim.py runs
+the same law on simulated servers.
 """
 
+import email.utils
 import enum
 import math
 import statistics
 from dataclasses import dataclass
+from datetime import UTC
 
 START = 8  # the limit a crawl starts with, in slow start
 INFLATED = 1.5  # a round's median this many times the base: the server is queueing
 HELD_ROUNDS = 10  # rounds held in a row before a probe checks whose queueing it is
 PROBE_ROUNDS = 2
 OURS = 0.8  # a probe whose median falls to this share of the held one: the queueing was ours
+MAX_PAUSE = 300.0  # seconds: the longest a Retry-After holds requests back
 
 
 class Kind(enum.Enum):
@@ -157,23 +161,53 @@ class ConcurrencyLaw:
 class PauseGate:
     """When the next request may start (DESIGN.md §5.3).
 
-    Under a rate ceiling, each start makes the next wait 1/rate seconds, so requests are
-    spaced evenly rather than sent in bursts, and a quiet spell earns no catching up. With
-    no ceiling, requests start whenever the limit allows.
+    A pause, from a 429 or 503's Retry-After, holds every start back until it ends; a later
+    pause extends it, an earlier one doesn't shorten it. Under a rate ceiling, each start
+    makes the next wait 1/rate seconds, so requests are spaced evenly rather than sent in
+    bursts, and a quiet spell earns no catching up. With neither, requests start whenever
+    the limit allows.
     """
 
     def __init__(self, rate: float | None = None) -> None:
         self.rate = rate  # requests per second, or None
-        self._next = -math.inf
+        self._next = -math.inf  # the rate ceiling's next start
+        self._paused_until = -math.inf
 
     def delay(self, now: float) -> float:
         """Seconds until a request may start: 0 if one may start now."""
-        return max(0.0, self._next - now) if self.rate else 0.0
+        next_start = max(self._paused_until, self._next if self.rate else -math.inf)
+        return max(0.0, next_start - now)
 
     def take(self, now: float) -> None:
         """A request starts now."""
         if self.rate:
             self._next = now + 1 / self.rate
+
+    def pause(self, until: float) -> None:
+        """Start no request before until, the clock's reading when a Retry-After ends."""
+        self._paused_until = max(self._paused_until, until)
+
+
+def parse_retry_after(value: str | None, now_wall: float) -> float | None:
+    """The seconds a Retry-After header asks a client to wait (RFC 9110 §10.2.3), at most
+    MAX_PAUSE: its number of seconds, or the time from now_wall, the wall clock's reading in
+    seconds since the epoch, until its date. None if there's no header, or it's neither.
+
+    A date may be in any of HTTP's three formats. The asctime one has no zone, and is GMT
+    as HTTP has it: email.utils reads it as local time.
+    """
+    if value is None:
+        return None
+    value = value.strip(" \t")
+    if value.isascii() and value.isdigit():  # isdigit() alone accepts other scripts' digits
+        return float(min(int(value), MAX_PAUSE))
+    try:
+        date = email.utils.parsedate_to_datetime(value)
+    except ValueError:
+        return None
+    if date.tzinfo is None:
+        date = date.replace(tzinfo=UTC)
+    return min(max(date.timestamp() - now_wall, 0.0), MAX_PAUSE)
 
 
 def rate_ceiling(max_rps: float | None, crawl_delay: float | None) -> float | None:

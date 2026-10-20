@@ -73,7 +73,9 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="N",
         default=3,
         help="how many times to try a page again after an error, such as a timeout, a "
-        "dropped connection or a server error, waiting longer each time (default: %(default)s)",
+        "dropped connection or a server error, waiting longer each time; a 429 or 503 is "
+        "tried again up to 5 times whatever N is, as its Retry-After asks "
+        "(default: %(default)s)",
     )
     parser.add_argument(
         "--ignore-robots",

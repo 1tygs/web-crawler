@@ -360,7 +360,7 @@ async def test_drains_a_small_non_html_body_and_drops_a_large_one(
     assert transport.responses[0].position == read
 
 
-@pytest.mark.parametrize("status", [404, 410, 401, 403, 400, 501, 429, 503])
+@pytest.mark.parametrize("status", [404, 410, 401, 403, 400, 501])
 async def test_an_error_status_is_final(status: int) -> None:
     outcome, _, stats = await fetch({START: Reply(status, HTML)})
     assert outcome == Final(f"HTTP {status}", f"HTTP {status}", (START,), status)
@@ -374,6 +374,26 @@ async def test_an_error_status_that_may_pass_is_a_retry(status: int) -> None:
     assert outcome == Retry(item(), Class.ERROR, final)
     assert transport.requested == [START]  # whether to try again is the caller's choice
     assert stats.statuses == {status: 1}
+
+
+@pytest.mark.parametrize(
+    ("headers", "retry_after"),
+    [
+        ({}, None),
+        ({"Retry-After": "120"}, 120.0),
+        ({"Retry-After": "Sun, 06 Nov 1994 08:51:37 GMT"}, 120.0),
+        ({"Retry-After": "whenever"}, None),
+    ],
+)
+@pytest.mark.parametrize("status", [429, 503])
+async def test_throttling_is_a_retry_after_what_retry_after_says(
+    status: int, headers: dict[str, str], retry_after: float | None
+) -> None:
+    transport = FakeTransport({START: Reply(status, headers)})
+    fetcher = Fetcher(transport, 1 << 20, Stats(started=0.0), wall_clock=lambda: 784111777.0)
+    outcome = await fetcher.fetch(item(), AdmissionHops(claiming(START)))
+    final = Final(f"HTTP {status}", f"HTTP {status}", (START,), status)
+    assert outcome == Retry(item(), Class.THROTTLE, final, retry_after)
 
 
 @pytest.mark.parametrize(

@@ -31,6 +31,7 @@ from web_crawler.content import (
     sniff_html,
 )
 from web_crawler.frontier import Admission, Hop
+from web_crawler.limiter import parse_retry_after
 from web_crawler.retry import Class, classify
 from web_crawler.robots import Availability, RobotsTxt
 from web_crawler.stats import Stats
@@ -94,6 +95,7 @@ class Retry:
     item: CrawlItem  # to request again: the item where it failed, as resume() makes it
     cls: Class  # what kind of failure, which says what budget a retry uses
     final: Final  # how the item ends if it isn't tried again
+    retry_after: float | None = None  # seconds a 429 or 503's Retry-After asks for
 
 
 type FetchOutcome = Page | NotPage | Claimed | Retry | Final
@@ -193,7 +195,7 @@ _STOPPED = {
 
 
 class Fetcher:
-    def __init__(
+    def __init__(  # noqa: PLR0913  (the collaborators that tests replace)
         self,
         transport: Transport,
         max_page_bytes: int,
@@ -201,12 +203,14 @@ class Fetcher:
         *,
         signals: Signals | None = None,
         clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
     ) -> None:
         self._transport = transport
         self._max_page_bytes = max_page_bytes
         self._stats = stats
         self._signals = signals or _Unheard()
         self._clock = clock
+        self._wall_clock = wall_clock  # for Retry-After's dates
 
     async def fetch(self, item: CrawlItem, hops: HopPolicy) -> FetchOutcome:
         """Request item.url and follow its redirects to a page, or to why there isn't one.
@@ -228,13 +232,11 @@ class Fetcher:
             try:
                 async with self._transport.open(chain[-1]) as response:
                     self._signals.answered(response.status, response.ttfb, issued)
-                    outcome = await self._handle(response, tuple(chain))
+                    outcome = await self._handle(response, tuple(chain), item)
             except TransportError as error:
                 self._signals.failed(error.kind, issued)
                 final = Final(str(error.kind), str(error), tuple(chain))
                 return _retry_or(final, classify(error.kind), item)
-            if isinstance(outcome, Final) and outcome.status is not None:
-                return _retry_or(outcome, classify(outcome.status), item)
             if not isinstance(outcome, _Redirect):
                 return outcome
             target, status = outcome.target, outcome.status
@@ -252,8 +254,11 @@ class Fetcher:
                 detail = f"HTTP {status} to {target}, {why}"
                 return Final(reason, detail, tuple(chain), status, target)
 
-    async def _handle(self, response: Response, chain: tuple[str, ...]) -> FetchOutcome | _Redirect:
-        """The outcome of one response, the last of chain, or the redirect it makes."""
+    async def _handle(
+        self, response: Response, chain: tuple[str, ...], item: CrawlItem
+    ) -> FetchOutcome | _Redirect:
+        """The outcome of item's request for the last URL of chain, or the redirect it
+        makes."""
         status = response.status
         self._stats.statuses[status] += 1
         match triage(status, response.headers):
@@ -275,7 +280,17 @@ class Fetcher:
                 await _drain_if_small(response)
                 return NotPage(response.url, response.headers.get("Content-Type"))
             case Triage.FINAL:  # pragma: no branch  (the cases are exhaustive)
-                return Final(f"HTTP {status}", f"HTTP {status}", chain, status)
+                return self._failed(response, chain, item)
+
+    def _failed(self, response: Response, chain: tuple[str, ...], item: CrawlItem) -> Retry | Final:
+        """An answer that isn't a page or a redirect: final, or worth another try. A 429 or
+        503 says how long to wait in its Retry-After, if it says."""
+        status = response.status
+        final = Final(f"HTTP {status}", f"HTTP {status}", chain, status)
+        if (cls := classify(status)) is not Class.THROTTLE:
+            return _retry_or(final, cls, item)
+        value = response.headers.get("Retry-After")
+        return Retry(resume(item, chain), cls, final, parse_retry_after(value, self._wall_clock()))
 
     async def _sniff(self, response: Response, chain: tuple[str, ...]) -> Page | NotPage | Final:
         """A 2xx response without a usable type: a page if its body starts as HTML does. The
@@ -418,9 +433,7 @@ class RobotsFetcher:
 
 def _retry_or(final: Final, cls: Class, item: CrawlItem) -> Retry | Final:
     """A Retry of item where final ended it, if final is worth another try."""
-    if cls is Class.ERROR:
-        return Retry(resume(item, final.chain), cls, final)
-    return final
+    return final if cls is Class.FINAL else Retry(resume(item, final.chain), cls, final)
 
 
 def _too_many_redirects(chain: tuple[str, ...], looped: bool, target: str, status: int) -> Final:
