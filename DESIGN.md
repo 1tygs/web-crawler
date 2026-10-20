@@ -335,14 +335,15 @@ Each URL has two forms:
 
 ### 5.7 robots.txt
 
-- **When.** Rules are per origin (RFC 9309), so the file for every in-scope origin (at most two: `https` and `http` on the default ports) is fetched in parallel before the first page, while the parser pool warms up. Admission then never waits for a file, so it stays synchronous ([§4.3](#43-concurrency-model)).
+- **When.** Rules are per origin (RFC 9309), so the file for every in-scope origin (at most two: `https` and `http` on the default ports) is fetched in parallel before the first page, while the parser pool warms up. Admission then never waits for a file, so it stays synchronous ([§4.3](#43-concurrency-model)). Most sites redirect `http://host/robots.txt` to `https://host/robots.txt`; each URL is requested once, and its answer serves both origins.
 - **Status handling per RFC 9309:**
-  - Follow at least 5 redirects.
-  - 2xx: parse the first 500 KiB.
-  - 4xx other than 429: allow everything.
-  - 429, 5xx or unreachable: retry with backoff, then treat as complete disallow. For the start URL's origin that means exit 3, suggesting `--ignore-robots` for site owners; for the other origin, its URLs are skipped and counted. RFC 9309 doesn't single out 429, but reading "too many requests" as permission would be the wrong way round; Google treats it as a server error too.
+  - Follow at least 5 redirects, to other hosts too; the file found governs the origin it was asked for. More than 5: there is no file.
+  - 2xx: parse the first 500 KiB, as UTF-8 with replacement. A line cut off at the limit is dropped, and so is a byte-order mark, which would hide the first line from Protego.
+  - 4xx other than 429, and anything else that isn't a file: allow everything.
+  - 429, 5xx or no answer: 3 tries with backoff, then treat as complete disallow. For the start URL's origin that means exit 3, suggesting `--ignore-robots` for site owners; if the host never answered at all, the message says so instead, since `--ignore-robots` wouldn't help. For the other origin, its URLs are skipped and counted. RFC 9309 doesn't single out 429, but reading "too many requests" as permission would be the wrong way round; Google treats it as a server error too.
 - **Parser: Protego.** A small pure-Python library with no dependencies; the Scrapy project maintains it, but it doesn't need Scrapy. It implements longest-match precedence, `*` and `$` wildcards, and `Allow`. `urllib.robotparser` was rejected: it uses first-match semantics, doesn't support wildcards, and is 6–17× slower (measured).
-- Groups are matched on the User-Agent's product token. Protego is looser than RFC 9309 here: a group name that starts a token in the User-Agent matches, so a `User-agent: web` group also applies to `web-crawler` (verified, A.6). That only matters when a site names a group after a prefix of the token, so it's accepted and pinned in a test rather than worked around. The file is re-fetched if a crawl runs past 24 hours.
+- Groups are matched on the User-Agent's product token: its leading letters, hyphens and underscores (RFC 9309 §2.2.1), `web-crawler` by default and whatever `--user-agent` gives. Protego is looser than RFC 9309 here: a group name that starts a token in the User-Agent matches, so a `User-agent: web` group also applies to `web-crawler` (verified, A.6). That only matters when a site names a group after a prefix of the token, so it's accepted and pinned in a test rather than worked around.
+- Every origin's file is fetched again every 24 hours while a crawl runs, as RFC 9309 asks; one that's unreachable then keeps the rules it had. URLs a rule rejects are counted, with examples, in the summary.
 
 ### 5.8 Output
 

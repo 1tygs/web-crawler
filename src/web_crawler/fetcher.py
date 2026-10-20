@@ -1,19 +1,24 @@
-"""One item's fetch: redirects, triage and the body (DESIGN.md §5.2).
+"""One item's fetch: redirects, triage and the body (DESIGN.md §5.2); and robots.txt
+(DESIGN.md §5.7).
 
 The fetcher follows redirects itself, so that each hop is checked and claimed before it's
 requested, and reads only the bodies worth reading. What to do with a response is decided
 by triage() from the status and headers alone.
 """
 
+import asyncio
 import enum
-from collections.abc import Collection, Mapping
+import random
+from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
 import ada_url
 
+from web_crawler import robots
 from web_crawler.content import HTML_TYPES, parse_content_type
 from web_crawler.frontier import Admission, Hop
+from web_crawler.robots import Availability, RobotsTxt
 from web_crawler.stats import Stats
 from web_crawler.transport import Response, Transport, TransportError
 from web_crawler.types import CrawlItem, ParseJob
@@ -111,6 +116,13 @@ class _Redirect:
     target: str  # resolved, without its fragment
 
 
+# How an item ends at a redirect that it may not follow: the reason, and why.
+_STOPPED = {
+    Hop.OUT_OF_SCOPE: ("redirect out of scope", "outside the crawl's scope"),
+    Hop.DISALLOWED: ("redirect disallowed", "which robots.txt disallows"),
+}
+
+
 class Fetcher:
     def __init__(self, transport: Transport, max_page_bytes: int, stats: Stats) -> None:
         self._transport = transport
@@ -135,23 +147,19 @@ class Fetcher:
                 return Final(str(error.kind), str(error), tuple(chain))
             if not isinstance(outcome, _Redirect):
                 return outcome
-            target = outcome.target
+            target, status = outcome.target, outcome.status
             if len(chain) > MAX_REDIRECTS:
-                if len(keys) < len(chain):  # some URL was requested twice
-                    detail = f"redirects in a loop through {', '.join(dict.fromkeys(chain))}"
-                    return Final("redirect loop", detail, tuple(chain), outcome.status)
-                detail = f"more than {MAX_REDIRECTS} redirects; the last was to {target}"
-                return Final("too many redirects", detail, tuple(chain), outcome.status)
+                return _too_many_redirects(tuple(chain), len(keys) < len(chain), target, status)
             # The response is released by now: a hop policy may wait on other requests.
-            match await hops.admit_hop(keys, target, key := dedupe_key(target)):
-                case Hop.FOLLOW:
-                    chain.append(target)
-                    keys.add(key)
-                case Hop.CLAIMED:
-                    return Claimed(target, tuple(chain))
-                case Hop.OUT_OF_SCOPE:  # pragma: no branch  (the cases are exhaustive)
-                    detail = f"HTTP {outcome.status} to {target}, outside the crawl's scope"
-                    return Final("redirect out of scope", detail, tuple(chain), outcome.status)
+            hop = await hops.admit_hop(keys, target, key := dedupe_key(target))
+            if hop is Hop.FOLLOW:
+                chain.append(target)
+                keys.add(key)
+            elif hop is Hop.CLAIMED:
+                return Claimed(target, tuple(chain))
+            else:
+                reason, why = _STOPPED[hop]
+                return Final(reason, f"HTTP {status} to {target}, {why}", tuple(chain), status)
 
     async def _handle(self, response: Response, chain: tuple[str, ...]) -> FetchOutcome | _Redirect:
         """The outcome of one response, the last of chain, or the redirect it makes."""
@@ -178,6 +186,119 @@ class Fetcher:
                 return NotPage(response.url, response.headers.get("Content-Type"))
             case Triage.FINAL:  # pragma: no branch  (the cases are exhaustive)
                 return Final(f"HTTP {status}", f"HTTP {status}", chain, status)
+
+
+@dataclass(frozen=True, slots=True)
+class _Answer:
+    """One response to a robots.txt request, as much of it as the file's fate needs."""
+
+    status: int
+    body: bytes = b""
+    truncated: bool = False
+    location: str | None = None  # for a redirect: where to, resolved; "" if invalid
+
+
+class RobotsFetcher:
+    """Fetches each origin's robots.txt by RFC 9309 (DESIGN.md §5.7).
+
+    It follows up to robots.MAX_REDIRECTS redirects, to other hosts too, and the file
+    found governs the origin it was asked for. A 2xx answer is the file; 429, 5xx or no
+    answer is tried robots.TRIES times, with backoff, before the file counts as unreachable;
+    anything else, more redirects included, means there is no file. Within one round of
+    fetch_all, each URL is requested once however many origins' chains lead to it, as the
+    http origin's robots.txt often redirects to the https one's.
+    """
+
+    def __init__(
+        self,
+        transport: Transport,
+        *,
+        rng: random.Random,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> None:
+        self._transport = transport
+        self._rng = rng
+        self._sleep = sleep
+        self._answers: dict[str, asyncio.Future[_Answer | TransportError]] = {}
+
+    async def fetch_all(self, origins: Sequence[str]) -> list[RobotsTxt]:
+        """The robots.txt of each origin, fetched in parallel and afresh."""
+        self._answers = {}
+        return list(await asyncio.gather(*map(self._fetch, origins)))
+
+    async def _fetch(self, origin: str) -> RobotsTxt:
+        url = f"{origin}/robots.txt"
+        for attempt in range(1, robots.TRIES + 1):
+            file = await self._follow(url)
+            if file.availability is not Availability.UNREACHABLE:
+                return file
+            if attempt < robots.TRIES:
+                # Full jitter, as for pages (DESIGN.md §5.4): 0.5 s, then 1 s at most.
+                await self._sleep(self._rng.uniform(0, 0.5 * 2 ** (attempt - 1)))
+        detail = f"{file.detail}, {robots.TRIES} tries"
+        return RobotsTxt(url, Availability.UNREACHABLE, detail, no_answer=file.no_answer)
+
+    async def _follow(self, url: str) -> RobotsTxt:
+        """The file at url, after its redirects."""
+        target = url
+        for _ in range(1 + robots.MAX_REDIRECTS):
+            answer = await self._ask(target)
+            if isinstance(answer, TransportError):
+                kind = str(answer.kind)
+                return RobotsTxt(url, Availability.UNREACHABLE, str(answer), no_answer=kind)
+            if answer.location is None:
+                if answer.status in SUCCESSFUL:
+                    return RobotsTxt.found(url, answer.body, truncated=answer.truncated)
+                return robots.without_file(url, answer.status)
+            if not answer.location.startswith(("http://", "https://")):
+                detail = f"HTTP {answer.status} to a URL that can't be fetched"
+                return RobotsTxt(url, Availability.UNAVAILABLE, detail)
+            target = answer.location
+        detail = f"more than {robots.MAX_REDIRECTS} redirects"
+        return RobotsTxt(url, Availability.UNAVAILABLE, detail)
+
+    async def _ask(self, url: str) -> _Answer | TransportError:
+        """url's answer, or what kept it from answering. An answer that could change on
+        retry, a 429, a 5xx or an error, isn't kept for the next request."""
+        if (pending := self._answers.get(url)) is not None:
+            return await pending
+        pending = self._answers[url] = asyncio.get_running_loop().create_future()
+        try:
+            answer = await self._request(url)
+        except BaseException:
+            del self._answers[url]
+            pending.cancel()  # whoever waits on it stops too
+            raise
+        if isinstance(answer, TransportError) or robots.unreachable(answer.status):
+            del self._answers[url]
+        pending.set_result(answer)
+        return answer
+
+    async def _request(self, url: str) -> _Answer | TransportError:
+        try:
+            async with self._transport.open(url) as response:
+                status = response.status
+                if status in SUCCESSFUL:
+                    body, truncated = await response.read(robots.MAX_BYTES)
+                    return _Answer(status, body, truncated)
+                await response.read(DRAIN_LIMIT)  # so its connection can be reused
+                if status in REDIRECT_STATUSES and "Location" in response.headers:
+                    try:
+                        location = ada_url.join_url(url, response.headers["Location"])
+                    except ValueError:
+                        location = ""
+                    return _Answer(status, location=strip_fragment(location))
+                return _Answer(status)
+        except TransportError as error:
+            return error
+
+
+def _too_many_redirects(chain: tuple[str, ...], looped: bool, target: str, status: int) -> Final:
+    if looped:  # some URL was requested twice
+        detail = f"redirects in a loop through {', '.join(dict.fromkeys(chain))}"
+        return Final("redirect loop", detail, chain, status)
+    detail = f"more than {MAX_REDIRECTS} redirects; the last was to {target}"
+    return Final("too many redirects", detail, chain, status)
 
 
 def _content_length(headers: Mapping[str, str]) -> int | None:

@@ -4,6 +4,7 @@ Pure: the engine records events and passes the time in.
 """
 
 from collections import Counter
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 
 
@@ -17,8 +18,16 @@ class Stats:
     failures: Counter[str] = field(default_factory=Counter)  # items that ended without a page
     internal_errors: int = 0  # unexpected exceptions while processing an item
 
-    def summary(self, unique_urls: int, now: float) -> str:
-        """A few lines for stderr. unique_urls is the number of in-scope URLs found."""
+    def summary(
+        self,
+        unique_urls: int,
+        now: float,
+        rejected: Mapping[str, int] | None = None,
+        examples: Mapping[str, Sequence[str]] | None = None,
+    ) -> str:
+        """A few lines for stderr. unique_urls is the number of in-scope URLs found;
+        rejected counts those a rule kept from being crawled, by rule, and examples has a
+        few of each."""
         elapsed = max(now - self.started, 0.0)
         rate = self.pages / elapsed if elapsed > 0 else 0.0
         lines = [
@@ -33,6 +42,16 @@ class Stats:
             skipped.insert(0, ("not HTML", self.not_html))
         if skipped:
             lines.append(f"not printed: {_counts(skipped)}")
+        if rejected:
+            examples = examples or {}
+            lines.append(
+                "not crawled: "
+                + ", ".join(
+                    f"{rule} ({count:,}"
+                    + (f", such as {e[0]})" if (e := examples.get(rule)) else ")")
+                    for rule, count in sorted(rejected.items())
+                )
+            )
         if self.internal_errors:
             lines.append(f"internal errors: {self.internal_errors:,}, logged above")
         return "\n".join(lines)

@@ -1,3 +1,6 @@
+import asyncio
+import itertools
+import random
 from collections.abc import Collection
 
 import pytest
@@ -12,10 +15,13 @@ from web_crawler.fetcher import (
     Final,
     NotPage,
     Page,
+    RobotsFetcher,
     Triage,
     triage,
 )
 from web_crawler.frontier import Admission, Frontier, Hop
+from web_crawler.robots import MAX_BYTES as MAX_ROBOTS_BYTES
+from web_crawler.robots import Availability, RobotsTxt
 from web_crawler.stats import Stats
 from web_crawler.transport import ErrorKind
 from web_crawler.types import CrawlItem, ParseJob
@@ -296,3 +302,148 @@ async def test_a_body_cut_off_is_final() -> None:
     outcome, _, _ = await fetch({START: Reply(headers=HTML, read_error=ErrorKind.PAYLOAD)})
     assert isinstance(outcome, Final)
     assert outcome.reason == "payload"
+
+
+class Sleeps:
+    """Records each backoff instead of waiting."""
+
+    def __init__(self) -> None:
+        self.delays: list[float] = []
+
+    async def __call__(self, delay: float) -> None:
+        self.delays.append(delay)
+
+
+class Highest(random.Random):
+    """Jitter at the top of its range, so that backoffs are predictable."""
+
+    def uniform(self, a: float, b: float) -> float:
+        return b
+
+
+ROBOTS = "https://example.com/robots.txt"
+PLAIN_ROBOTS = "http://example.com/robots.txt"
+TEXT = {"Content-Type": "text/plain"}
+
+
+async def robots_txt(
+    replies: Replies, origins: tuple[str, ...] = ("https://example.com",)
+) -> tuple[list[RobotsTxt], FakeTransport, Sleeps]:
+    transport, sleeps = FakeTransport(replies), Sleeps()
+    files = await RobotsFetcher(transport, rng=Highest(), sleep=sleeps).fetch_all(origins)
+    return files, transport, sleeps
+
+
+async def test_robots_found() -> None:
+    body = b"User-agent: *\nDisallow: /private\n"
+    [file], transport, sleeps = await robots_txt({ROBOTS: Reply(headers=TEXT, body=body)})
+    assert (file.url, file.availability, file.detail) == (ROBOTS, Availability.FOUND, "33 bytes")
+    assert not file.allowed("https://example.com/private", "web-crawler")
+    assert transport.requested == [ROBOTS]
+    assert not sleeps.delays
+
+
+@pytest.mark.parametrize("status", [404, 410, 401, 403, 400])
+async def test_robots_unavailable_allows_everything(status: int) -> None:
+    [file], transport, _ = await robots_txt({ROBOTS: Reply(status, TEXT, b"Forbidden")})
+    assert file == RobotsTxt(ROBOTS, Availability.UNAVAILABLE, f"HTTP {status}")
+    assert transport.requested == [ROBOTS]
+    assert transport.responses[0].position == len(b"Forbidden")  # drained
+
+
+@pytest.mark.parametrize(
+    ("answer", "detail", "no_answer"),
+    [
+        (Reply(503, TEXT), "HTTP 503", None),
+        (Reply(429, TEXT), "HTTP 429", None),
+        (ErrorKind.CONNECT, "connect: scripted", "connect"),  # the host never answered
+    ],
+)
+async def test_robots_unreachable_is_tried_three_times(
+    answer: Answer, detail: str, no_answer: str | None
+) -> None:
+    [file], _, sleeps = await robots_txt({ROBOTS: answer})
+    assert file == RobotsTxt(
+        ROBOTS, Availability.UNREACHABLE, f"{detail}, 3 tries", no_answer=no_answer
+    )
+    assert sleeps.delays == [0.5, 1.0]  # full jitter, at its highest
+
+
+async def test_robots_found_on_a_retry() -> None:
+    replies: Replies = {ROBOTS: [Reply(503, TEXT), ErrorKind.RESET, Reply(headers=TEXT)]}
+    [file], transport, sleeps = await robots_txt(replies)
+    assert file.availability is Availability.FOUND
+    assert transport.requested == [ROBOTS, ROBOTS]  # the reset gave no response
+    assert sleeps.delays == [0.5, 1.0]
+
+
+def redirects(count: int, start: str = ROBOTS) -> Replies:
+    """A chain of count redirects from start, through other hosts, to the file."""
+    hops = [start] + [f"https://cdn{n}.example.net/robots.txt" for n in range(count)]
+    replies: Replies = {a: Reply(301, {"Location": b}) for a, b in itertools.pairwise(hops)}
+    replies[hops[-1]] = Reply(headers=TEXT, body=b"User-agent: *\nDisallow: /\n")
+    return replies
+
+
+async def test_robots_follows_five_redirects_across_hosts() -> None:
+    [file], transport, _ = await robots_txt(redirects(5))
+    assert file.availability is Availability.FOUND
+    assert file.url == ROBOTS  # its rules govern the origin it was asked for
+    assert not file.allowed("https://example.com/", "web-crawler")
+    assert len(transport.requested) == 6
+
+
+async def test_robots_after_more_than_five_redirects_is_unavailable() -> None:
+    [file], transport, _ = await robots_txt(redirects(6))
+    assert file == RobotsTxt(ROBOTS, Availability.UNAVAILABLE, "more than 5 redirects")
+    assert len(transport.requested) == 6
+
+
+@pytest.mark.parametrize("location", ["http://exa mple.com/", "ftp://example.com/robots.txt"])
+async def test_robots_redirect_to_a_url_that_cant_be_fetched(location: str) -> None:
+    [file], _, _ = await robots_txt({ROBOTS: Reply(302, {"Location": location})})
+    assert file == RobotsTxt(
+        ROBOTS, Availability.UNAVAILABLE, "HTTP 302 to a URL that can't be fetched"
+    )
+
+
+async def test_robots_reads_at_most_500_kib() -> None:
+    rule = b"Disallow: /x\n"
+    body = b"User-agent: *\n" + rule * (MAX_ROBOTS_BYTES // len(rule) + 10)
+    [file], transport, _ = await robots_txt({ROBOTS: Reply(headers=TEXT, body=body)})
+    assert file.detail.endswith(", truncated")
+    assert transport.responses[0].position == MAX_ROBOTS_BYTES
+
+
+async def test_robots_requests_each_url_once_per_round() -> None:
+    # The http origin's robots.txt redirects to the https one's, as most sites' do.
+    replies: Replies = {
+        PLAIN_ROBOTS: Reply(301, {"Location": ROBOTS}, delay=0.001),
+        ROBOTS: Reply(headers=TEXT, body=b"User-agent: *\nDisallow: /x\n", delay=0.01),
+    }
+    origins = ("https://example.com", "http://example.com")
+    transport, sleeps = FakeTransport(replies), Sleeps()
+    fetcher = RobotsFetcher(transport, rng=Highest(), sleep=sleeps)
+    https, http = await fetcher.fetch_all(origins)
+    assert transport.requested == [PLAIN_ROBOTS, ROBOTS]
+    assert (https.url, http.url) == (ROBOTS, PLAIN_ROBOTS)
+    assert not http.allowed("http://example.com/x", "web-crawler")
+    await fetcher.fetch_all(origins)  # a later round asks again
+    assert sorted(transport.requested) == sorted([PLAIN_ROBOTS, ROBOTS] * 2)
+
+
+async def test_cancelling_a_robots_round_leaves_nothing_behind() -> None:
+    replies: Replies = {
+        PLAIN_ROBOTS: Reply(301, {"Location": ROBOTS}),
+        ROBOTS: [Reply(headers=TEXT, delay=60), Reply(headers=TEXT)],
+    }
+    transport = FakeTransport(replies)
+    fetcher = RobotsFetcher(transport, rng=Highest(), sleep=Sleeps())
+    task = asyncio.create_task(fetcher.fetch_all(("https://example.com", "http://example.com")))
+    for _ in range(20):  # until both wait for the https file
+        await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    files = await fetcher.fetch_all(("https://example.com",))
+    assert files[0].availability is Availability.FOUND

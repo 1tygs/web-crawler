@@ -7,7 +7,7 @@ import sys
 from collections.abc import Callable, Sequence
 
 from web_crawler import __version__
-from web_crawler.config import Config, ConfigError
+from web_crawler.config import USER_AGENT, Config, ConfigError
 from web_crawler.engine import crawl
 from web_crawler.output import ThreadedSink
 from web_crawler.types import ExitCode
@@ -40,6 +40,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="print every URL on each page, from images, scripts, forms and the like too, in "
         "every scheme; only links are crawled",
     )
+    parser.add_argument(
+        "--ignore-robots",
+        action="store_true",
+        help="don't fetch or obey robots.txt: for crawling your own site",
+    )
+    parser.add_argument(
+        "--user-agent",
+        metavar="UA",
+        default=USER_AGENT,
+        help="the User-Agent header; its product token, the leading letters, hyphens and "
+        "underscores, also selects the robots.txt group to obey (default: %(default)s)",
+    )
     parser.add_argument("--version", action="version", version=f"web-crawler {__version__}")
     return parser
 
@@ -49,7 +61,12 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        return Config(start_url=args.url, all_urls=args.all_urls)
+        return Config(
+            start_url=args.url,
+            user_agent=args.user_agent,
+            all_urls=args.all_urls,
+            ignore_robots=args.ignore_robots,
+        )
     except ConfigError as error:
         parser.error(str(error))
 

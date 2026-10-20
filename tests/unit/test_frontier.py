@@ -3,6 +3,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from web_crawler.frontier import Admission, Frontier, Hop
+from web_crawler.robots import RobotsPolicy, RobotsTxt
 from web_crawler.types import CrawlItem
 from web_crawler.urls import Scope
 
@@ -109,3 +110,33 @@ def test_a_claimed_hop_isnt_admitted_again_as_a_link() -> None:
     )
     assert admission.admit([("https://example.com/r", "https://example.com/r")], depth=1) == 0
     assert frontier.pop() is None
+
+
+def disallowing(path: str) -> RobotsPolicy:
+    rules = f"User-agent: *\nDisallow: {path}\n".encode()
+    file = RobotsTxt.found("https://example.com/robots.txt", rules, truncated=False)
+    return RobotsPolicy("web-crawler", {"https://example.com": file})
+
+
+def test_admit_claims_and_counts_what_robots_txt_disallows() -> None:
+    frontier = Frontier()
+    admission = Admission(frontier, SCOPE, disallowing("/private"))
+    private = [f"https://example.com/private/{n}" for n in range(5)]
+    links = [(url, url) for url in [*private, "https://example.com/ok"]]
+    assert admission.admit(links, depth=1) == 1
+    assert admission.rejected == {"robots.txt": 5}
+    assert admission.examples == {"robots.txt": private[:3]}
+    # Found again, they're neither checked nor counted again.
+    assert admission.admit(links, depth=2) == 0
+    assert admission.rejected == {"robots.txt": 5}
+    assert pop_all(frontier) == [CrawlItem("https://example.com/ok", "https://example.com/ok", 1)]
+
+
+def test_admit_hop_to_a_url_robots_txt_disallows() -> None:
+    frontier = Frontier()
+    admission = Admission(frontier, SCOPE, disallowing("/private"))
+    url = "https://example.com/private/x"
+    assert admission.admit_hop(set(), url, url) is Hop.DISALLOWED
+    assert url in admission.seen
+    assert admission.rejected == {"robots.txt": 1}
+    assert admission.admit_hop(set(), url, url) is Hop.CLAIMED  # checked once

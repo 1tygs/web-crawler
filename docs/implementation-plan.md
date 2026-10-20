@@ -45,6 +45,7 @@ Checked on 2026-10-20 against the versions pinned in Appendix A (Python 3.14.6, 
 | Python's codec names aren't WHATWG labels: `latin1` and `ascii` mean iso8859-1 and ascii to Python but windows-1252 to a browser; `x-mac-cyrillic`, `koi8-ru` and `unicode11utf8` don't exist in Python | A WHATWG label table (`encodings.py`) maps labels to Python codecs |
 | Found in PR 2: Python's single-byte codecs decode 89 bytes unlike the standard's indexes: windows-874 and windows-1250 to 1258 leave bytes in 0x80–0x9F undefined that WHATWG maps to C1 controls, and KOI8-U and windows-1255 differ on three. Its multi-byte codecs differ on a few hundred rare characters (DESIGN A.14) | Single-byte encodings decode through tables built from Python's codecs with those bytes filled in, tested byte for byte against the standard's indexes. Multi-byte encodings use Python's codecs |
 | Found in PR 2: lexbor reads a UTF-8 byte order mark in `bytes` as text, which ends `<head>` there and makes it ignore a `<frameset>` after it | `parse.py` drops the mark before parsing |
+| Found in PR 2: Protego doesn't skip a UTF-8 byte order mark, so a robots.txt that starts with one loses its first line, often `User-agent: *` and with it the group's rules | robots.txt is decoded as `utf-8-sig` |
 | Found in PR 2: selectolax parses the selector string on every `css()` call, about 1.65 µs for the navigational list; `template_fragments()` walks the whole tree (31 µs on a 1.4 MB page with none); `node.attributes` copies every attribute, where `node.attrs.get` reads one, about twice as fast on attribute-heavy pages | One selector pass per tree, `template_fragments()` only for a page with a declarative shadow root, and `node.attrs` |
 | Found in PR 2: html5lib's encoding tests expect a `<meta>` after the first 1,024 bytes to count, as the HTML standard's "change the encoding" makes it when the parser reaches it | A charset from the prescan or the guess is tentative: `parse.py` checks the parsed page's first declaring `<meta>` and decodes again if it names another encoding. It costs about 1 µs a page (`css_first`) |
 | Python 3.14 has `ProcessPoolExecutor.kill_workers()`, `os.process_cpu_count()` and `asyncio.run(loop_factory=)`. `PYTHON_CPU_COUNT` and `-X cpu_count` override `process_cpu_count()`; isolated mode (`-I`) ignores the variable | The second Ctrl-C calls `kill_workers()`. uvloop comes in through `loop_factory`. The cgroup cap applies only when no override is set (§5.12) |
@@ -76,7 +77,7 @@ web-crawler/
 │   ├── frontier.py           # Admission + Frontier: seen set, depth queues and window, retry heap, accounting
 │   ├── limiter.py            # ADR-001 law, pause and rate gate, circuit breaker, 403 guard
 │   ├── retry.py              # DESIGN §5.4 classification and backoff, as pure functions
-│   ├── robots.py             # RobotsPolicy (pure) + RFC 9309 fetching (async)
+│   ├── robots.py             # RobotsPolicy and RFC 9309's status classes (pure); fetcher.py fetches the files
 │   ├── stats.py              # counters, TTFB histogram, progress line, summary
 │   ├── transport.py          # Transport/Response protocols + the aiohttp implementation
 │   ├── fetcher.py            # redirects, triage, size caps
@@ -315,14 +316,14 @@ Golden fixtures (`tests/fixtures/parse/*.html` with expected JSON) cover:
 
 ### 5.9 `robots.py`
 
-- **`RobotsPolicy`** (pure) holds one Protego object per origin prefix. It provides `allowed(url)` and `crawl_delay`, plus `ALLOW_ALL` and `DISALLOW_ALL` for the status classes. Groups match on the User-Agent's product token.
-- **`fetch_robots(transport, origin)`** (async) follows at least 5 redirects, across hosts if needed (RFC 9309).
-  - 2xx: the first 500 KiB after decoding (a capped `decode_body`), read as UTF-8 with replacement.
+- **`RobotsPolicy`** (pure) holds one `RobotsTxt` per origin: found (a Protego object), unavailable (allow everything) or unreachable (disallow everything), with the detail for messages. It provides `allowed(url)`, `file_for(url)` and `crawl_delay`. Groups match on the User-Agent's product token. `robots.py` also classifies statuses, so it stays pure; the architecture test would reject it importing the transport.
+- **`fetcher.RobotsFetcher.fetch_all(origins)`** (async) fetches the origins' files in parallel, following at least 5 redirects, across hosts if needed (RFC 9309). Within a round, each URL is requested once, however many origins' chains reach it.
+  - 2xx: the first 500 KiB after decoding (a capped `decode_body` from PR 3), read as UTF-8 with replacement, without a BOM or a line cut off at the limit.
   - 4xx other than 429: allow everything.
-  - 429, 5xx or network errors: 3 tries with backoff, then disallow everything.
+  - 429, 5xx or network errors: 3 tries with backoff, then disallow everything. A file whose host never answered records the transport error's kind (`no_answer`).
   - More than 5 redirects: unavailable, so allow everything.
 
-  If the start origin ends up disallowing everything, the crawl exits 3 with a hint about `--ignore-robots`. Every origin is refetched in the background every 24 hours; if a refetch fails, the cached policy stays.
+  If the start origin ends up disallowing everything, the crawl exits 3 with a hint about `--ignore-robots`, or, when its host never answered, saying so. Every origin is refetched in the background every 24 hours (`Config.robots_refresh`); if a refetch fails, the cached policy stays. Admission rejects what the policy disallows, links and redirect targets alike, and counts it.
 
 ### 5.10 `transport.py`
 

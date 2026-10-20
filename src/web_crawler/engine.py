@@ -7,15 +7,27 @@ fetches in flight and parses each page inline on the event loop.
 
 import asyncio
 import logging
+import random
 import time
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from web_crawler.config import Config
-from web_crawler.fetcher import AdmissionHops, Claimed, Fetcher, Final, HopPolicy, NotPage, Page
+from web_crawler.fetcher import (
+    AdmissionHops,
+    Claimed,
+    Fetcher,
+    Final,
+    HopPolicy,
+    NotPage,
+    Page,
+    RobotsFetcher,
+)
 from web_crawler.frontier import Admission, Frontier
 from web_crawler.output import Sink
 from web_crawler.parse import parse_page
+from web_crawler.robots import Availability, RobotsPolicy, product_token
 from web_crawler.stats import Stats
 from web_crawler.transport import AiohttpTransport, Transport
 from web_crawler.types import CrawlItem, ExitCode, WorkerContext
@@ -34,10 +46,12 @@ class CrawlReport:
     stats: Stats
     unique_urls: int  # in-scope URLs found, including the start URL
     finished: float  # the clock's reading at the end
+    rejected: Counter[str] = field(default_factory=Counter)  # URLs not crawled, by rule
+    examples: dict[str, list[str]] = field(default_factory=dict)  # a few for each rule
 
     @property
     def summary(self) -> str:
-        return self.stats.summary(self.unique_urls, self.finished)
+        return self.stats.summary(self.unique_urls, self.finished, self.rejected, self.examples)
 
 
 async def crawl(
@@ -46,9 +60,10 @@ async def crawl(
     *,
     transport: Transport | None = None,
     clock: Callable[[], float] = time.monotonic,
+    rng: random.Random | None = None,
 ) -> CrawlReport:
     """Crawl the start URL's host, writing a record per page to sink. A transport passed
-    in stays open; sink is always closed."""
+    in stays open; sink is always closed. rng draws the jitter of retries' backoff."""
     start_url, _scheme_was_implicit = normalize_start(cfg.start_url)
     scope = Scope.for_url(start_url)
     stats = Stats(started=clock())
@@ -57,8 +72,12 @@ async def crawl(
     owned = transport is None
     if transport is None:
         transport = AiohttpTransport(cfg)
+    robots = None if cfg.ignore_robots else RobotsFetcher(transport, rng=rng or random.Random())
     dispatcher = _Dispatcher(
         fetcher=Fetcher(transport, cfg.max_page_bytes, stats),
+        robots=robots,
+        product=product_token(cfg.user_agent),
+        robots_refresh=cfg.robots_refresh,
         hops=AdmissionHops(admission),
         frontier=frontier,
         admission=admission,
@@ -77,7 +96,9 @@ async def crawl(
                 await transport.close()
         finally:
             sink.close()
-    return CrawlReport(exit_code, stats, len(admission.seen), clock())
+    return CrawlReport(
+        exit_code, stats, len(admission.seen), clock(), admission.rejected, admission.examples
+    )
 
 
 @dataclass(slots=True, kw_only=True)
@@ -85,6 +106,9 @@ class _Dispatcher:
     """Starts a fetch whenever one finishes, until nothing is outstanding."""
 
     fetcher: Fetcher
+    robots: RobotsFetcher | None  # None under --ignore-robots
+    product: str  # the User-Agent's product token, which robots.txt groups name
+    robots_refresh: float  # seconds between fetches of robots.txt
     hops: HopPolicy
     frontier: Frontier
     admission: Admission
@@ -96,12 +120,17 @@ class _Dispatcher:
     _tasks: set[asyncio.Task[None]] = field(default_factory=set, init=False)
     _stopping: bool = field(default=False, init=False)
     _done: asyncio.Future[None] = field(init=False)
+    _refresh: asyncio.TimerHandle | None = field(default=None, init=False)
+    _refreshing: asyncio.Task[None] | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         self._done = asyncio.get_running_loop().create_future()
 
     async def run(self, start_url: str) -> ExitCode:
         """Crawl from start_url until nothing is outstanding."""
+        if self.robots is not None and (problem := await self._read_robots(start_url)):
+            log.error("can't start: %s", problem)
+            return ExitCode.CANNOT_START
         self.admission.admit([(dedupe_key(start_url), start_url)], depth=0)
         start = self.frontier.pop()
         assert start is not None
@@ -138,10 +167,66 @@ class _Dispatcher:
     async def stop(self) -> None:
         """Cancel the fetches still running, and wait for them to end."""
         self._stopping = True
+        if self._refresh is not None:
+            self._refresh.cancel()
         tasks = list(self._tasks)
+        if self._refreshing is not None:
+            tasks.append(self._refreshing)
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _read_robots(self, start_url: str) -> str | None:
+        """Fetch the robots.txt of every origin in scope, in parallel, before any page
+        (DESIGN.md §5.7). Returns why the crawl can't start, if it can't."""
+        assert self.robots is not None
+        origins = self.admission.scope.origins
+        files = await self.robots.fetch_all(origins)
+        by_origin = dict(zip(origins, files, strict=True))
+        policy = self.admission.robots = RobotsPolicy(self.product, by_origin)
+        start = policy.file_for(start_url)
+        assert start is not None
+        hint = "if the site is yours, --ignore-robots skips robots.txt"
+        if start.no_answer is not None:  # the host itself is unreachable
+            return f"{start.url} got no answer ({start.detail})"
+        if start.availability is Availability.UNREACHABLE:
+            return f"{start.url} is unreachable ({start.detail}), so nothing may be crawled; {hint}"
+        if not start.allowed(start_url, self.product):
+            return f"{start.url} disallows {start_url} for {self.product or 'any crawler'}; {hint}"
+        for file in files:
+            if file.availability is Availability.UNREACHABLE:
+                log.warning(
+                    "%s is unreachable (%s): its URLs aren't crawled", file.url, file.detail
+                )
+        self._refresh = asyncio.get_running_loop().call_later(
+            self.robots_refresh, self._start_refresh
+        )
+        return None
+
+    def _start_refresh(self) -> None:
+        self._refresh = None
+        self._refreshing = asyncio.create_task(self._refresh_robots())
+
+    async def _refresh_robots(self) -> None:
+        """Fetch every origin's robots.txt again, as RFC 9309 asks of a crawl that runs
+        longer than a day. A file that's unreachable now keeps its old rules."""
+        assert self.robots is not None
+        try:
+            current = self.admission.robots.files
+            files = dict(current)
+            fetched = await self.robots.fetch_all(list(current))
+            for origin, file in zip(current, fetched, strict=True):
+                if file.availability is Availability.UNREACHABLE:
+                    log.warning("%s is unreachable (%s): keeping its rules", file.url, file.detail)
+                else:
+                    files[origin] = file
+            self.admission.robots = RobotsPolicy(self.product, files)
+        except Exception:
+            self.stats.internal_errors += 1
+            log.exception("internal error while refetching robots.txt")
+        self._refresh = asyncio.get_running_loop().call_later(
+            self.robots_refresh, self._start_refresh
+        )
 
     async def _process(self, item: CrawlItem) -> None:
         try:

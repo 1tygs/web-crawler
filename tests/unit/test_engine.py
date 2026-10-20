@@ -1,11 +1,13 @@
 import asyncio
 import itertools
 import logging
-from collections.abc import Callable
+import random
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 
 import pytest
 
-from tests.support.fake_transport import FakeTransport, Reply
+from tests.support.fake_transport import Answer, FakeResponse, FakeTransport, Reply
 from web_crawler.config import Config
 from web_crawler.engine import INITIAL_CONCURRENCY, crawl
 from web_crawler.output import MemorySink
@@ -14,6 +16,23 @@ from web_crawler.types import ExitCode
 
 START = "https://example.com/"
 HTML = {"Content-Type": "text/html"}
+TEXT = {"Content-Type": "text/plain"}
+ROBOTS = "https://example.com/robots.txt"
+PLAIN_ROBOTS = "http://example.com/robots.txt"
+
+
+def pages(transport: FakeTransport) -> list[str]:
+    """What the crawl requested, robots.txt aside."""
+    return [url for url in transport.requested if not url.endswith("/robots.txt")]
+
+
+def robots(rules: str) -> Reply:
+    return Reply(headers=TEXT, body=rules.encode())
+
+
+class NoJitter(random.Random):
+    def uniform(self, a: float, b: float) -> float:
+        return a
 
 
 def html(*hrefs: str, delay: float = 0.0) -> Reply:
@@ -49,7 +68,7 @@ async def test_prints_each_reachable_page_once() -> None:
             b"https://example.com/c\n  https://example.com/\n\n",
         ]
     )
-    assert sorted(transport.requested) == sorted(replies)
+    assert sorted(pages(transport)) == sorted(replies)
     assert sink.closed
     assert not transport.closed  # a transport passed in belongs to the caller
     assert (report.stats.pages, report.stats.links_found, report.unique_urls) == (4, 8, 4)
@@ -132,7 +151,7 @@ async def test_all_urls_prints_every_url_but_crawls_only_links() -> None:
         b"  https://example.com/search\n\n",
         b"https://example.com/page\n\n",
     ]
-    assert transport.requested == [START, "https://example.com/page"]
+    assert pages(transport) == [START, "https://example.com/page"]
     assert report.stats.links_found == 3
 
 
@@ -147,7 +166,7 @@ async def test_a_page_reached_by_redirect_is_fetched_and_printed_once() -> None:
     }
     transport, sink = FakeTransport(replies), MemorySink()
     report = await crawl(Config(start_url=START), sink, transport=transport)
-    assert sorted(transport.requested) == sorted(replies)  # each once
+    assert sorted(pages(transport)) == sorted(replies)  # each once
     assert sorted(sink.records) == sorted(
         [
             b"https://example.com/\n  https://example.com/a\n  https://example.com/b\n"
@@ -207,16 +226,16 @@ async def test_a_backlogged_sink_pauses_dispatch_until_it_drains() -> None:
     task = asyncio.create_task(crawl(Config(start_url=START), sink, transport=transport))
     await settle()
     # Fetches already in flight finish and print, but no new one starts.
-    paused_at = len(transport.requested)
+    paused_at = len(pages(transport))
     assert len(sink.records) >= sink.limit
     assert paused_at < 21
     await settle()
-    assert len(transport.requested) == paused_at
+    assert len(pages(transport)) == paused_at
     assert not task.done()
     sink.open()
     report = await task
     assert report.stats.pages == 21
-    assert len(transport.requested) == 21
+    assert len(pages(transport)) == 21
 
 
 async def test_cancelling_a_crawl_stops_its_fetches_and_closes_the_sink() -> None:
@@ -242,3 +261,185 @@ async def test_reports_the_clock() -> None:
         clock=lambda: next(ticks),
     )
     assert report.summary.startswith("1 page in 2.5 s (0.4 pages/s), 0 links found")
+
+
+async def test_reads_robots_txt_for_both_origins_before_the_start_page() -> None:
+    transport = FakeTransport({START: html()})
+    report = await crawl(Config(start_url=START), MemorySink(), transport=transport)
+    assert report.exit_code is ExitCode.OK
+    assert sorted(transport.requested[:2]) == [PLAIN_ROBOTS, ROBOTS]  # 404s: no rules
+    assert transport.requested[2:] == [START]
+
+
+async def test_does_not_crawl_what_robots_txt_disallows() -> None:
+    replies: dict[str, Answer | list[Answer]] = {
+        ROBOTS: robots("User-agent: *\nDisallow: /private\n"),
+        START: html("/private/a", "/private/b", "/public", "/redirect"),
+        "https://example.com/public": html(),
+        "https://example.com/redirect": Reply(302, {"Location": "/private/c"}),
+    }
+    transport, sink = FakeTransport(replies), MemorySink()
+    report = await crawl(Config(start_url=START), sink, transport=transport)
+    assert report.exit_code is ExitCode.OK
+    assert sorted(pages(transport)) == [
+        START,
+        "https://example.com/public",
+        "https://example.com/redirect",
+    ]
+    # The links are still printed.
+    assert sink.records[0].count(b"/private/") == 2
+    assert report.rejected == {"robots.txt": 3}
+    assert report.examples == {
+        "robots.txt": [
+            "https://example.com/private/a",
+            "https://example.com/private/b",
+            "https://example.com/private/c",
+        ]
+    }
+    assert report.stats.failures == {"redirect disallowed": 1}
+    assert "not crawled: robots.txt (3, such as https://example.com/private/a)" in report.summary
+
+
+async def test_robots_txt_for_another_origin_applies_to_it_alone() -> None:
+    replies: dict[str, Answer | list[Answer]] = {
+        PLAIN_ROBOTS: robots("User-agent: *\nDisallow: /\n"),
+        START: html("http://example.com/plain", "/secure"),
+        "https://example.com/secure": html(),
+    }
+    transport = FakeTransport(replies)
+    report = await crawl(Config(start_url=START), MemorySink(), transport=transport)
+    assert sorted(pages(transport)) == [START, "https://example.com/secure"]
+    assert report.rejected == {"robots.txt": 1}
+
+
+async def test_an_unreachable_robots_txt_on_the_other_origin_disallows_it(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    replies: dict[str, Answer | list[Answer]] = {
+        PLAIN_ROBOTS: ErrorKind.CONNECT,
+        START: html("http://example.com/plain", "/secure"),
+        "https://example.com/secure": html(),
+    }
+    transport = FakeTransport(replies)
+    report = await crawl(Config(start_url=START), MemorySink(), transport=transport, rng=NoJitter())
+    assert report.exit_code is ExitCode.OK
+    assert sorted(pages(transport)) == [START, "https://example.com/secure"]
+    assert report.rejected == {"robots.txt": 1}
+    assert (
+        "http://example.com/robots.txt is unreachable (connect: scripted, 3 tries): "
+        "its URLs aren't crawled" in caplog.text
+    )
+
+
+@pytest.mark.parametrize(
+    ("robots_txt", "message"),
+    [
+        (
+            robots("User-agent: *\nDisallow: /\n"),
+            "can't start: https://example.com/robots.txt disallows https://example.com/ for "
+            "web-crawler; if the site is yours, --ignore-robots skips robots.txt",
+        ),
+        (
+            Reply(503, TEXT),
+            "can't start: https://example.com/robots.txt is unreachable (HTTP 503, 3 tries), "
+            "so nothing may be crawled; if the site is yours, --ignore-robots skips robots.txt",
+        ),
+        # No answer at all: the host is down, which --ignore-robots wouldn't help.
+        (
+            ErrorKind.CONNECT,
+            "can't start: https://example.com/robots.txt got no answer "
+            "(connect: scripted, 3 tries)",
+        ),
+    ],
+)
+async def test_a_start_url_robots_txt_keeps_from_crawling_cant_start(
+    robots_txt: Answer, message: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    transport = FakeTransport({ROBOTS: robots_txt, START: html()})
+    sink = MemorySink()
+    report = await crawl(Config(start_url=START), sink, transport=transport, rng=NoJitter())
+    assert report.exit_code is ExitCode.CANNOT_START
+    assert message in caplog.text
+    assert pages(transport) == []
+    assert sink.records == []
+
+
+async def test_a_custom_user_agent_selects_its_own_group() -> None:
+    replies: dict[str, Answer | list[Answer]] = {
+        ROBOTS: robots("User-agent: MyBot\nDisallow: /a\n\nUser-agent: *\nDisallow: /b\n"),
+        START: html("/a", "/b"),
+    }
+    transport = FakeTransport(replies)
+    cfg = Config(start_url=START, user_agent="MyBot/2.0")
+    await crawl(cfg, MemorySink(), transport=transport)
+    assert pages(transport) == [START, "https://example.com/b"]
+
+
+async def test_ignore_robots_fetches_no_robots_txt() -> None:
+    replies: dict[str, Answer | list[Answer]] = {
+        ROBOTS: robots("User-agent: *\nDisallow: /\n"),
+        START: html("/page"),
+        "https://example.com/page": html(),
+    }
+    transport = FakeTransport(replies)
+    report = await crawl(
+        Config(start_url=START, ignore_robots=True), MemorySink(), transport=transport
+    )
+    assert transport.requested == [START, "https://example.com/page"]
+    assert report.stats.pages == 2
+
+
+def slow_chain(length: int, delay: float) -> dict[str, Answer | list[Answer]]:
+    """START, then pages /1 to /length, each linking to the next and slow to answer."""
+    replies: dict[str, Answer | list[Answer]] = {START: html("/1")}
+    for n in range(1, length + 1):
+        replies[f"https://example.com/{n}"] = html(f"/{n + 1}", delay=delay)
+    return replies
+
+
+async def test_refetches_robots_txt_while_a_crawl_runs() -> None:
+    # robots.txt is refetched after 0.05 s, and disallows /4 now; /4 is found after 0.18 s.
+    replies = slow_chain(5, delay=0.06)
+    replies[ROBOTS] = [robots(""), robots("User-agent: *\nDisallow: /4\n")]
+    transport = FakeTransport(replies)
+    cfg = Config(start_url=START, robots_refresh=0.05)
+    report = await crawl(cfg, MemorySink(), transport=transport)
+    assert transport.requested.count(ROBOTS) >= 2
+    assert pages(transport) == [START, *(f"https://example.com/{n}" for n in (1, 2, 3))]
+    assert report.rejected == {"robots.txt": 1}
+
+
+async def test_a_refetch_that_fails_keeps_the_rules(caplog: pytest.LogCaptureFixture) -> None:
+    replies = slow_chain(5, delay=0.06)
+    replies[ROBOTS] = [robots("User-agent: *\nDisallow: /4\n"), Reply(503, TEXT)]
+    transport = FakeTransport(replies)
+    cfg = Config(start_url=START, robots_refresh=0.05)
+    report = await crawl(cfg, MemorySink(), transport=transport, rng=NoJitter())
+    assert report.rejected == {"robots.txt": 1}
+    assert (
+        "https://example.com/robots.txt is unreachable (HTTP 503, 3 tries): keeping its rules"
+        in caplog.text
+    )
+
+
+class Broken(FakeTransport):
+    """Fails with a bug, rather than a transport error, from the second robots.txt round."""
+
+    @asynccontextmanager
+    async def open(self, url: str) -> AsyncIterator[FakeResponse]:
+        if url.endswith("/robots.txt") and self.requested.count(url) >= 1:
+            raise RuntimeError("a bug")
+        async with super().open(url) as response:
+            yield response
+
+
+async def test_a_bug_in_a_refetch_is_counted_and_the_crawl_continues(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    transport = Broken(slow_chain(4, delay=0.06))
+    cfg = Config(start_url=START, robots_refresh=0.05)
+    report = await crawl(cfg, MemorySink(), transport=transport)
+    assert report.exit_code is ExitCode.INTERNAL_ERROR
+    assert report.stats.internal_errors >= 1
+    assert report.stats.pages == 5
+    assert "internal error while refetching robots.txt" in caplog.text

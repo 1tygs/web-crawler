@@ -56,6 +56,11 @@ def hand_built(port: int, other_port: int) -> dict[str, Resource]:
             "/a#section",
             "/~user/",
             "/%7Euser/",  # the same resource: printed as written, requested once
+            "/private/page",  # disallowed by robots.txt: printed, never requested
+        ),
+        "/robots.txt": Resource(
+            body=b"User-agent: *\nDisallow: /private/\n",
+            headers=(("Content-Type", "text/plain"),),
         ),
         "/a": page("/", "/a/deeper/", "../c?x=%2f"),
         "/b": page("/a"),
@@ -89,6 +94,7 @@ def hand_built_records(port: int, other_port: int) -> list[bytes]:
             f"{o}/",
             f"{o}/~user/",
             f"{o}/%7Euser/",
+            f"{o}/private/page",
         ],
         f"{o}/a": [f"{o}/", f"{o}/a/deeper/", f"{o}/c?x=%2f"],
         f"{o}/b": [f"{o}/a"],
@@ -115,6 +121,7 @@ async def test_a_hand_built_site() -> None:
     # Each in-scope URL was requested once, exactly as printed, and nothing else was.
     assert sorted(site.targets()) == sorted(
         [
+            "/robots.txt",
             "/",
             "/a",
             "/b",
@@ -135,7 +142,8 @@ async def test_a_hand_built_site() -> None:
     # Whichever of /old and /also-old answered second found /new already claimed.
     assert stats.failures == {"HTTP 404": 1, "redirect to a URL already claimed": 1}
     assert stats.statuses == {200: 9, 301: 1, 302: 1, 404: 1}
-    assert report.unique_urls == 12  # /new, reached only by redirect, among them
+    assert report.unique_urls == 13  # /new, reached only by redirect, among them
+    assert report.rejected == {"robots.txt": 1}
 
 
 @pytest.mark.parametrize("seed", range(4))
@@ -204,7 +212,7 @@ async def test_follows_a_cookie_gate_back_to_the_page() -> None:
         f"{o}/\n  {o}/members\n\n".encode(),
         f"{o}/members\n  {o}/\n\n".encode(),
     ]
-    assert site.targets() == ["/", "/members", "/gate?next=/members", "/members"]
+    assert site.targets() == ["/robots.txt", "/", "/members", "/gate?next=/members", "/members"]
     assert not report.stats.failures
 
 
@@ -213,7 +221,7 @@ async def test_a_redirect_loop_ends_at_the_hop_limit() -> None:
     async with Site(resources) as site:
         report = await crawl(Config(start_url=site.url()), MemorySink())
     assert report.stats.failures == {"redirect loop": 1}
-    assert site.targets() == ["/", *(["/loop", "/loop/"] * 6)[:11]]
+    assert site.targets() == ["/robots.txt", "/", *(["/loop", "/loop/"] * 6)[:11]]
 
 
 START_FAILURES = {
@@ -247,7 +255,37 @@ async def test_an_unreachable_start_url_exits_3() -> None:
     code, stdout, stderr = await run(CRAWL, f"http://127.0.0.1:{port}/")
     assert code == ExitCode.CANNOT_START
     assert stdout == b""
-    assert stderr.startswith(f"crawl: can't start: http://127.0.0.1:{port}/: connect: ")
+    assert stderr.startswith(
+        f"crawl: can't start: http://127.0.0.1:{port}/robots.txt got no answer (connect: "
+    )
+    assert stderr.endswith(", 3 tries)\n")
+    assert "--ignore-robots" not in stderr
+
+
+DISALLOW_ALL = Resource(
+    body=b"User-agent: *\nDisallow: /\n", headers=(("Content-Type", "text/plain"),)
+)
+
+
+async def test_a_start_url_robots_txt_disallows_exits_3() -> None:
+    async with Site({"/robots.txt": DISALLOW_ALL, "/": page("/a")}) as site:
+        code, stdout, stderr = await run(CRAWL, site.url())
+    assert code == ExitCode.CANNOT_START
+    assert stdout == b""
+    assert stderr == (
+        f"crawl: can't start: {site.url('/robots.txt')} disallows {site.url()} for "
+        "web-crawler; if the site is yours, --ignore-robots skips robots.txt\n"
+    )
+    assert site.targets() == ["/robots.txt"]
+
+
+async def test_ignore_robots_crawls_without_reading_robots_txt() -> None:
+    resources = {"/robots.txt": DISALLOW_ALL, "/": page("/a"), "/a": page()}
+    async with Site(resources) as site:
+        code, stdout, _ = await run(CRAWL, "--ignore-robots", site.url())
+    assert code == 0
+    assert len(split_records(stdout)) == 2
+    assert site.targets() == ["/", "/a"]
 
 
 async def test_a_usage_error_exits_2() -> None:
