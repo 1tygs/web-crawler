@@ -95,6 +95,9 @@ concurrency = ["thread", "multiprocessing"]
 parallel = true
 # Measure the CLI tests' child processes too.
 patch = ["subprocess"]
+# A spawned parser process runs the crawl script, which imports web_crawler, before coverage
+# starts in it, and coverage would say so on the crawl's stderr.
+disable_warnings = ["module-not-measured"]
 
 [tool.coverage.report]
 # The walking skeleton is fully covered; lowering this needs a reason.

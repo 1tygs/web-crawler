@@ -3,18 +3,29 @@ import itertools
 import logging
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from typing import Any
 
 import pytest
 
 from tests.support.fake_transport import Answer, FakeResponse, FakeTransport, Reply
 from tests.support.jitter import Lowest
+from web_crawler import engine
 from web_crawler.config import Config
-from web_crawler.engine import INITIAL_CONCURRENCY, crawl
-from web_crawler.output import MemorySink
+from web_crawler.engine import INITIAL_CONCURRENCY, CrawlReport
+from web_crawler.output import MemorySink, Sink
+from web_crawler.pool import InlineParser
 from web_crawler.transport import ErrorKind
 from web_crawler.types import ExitCode
 
 START = "https://example.com/"
+
+
+async def crawl(cfg: Config, sink: Sink, **collaborators: Any) -> CrawlReport:
+    """engine.crawl, parsing inline: these tests are about dispatch, and the parse gateway's
+    own are in tests/integration/test_pool.py."""
+    return await engine.crawl(cfg, sink, parser=InlineParser, **collaborators)
+
+
 HTML = {"Content-Type": "text/html"}
 TEXT = {"Content-Type": "text/plain"}
 ROBOTS = "https://example.com/robots.txt"

@@ -5,10 +5,12 @@ import gzip
 import os
 import signal
 import sys
+import time
 import zlib
 from collections import Counter
 from collections.abc import Callable
 from compression import zstd
+from pathlib import Path
 
 import brotli
 import pytest
@@ -16,12 +18,15 @@ from aiohttp import web
 
 from tests.support.bench import make_site
 from tests.support.command import CRAWL, run, split_records
-from tests.support.graphs import expected_records, graph_site
+from tests.support.graphs import expected_records, graph_site, href
 from tests.support.site import HTML, Handler, Resource, Site, page, redirect, unused_port
+from tests.support.waiting import until
+from tests.support.workers import scripted
 from web_crawler.config import Config
 from web_crawler.engine import crawl
 from web_crawler.output import MemorySink
-from web_crawler.types import ExitCode
+from web_crawler.pool import Parser, ProcessParser
+from web_crawler.types import ExitCode, WorkerContext
 
 
 def hand_built(port: int, other_port: int) -> dict[str, Resource]:
@@ -96,12 +101,12 @@ def hand_built_records(port: int, other_port: int) -> list[bytes]:
     )
 
 
-async def test_a_hand_built_site() -> None:
+async def test_a_hand_built_site(parse_workers: int) -> None:
     other_port = unused_port()
     async with Site({}) as site:
         site.resources = hand_built(site.port, other_port)
         sink = MemorySink()
-        report = await crawl(Config(start_url=site.url()), sink)
+        report = await crawl(Config(start_url=site.url(), parse_workers=parse_workers), sink)
     assert report.exit_code is ExitCode.OK
     assert sorted(sink.records) == hand_built_records(site.port, other_port)
     # Each in-scope URL was requested once, exactly as printed, and nothing else was.
@@ -189,10 +194,10 @@ def _compressed_site() -> dict[str, Resource]:
     return resources
 
 
-async def test_compressed_pages_are_crawled_as_a_browser_reads_them() -> None:
+async def test_compressed_pages_are_crawled_as_a_browser_reads_them(parse_workers: int) -> None:
     async with Site(_compressed_site()) as site:
         sink = MemorySink()
-        cfg = Config(start_url=site.url(), max_page_bytes=1 << 20)
+        cfg = Config(start_url=site.url(), max_page_bytes=1 << 20, parse_workers=parse_workers)
         report = await crawl(cfg, sink)
     assert report.exit_code is ExitCode.OK
     o = site.origin
@@ -217,13 +222,16 @@ async def test_compressed_pages_are_crawled_as_a_browser_reads_them() -> None:
 @pytest.mark.parametrize("seed", range(4))
 @pytest.mark.parametrize("max_concurrency", [1, 64])
 async def test_random_sites_match_breadth_first_ground_truth(
-    seed: int, max_concurrency: int
+    seed: int, max_concurrency: int, parse_workers: int
 ) -> None:
     graph = make_site(seed, pages=300, branching=3.0, cross_links=2)
     async with Site({}) as site:
         site.resources = graph_site(site.origin, graph)
         sink = MemorySink()
-        report = await crawl(Config(start_url=site.url(), max_concurrency=max_concurrency), sink)
+        cfg = Config(
+            start_url=site.url(), max_concurrency=max_concurrency, parse_workers=parse_workers
+        )
+        report = await crawl(cfg, sink)
     assert report.exit_code is ExitCode.OK
     assert sorted(sink.records) == expected_records(site.origin, graph)
     assert max(Counter(site.targets()).values()) == 1  # no URL requested twice
@@ -253,7 +261,7 @@ async def test_python_dash_m_crawls_the_hand_built_site() -> None:
     )
 
 
-async def test_follows_a_cookie_gate_back_to_the_page() -> None:
+async def test_follows_a_cookie_gate_back_to_the_page(parse_workers: int) -> None:
     # /members redirects to a page that sets a cookie and redirects back, as many sites'
     # consent and login gates do. With the cookie, /members is served.
     async def members(request: web.Request) -> web.StreamResponse:
@@ -273,7 +281,7 @@ async def test_follows_a_cookie_gate_back_to_the_page() -> None:
     }
     async with Site(resources) as site:
         sink = MemorySink()
-        report = await crawl(Config(start_url=site.url()), sink)
+        report = await crawl(Config(start_url=site.url(), parse_workers=parse_workers), sink)
     assert report.exit_code is ExitCode.OK
     o = site.origin
     assert sorted(sink.records) == [
@@ -284,10 +292,11 @@ async def test_follows_a_cookie_gate_back_to_the_page() -> None:
     assert not report.stats.failures
 
 
-async def test_a_redirect_loop_ends_at_the_hop_limit() -> None:
+async def test_a_redirect_loop_ends_at_the_hop_limit(parse_workers: int) -> None:
     resources = {"/": page("/loop"), "/loop": redirect("/loop/"), "/loop/": redirect("/loop")}
     async with Site(resources) as site:
-        report = await crawl(Config(start_url=site.url()), MemorySink())
+        cfg = Config(start_url=site.url(), parse_workers=parse_workers)
+        report = await crawl(cfg, MemorySink())
     assert report.stats.failures == {"redirect loop": 1}
     assert site.targets() == ["/robots.txt", "/", *(["/loop", "/loop/"] * 6)[:11]]
 
@@ -431,25 +440,50 @@ def _slow_after(sig: signal.Signals, times: int = 1) -> dict[str, Resource | Han
     return {"/": page("/slow"), "/slow": slow}
 
 
-async def test_a_second_ctrl_c_exits_at_once(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_a_second_ctrl_c_exits_at_once(
+    monkeypatch: pytest.MonkeyPatch, parse_workers: int
+) -> None:
     exits: list[int] = []
     monkeypatch.setattr(os, "_exit", exits.append)
     before = signal.getsignal(signal.SIGINT)
     async with Site(_slow_after(signal.SIGINT)) as site:
         sink = _InterruptedWhileClosing()
-        report = await crawl(Config(start_url=site.url(), ignore_robots=True), sink)
+        cfg = Config(start_url=site.url(), ignore_robots=True, parse_workers=parse_workers)
+        report = await crawl(cfg, sink)
     assert report.exit_code is ExitCode.INTERRUPTED
     assert exits == [ExitCode.INTERRUPTED]
     assert sink.records == [b"%s\n  %s\n\n" % (site.url().encode(), site.url("/slow").encode())]
     assert signal.getsignal(signal.SIGINT) is before
 
 
-async def test_sigterm_stops_the_crawl_and_an_ignored_sigint_stays_ignored() -> None:
+async def test_a_second_ctrl_c_during_start_up_exits_at_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    exits: list[int] = []
+    monkeypatch.setattr(os, "_exit", exits.append)
+
+    async def robots(request: web.Request) -> web.StreamResponse:
+        os.kill(os.getpid(), signal.SIGINT)
+        await asyncio.sleep(30)
+        return web.Response()
+
+    async with Site({"/robots.txt": robots, "/": page()}) as site:
+        sink = _InterruptedWhileClosing()
+        report = await crawl(Config(start_url=site.url()), sink)
+    assert report.exit_code is ExitCode.INTERRUPTED
+    assert exits == [ExitCode.INTERRUPTED]  # with no parser processes started to kill
+    assert sink.records == []
+
+
+async def test_sigterm_stops_the_crawl_and_an_ignored_sigint_stays_ignored(
+    parse_workers: int,
+) -> None:
     before = signal.signal(signal.SIGINT, signal.SIG_IGN)
     try:
         async with Site(_slow_after(signal.SIGTERM, times=2)) as site:
             sink = MemorySink()
-            report = await crawl(Config(start_url=site.url(), ignore_robots=True), sink)
+            cfg = Config(start_url=site.url(), ignore_robots=True, parse_workers=parse_workers)
+            report = await crawl(cfg, sink)
         assert signal.getsignal(signal.SIGINT) is signal.SIG_IGN
     finally:
         signal.signal(signal.SIGINT, before)
@@ -470,13 +504,118 @@ def _wide_site(size: int) -> dict[str, Resource | Handler]:
 
 
 @pytest.mark.parametrize(("max_pages", "printed"), [(1, 1), (3, 3), (20, 20), (100, 30)])
-async def test_max_pages_prints_and_fetches_at_most_n_pages(max_pages: int, printed: int) -> None:
+async def test_max_pages_prints_and_fetches_at_most_n_pages(
+    max_pages: int, printed: int, parse_workers: int
+) -> None:
     async with Site(_wide_site(30)) as site:
         sink = MemorySink()
-        cfg = Config(start_url=site.url(), max_pages=max_pages, ignore_robots=True)
+        cfg = Config(
+            start_url=site.url(),
+            max_pages=max_pages,
+            ignore_robots=True,
+            parse_workers=parse_workers,
+        )
         report = await crawl(cfg, sink)
     assert report.exit_code is ExitCode.OK
     assert len(sink.records) == printed  # exactly N, or every page of a smaller site
     page_fetches = [t for t in site.targets() if t not in ("/missing", "/file.bin")]
     assert len(page_fetches) == printed  # no page fetched only to be thrown away
     assert len(set(page_fetches)) == printed
+
+
+def _scripted_pool(ctx: WorkerContext) -> Parser:
+    """Two parser processes whose parses misbehave as their pages' URLs say."""
+    return ProcessParser(ctx, 2, target=scripted)
+
+
+async def _hang(request: web.Request) -> web.StreamResponse:
+    await asyncio.sleep(30)
+    return web.Response()
+
+
+async def test_the_first_ctrl_c_lets_parses_already_submitted_finish(tmp_path: Path) -> None:
+    marker = tmp_path / "parsing"
+    slow = f"/slow?sleep=0.5&marker={marker}"
+    resources: dict[str, Resource | Handler] = {
+        "/": page(slow, "/hanging"),
+        slow: page("/next"),
+        "/hanging": _hang,
+    }
+    async with Site(resources) as site:
+
+        async def interrupt() -> None:
+            await until(marker.exists)  # the slow page is submitted, /hanging still fetching
+            os.kill(os.getpid(), signal.SIGINT)
+
+        interrupter = asyncio.create_task(interrupt())
+        sink = MemorySink()
+        cfg = Config(start_url=site.url(), ignore_robots=True)
+        report = await crawl(cfg, sink, parser=_scripted_pool)
+        await interrupter
+    assert report.exit_code is ExitCode.INTERRUPTED
+    assert sorted(sink.records) == [
+        f"{site.url()}\n  {site.url(slow)}\n  {site.url('/hanging')}\n\n".encode(),
+        f"{site.url(slow)}\n  {site.url('/next')}\n\n".encode(),
+    ]
+    assert "/next" not in site.targets()  # nothing new was fetched
+
+
+async def test_a_second_ctrl_c_kills_busy_parser_processes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    exits: list[int] = []
+    monkeypatch.setattr(os, "_exit", exits.append)  # so that the test carries on
+    marker = tmp_path / "parsing"
+    slow = f"/slow?sleep=60&marker={marker}"
+    async with Site({"/": page(slow), slow: page()}) as site:
+
+        async def interrupt_twice() -> None:
+            await until(marker.exists)
+            os.kill(os.getpid(), signal.SIGINT)  # waits for the slow parse
+            await asyncio.sleep(0.2)
+            os.kill(os.getpid(), signal.SIGINT)
+
+        interrupter = asyncio.create_task(interrupt_twice())
+        started = time.monotonic()
+        sink = MemorySink()
+        report = await crawl(Config(start_url=site.url()), sink, parser=_scripted_pool)
+        await interrupter
+    assert exits == [ExitCode.INTERRUPTED]
+    assert time.monotonic() - started < 30  # the parse didn't run its 60 s
+    assert report.exit_code is ExitCode.INTERRUPTED
+    assert len(sink.records) == 1  # the start page's
+    # With os._exit stubbed out, the killed parse fails as a pool broken for good would.
+    assert "BrokenProcessPool" in caplog.text
+
+
+async def test_a_parser_process_killed_mid_parse_loses_no_page(tmp_path: Path) -> None:
+    # The first parse of the page dies with its process, as on a kill -9.
+    victim = f"/victim?kill=once&marker={tmp_path / 'killed'}"
+    graph = make_site(3, pages=60, branching=3.0, cross_links=2)
+    async with Site({}) as site:
+        home = page(victim, *(href(site.origin, 0, target) for target in graph[0]))
+        site.resources = graph_site(site.origin, graph) | {"/": home, victim: page("/")}
+        sink = MemorySink()
+        report = await crawl(Config(start_url=site.url()), sink, parser=_scripted_pool)
+    assert (tmp_path / "killed").exists()
+    assert report.exit_code is ExitCode.OK
+    assert not report.stats.failures
+    assert len(sink.records) == len(graph) + 1  # every page, the victim too
+
+
+async def test_a_page_that_crashes_its_parser_fails_alone(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    crash = "/crash?kill=always"
+    resources = {"/": page(crash, "/fine"), crash: page("/unseen"), "/fine": page()}
+    async with Site(resources) as site:
+        sink = MemorySink()
+        report = await crawl(Config(start_url=site.url()), sink, parser=_scripted_pool)
+    assert report.exit_code is ExitCode.OK
+    assert report.stats.failures == {"parse crashed": 1}
+    assert sorted(sink.records) == [
+        f"{site.url()}\n  {site.url(crash)}\n  {site.url('/fine')}\n\n".encode(),
+        f"{site.url('/fine')}\n\n".encode(),
+    ]
+    assert f"{site.url(crash)} isn't printed: parsing it crashed the parser process" in caplog.text
+    assert "not printed: parse crashed (1)" in report.summary

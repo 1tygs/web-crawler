@@ -24,6 +24,7 @@ class Config:
     start_url: str  # as given; urls.normalize_start makes it a display URL
     user_agent: str = USER_AGENT
     max_concurrency: int = 64  # upper bound on requests in flight
+    parse_workers: int | None = None  # parser processes; None: one fewer than the CPUs
     timeout: float = 60.0  # seconds, for one whole request
     max_page_bytes: int = 32 * MIB  # body bytes read from one page
     max_pages: int | None = None  # stop once this many pages are printed
@@ -40,6 +41,8 @@ class Config:
             raise ConfigError(str(error)) from None
         if self.max_concurrency < 1:
             raise ConfigError(f"max_concurrency must be at least 1, not {self.max_concurrency}")
+        if self.parse_workers is not None and self.parse_workers < 0:
+            raise ConfigError(f"parse_workers must be at least 0, not {self.parse_workers}")
         if not (math.isfinite(self.timeout) and self.timeout > 0):
             raise ConfigError(f"timeout must be a positive number of seconds, not {self.timeout}")
         if not (math.isfinite(self.robots_refresh) and self.robots_refresh > 0):
