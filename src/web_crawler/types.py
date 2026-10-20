@@ -78,4 +78,5 @@ class ExitCode(IntEnum):
     CANNOT_START = 3
     ABORTED = 4  # the host stopped answering, or kept refusing requests
     INTERRUPTED = 130  # SIGINT
+    STDOUT_CLOSED = 141  # 128 + SIGPIPE, as a shell reports a process that SIGPIPE ended
     TERMINATED = 143  # SIGTERM

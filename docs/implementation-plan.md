@@ -529,7 +529,7 @@ Each lands in the PR that implements it:
 3. **Cookie-gated redirects:** a redirect back to a URL already in the same chain is followed. Real loops end at the 10-hop limit and are reported as loops. PR 2 (folded into DESIGN §4.2, §5.2 and §5.4).
 4. **The pool starts once the scope is fixed,** after the start URL's redirects, because its initializer carries the scope prefixes. The cost is one worker start before the first parse. PR 3.
 5. **403s are held until their run is settled,** which keeps `--max-depth` exact and gives a requeued URL only one record. PR 4 (folded into DESIGN §5.4).
-6. **A closed stdout exits 141** (128 + SIGPIPE), consistent with 130 and 143; DESIGN §6.1 is silent on it. PR 4.
+6. **A closed stdout exits 141** (128 + SIGPIPE), consistent with 130 and 143; DESIGN §6.1 is silent on it. PR 4 (folded into DESIGN §5.9 and §6.1).
 7. **`ParseResult` gains `links_found`, `decoded_bytes` and `error`.** PRs 1 and 3.
 8. **A compressed stream that ends cleanly but early** is parsed as far as it got and flagged `truncated`, as a browser renders it; only corrupt data is a final error. PR 3.
 9. **`--include-errors` requires `--format jsonl`.** PR 5.

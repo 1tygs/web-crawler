@@ -7,13 +7,14 @@ its blocking writes on a thread of its own, so a slow reader never blocks the ev
 
 import asyncio
 import contextlib
+import functools
 import io
 import os
 import queue
 import threading
 import time
 from collections.abc import Callable
-from typing import BinaryIO, Protocol
+from typing import BinaryIO, Protocol, TextIO
 
 MIB = 1024 * 1024
 
@@ -21,8 +22,10 @@ MIB = 1024 * 1024
 class Sink(Protocol):
     """Where the crawl's records go. Every method is called from the event loop's thread."""
 
-    def start(self, on_drained: Callable[[], object]) -> None:
-        """Begin accepting records. on_drained runs on the event loop when a backlog clears."""
+    def start(self, on_drained: Callable[[], object], on_closed: Callable[[], object]) -> None:
+        """Begin accepting records. on_drained runs on the event loop when a backlog clears,
+        and on_closed if the records' reader goes away, as stdout's does when `| head`
+        has read enough."""
         ...
 
     def write(self, record: bytes) -> None: ...
@@ -43,7 +46,8 @@ class ThreadedSink:
     Each batch of queued records goes out in one write(). The stream is flushed whenever the
     queue runs dry, and at least every 100 ms while it doesn't, so `| head` and `tail -f`
     see records promptly. Past 64 MiB of backlog, backlogged turns on until the backlog
-    falls below 32 MiB, when on_drained runs.
+    falls below 32 MiB, when on_drained runs. A pipe whose reader has gone discards the
+    rest, quietly, and on_closed runs.
 
     The backlog is the difference of two counters, bytes queued and bytes written, each
     written by one thread only, so no lock is needed.
@@ -64,9 +68,11 @@ class ThreadedSink:
         self._discarding = False  # the reader is gone, or a write failed
         self._error: OSError | None = None
         self._thread: threading.Thread | None = None
+        self._closed: Callable[[], object] = lambda: None  # on_closed, on the event loop
 
-    def start(self, on_drained: Callable[[], object]) -> None:
+    def start(self, on_drained: Callable[[], object], on_closed: Callable[[], object]) -> None:
         loop = asyncio.get_running_loop()
+        self._closed = functools.partial(loop.call_soon_threadsafe, on_closed)
         self._thread = threading.Thread(
             target=self._run, args=(loop, on_drained), name="crawl-output", daemon=True
         )
@@ -126,24 +132,27 @@ class ThreadedSink:
             elif data:
                 self._stream.write(data)
         except BrokenPipeError:
-            # The reader went away, e.g. `| head`: discard the rest quietly. Pointing the
-            # descriptor at /dev/null keeps the interpreter's own flush at exit from failing.
+            # The reader went away, e.g. `| head`: discard the rest quietly, and say so.
             self._discarding = True
-            self._stream_to_devnull()
+            to_devnull(self._stream)
+            self._closed()
         except OSError as error:
             self._discarding = True
             self._error = error
 
-    def _stream_to_devnull(self) -> None:
-        try:
-            fd = self._stream.fileno()
-        except OSError, io.UnsupportedOperation:
-            return
-        devnull = os.open(os.devnull, os.O_WRONLY)
-        try:
-            os.dup2(devnull, fd)
-        finally:
-            os.close(devnull)
+
+def to_devnull(stream: BinaryIO | TextIO) -> None:
+    """Point a stream whose pipe has no reader at /dev/null, so that what it still holds,
+    and the interpreter's own flush at exit, go nowhere rather than fail."""
+    try:
+        fd = stream.fileno()
+    except OSError, io.UnsupportedOperation:
+        return
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull, fd)
+    finally:
+        os.close(devnull)
 
 
 class MemorySink:
@@ -153,7 +162,7 @@ class MemorySink:
         self.records: list[bytes] = []
         self.closed = False
 
-    def start(self, on_drained: Callable[[], object]) -> None:
+    def start(self, on_drained: Callable[[], object], on_closed: Callable[[], object]) -> None:
         pass
 
     def write(self, record: bytes) -> None:

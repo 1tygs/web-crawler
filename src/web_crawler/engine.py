@@ -178,7 +178,7 @@ async def crawl(  # noqa: PLR0913  (the collaborators that tests replace)
     interrupts = _Interrupts(dispatcher)
     with interrupts:  # until the sink is closed, so a second Ctrl-C can cut closing short
         try:
-            sink.start(dispatcher.pump)
+            sink.start(dispatcher.pump, interrupts.output_closed)
             work = asyncio.create_task(_run(start, dispatcher, start_url, scheme_was_implicit))
             exit_code = await interrupts.wait(work)
         finally:
@@ -231,7 +231,8 @@ async def _run(
 
 @dataclass(slots=True)
 class _Interrupts:
-    """Stops the crawl cleanly on the first SIGINT or SIGTERM (DESIGN.md §5.9).
+    """Stops the crawl cleanly on the first SIGINT or SIGTERM (DESIGN.md §5.9), or when the
+    sink's reader goes away, as stdout's does when `| head` has read enough.
 
     Dispatching stops and the crawl's task is cancelled; crawl() then cancels the fetches
     in flight, lets the parses already submitted finish and print, stops the parser
@@ -241,9 +242,10 @@ class _Interrupts:
     """
 
     dispatcher: _Dispatcher
-    exit_code: ExitCode | None = None  # the first signal's
+    exit_code: ExitCode | None = None  # the first stop's
     _work: asyncio.Task[ExitCode] = field(init=False)
     _previous: dict[signal.Signals, _SignalHandler] = field(default_factory=dict)
+    _watching: bool = False  # within the with block
 
     def __enter__(self) -> None:
         loop = asyncio.get_running_loop()
@@ -253,8 +255,10 @@ class _Interrupts:
                 continue
             self._previous[sig] = previous
             loop.add_signal_handler(sig, self._received, sig)
+        self._watching = True
 
     def __exit__(self, *exc_info: object) -> None:
+        self._watching = False
         loop = asyncio.get_running_loop()
         for sig, previous in self._previous.items():
             loop.remove_signal_handler(sig)
@@ -271,9 +275,18 @@ class _Interrupts:
             return self.exit_code
 
     def _received(self, sig: signal.Signals) -> None:
-        if self.exit_code is not None:  # a second SIGTERM: closing is already under way
+        self._stop(_STOP_SIGNALS[sig])
+
+    def output_closed(self) -> None:
+        """The sink's reader went away: nothing more can be printed (DESIGN.md §6.1)."""
+        self._stop(ExitCode.STDOUT_CLOSED)
+
+    def _stop(self, exit_code: ExitCode) -> None:
+        # Once stopping, a SIGTERM or a closed output changes nothing; a reader that went
+        # away while the sink was closing, once crawl() was done, changes nothing either.
+        if self.exit_code is not None or not self._watching:
             return
-        self.exit_code = _STOP_SIGNALS[sig]
+        self.exit_code = exit_code
         self.dispatcher.halt()
         self._work.cancel()
         if signal.SIGINT in self._previous:

@@ -42,5 +42,6 @@ def test_exit_codes_match_the_design() -> None:
         "CANNOT_START": 3,
         "ABORTED": 4,
         "INTERRUPTED": 130,
+        "STDOUT_CLOSED": 141,
         "TERMINATED": 143,
     }

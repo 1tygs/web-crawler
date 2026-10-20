@@ -8,6 +8,8 @@ import pytest
 import web_crawler
 from web_crawler.cli import main, parse_args
 from web_crawler.config import Config
+from web_crawler.engine import CrawlReport
+from web_crawler.stats import Stats
 from web_crawler.types import ExitCode
 
 
@@ -207,6 +209,18 @@ def test_an_unexpected_exception_exits_1_with_its_traceback(
     assert main(["https://example.com/"]) == ExitCode.INTERNAL_ERROR
     assert "internal error" in caplog.text
     assert "RuntimeError: a bug" in caplog.text
+
+
+@pytest.mark.parametrize("code", [ExitCode.ABORTED, ExitCode.STDOUT_CLOSED, ExitCode.TERMINATED])
+def test_a_crawl_that_stops_early_prints_its_summary_and_exits_with_its_code(
+    code: ExitCode, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    async def stopped(*args: object, **kwargs: object) -> CrawlReport:
+        return CrawlReport(code, Stats(started=0.0, pages=3), unique_urls=7, finished=2.0)
+
+    monkeypatch.setattr("web_crawler.cli.crawl", stopped)
+    assert main(["https://example.com/"]) == code
+    assert capsys.readouterr().err.startswith("3 pages in 2.0 s")
 
 
 def test_ctrl_c_before_the_crawl_handles_it_exits_130(monkeypatch: pytest.MonkeyPatch) -> None:

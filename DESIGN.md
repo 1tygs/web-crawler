@@ -382,13 +382,15 @@ JSONL (`--format jsonl`) has one object per page:
 ```
 
 - stdout carries only results. Logs, progress and the summary go to stderr, so `crawl … > out.txt` stays clean.
-- Each record is written with one `write()` and is never interleaved. The writer thread flushes every 100 ms and at exit, so `| head`, `tee` and `tail -f` behave as expected. A closed pipe (e.g. `| head`) ends the crawl quietly.
+- Each record is written with one `write()` and is never interleaved. The writer thread flushes every 100 ms and at exit, so `| head`, `tee` and `tail -f` behave as expected. A closed pipe (e.g. `| head`) ends the crawl quietly, with exit code 141 ([§5.9](#59-shutdown)).
 - At thousands of lines per second, the terminal itself becomes the bottleneck. When stdout is a terminal, the progress line suggests redirecting to a file.
 
 ### 5.9 Shutdown
 
 - **First SIGINT/SIGTERM.** Dispatching stops and in-flight fetches are cancelled. Parse jobs already submitted finish so their records print; the workers never see the signal ([§4.3](#43-concurrency-model)). Then output is flushed, the summary printed, and the process exits with 130 (SIGINT) or 143 (SIGTERM).
 - **Second SIGINT.** Exit immediately; the pool is killed.
+- **Abort** ([§5.3](#53-adaptive-concurrency-limiter), [§5.4](#54-errors-and-retries)). As for the first signal, with exit code 4: the host stayed unreachable, or kept refusing the crawl, for 5 minutes. An error line on stderr says which.
+- **Stdout closed,** as when `| head` has read enough. The writer thread's next write fails, and it discards the rest; the crawl stops as for the first signal, with exit code 141, 128 + SIGPIPE, as a shell reports a program that SIGPIPE ended. Nothing is said about it, and no traceback is printed; the summary still goes to stderr, unless stderr went to the same pipe.
 - **Normal end.** Shut down the pool, close the session (with a graceful TLS close), flush, print the summary, exit 0.
 
 ---
@@ -429,7 +431,9 @@ A start URL given without a scheme gets `https://`. If its host gives no answer 
 - `2`: usage error.
 - `3`: couldn't start. The start URL is unreachable, disallowed by robots.txt, or redirects to another host (other than adding or removing `www.`, unless `--strict-host` is set), or its robots.txt is unreachable.
 - `4`: aborted because the host became unreachable or kept blocking requests.
-- `130`: interrupted.
+- `130`: interrupted (SIGINT).
+- `141`: stdout closed, as by `| head`.
+- `143`: terminated (SIGTERM).
 
 ### 6.2 Internal contracts
 
@@ -578,7 +582,7 @@ Python 3.14 or later is required, because `compression.zstd` is in its standard 
 | Unit: limiter | Within 15% of the ceiling's crawl time when the server has spare capacity; under half the unthrottled queueing on a small origin; halves on 429; honours `Retry-After`; one cut per congestion event | The simulator behind ADR-001 (`bench/limiter_sim.py`) with a fake clock: a narrow and a wide steady spread of response times, a page-mix shift late and during slow start, and a small origin that queues |
 | Unit: robots | The crawler's own handling: fetching every origin up front, each status class including 429, redirects, re-fetching after 24 hours | Table tests, plus a few pinned Protego behaviours (longest match, wildcards, group selection). Google's test suite isn't run against Protego, which matches groups more loosely ([§5.7](#57-robotstxt)) |
 | Integration | Output matches ground truth exactly; each URL is fetched at most once | An in-process aiohttp server, over http and https, serving sites with known link graphs; a test resolver serves `*.test` hosts on their default ports: the scenarios below, plus seeded random graphs with random latencies, compared against a breadth-first search with and without `--max-depth`. The server's request log proves there are no double fetches |
-| Fault injection | Recovery without losing pages | Connection resets mid-body, truncated gzip, `kill -9` on one worker of a busy pool (no page lost), a page that crashes its worker every time (only it fails), Ctrl-C mid-crawl and while workers are starting (no partial records; summary printed), a run of 403s mid-crawl |
+| Fault injection | Recovery without losing pages | Connection resets mid-body, truncated gzip, 429 and 503 with and without `Retry-After`, `kill -9` on one worker of a busy pool (no page lost), a page that crashes its worker every time (only it fails), Ctrl-C mid-crawl and while workers are starting (no partial records; summary printed), a run of 403s mid-crawl that ends and one that doesn't (exit 4), a host that goes away (exit 4), a decompression bomb, `\| head` (exit 141, no traceback) |
 | Performance | No regressions | A local server with 50 ms of injected latency and 50k pages, tracking pages/s, coordinator CPU per page and peak RSS in CI. `bench/` holds the scripts behind this document |
 
 The integration test sites cover:

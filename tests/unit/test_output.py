@@ -7,7 +7,7 @@ from typing import BinaryIO
 
 import pytest
 
-from web_crawler.output import MemorySink, ThreadedSink
+from web_crawler.output import MemorySink, ThreadedSink, to_devnull
 
 
 class Recorder(io.RawIOBase):
@@ -49,7 +49,7 @@ def backlogged(sink: ThreadedSink) -> bool:
 
 def test_memory_sink_keeps_records() -> None:
     sink = MemorySink()
-    sink.start(lambda: None)
+    sink.start(lambda: None, lambda: None)
     sink.write(b"a\n")
     sink.write(b"b\n")
     assert not sink.backlogged
@@ -61,7 +61,7 @@ def test_memory_sink_keeps_records() -> None:
 async def test_writes_every_record_in_order() -> None:
     stream = Recorder()
     sink = ThreadedSink(stream)  # type: ignore[arg-type]
-    sink.start(lambda: None)
+    sink.start(lambda: None, lambda: None)
     records = [f"https://example.com/{n}\n\n".encode() for n in range(1000)]
     for record in records:
         sink.write(record)
@@ -74,7 +74,7 @@ async def test_sends_what_queued_up_meanwhile_in_one_write() -> None:
     stream = Recorder()
     stream.gate.clear()
     sink = ThreadedSink(stream)  # type: ignore[arg-type]
-    sink.start(lambda: None)
+    sink.start(lambda: None, lambda: None)
     sink.write(b"first\n")
     await wait_for(stream.writing)  # the writer holds "first" at the gate
     for name in (b"a\n", b"b\n", b"c\n"):
@@ -87,7 +87,7 @@ async def test_sends_what_queued_up_meanwhile_in_one_write() -> None:
 async def test_flushes_as_soon_as_the_queue_runs_dry() -> None:
     stream = Recorder()
     sink = ThreadedSink(stream)  # type: ignore[arg-type]
-    sink.start(lambda: None)
+    sink.start(lambda: None, lambda: None)
     sink.write(b"record\n")
     await wait_for(stream.flushed)  # without close(): a reader sees the record now
     assert stream.calls == [b"record\n", "flush"]
@@ -100,7 +100,7 @@ async def test_a_backlog_pauses_until_it_drains() -> None:
     sink = ThreadedSink(stream, high_water=100, low_water=50)  # type: ignore[arg-type]
     loop = asyncio.get_running_loop()
     drained = loop.create_future()
-    sink.start(lambda: drained.set_result(threading.current_thread()))
+    sink.start(lambda: drained.set_result(threading.current_thread()), lambda: None)
     sink.write(b"x" * 10)
     await wait_for(stream.writing)
     writes = 0
@@ -121,15 +121,25 @@ def pipe_without_a_reader() -> tuple[BinaryIO, int]:
     return open(write_end, "wb"), write_end
 
 
-async def test_a_closed_pipe_is_quiet_and_discards_the_rest() -> None:
+async def test_a_closed_pipe_is_quiet_discards_the_rest_and_says_so() -> None:
     stream, write_end = pipe_without_a_reader()
     sink = ThreadedSink(stream)
-    sink.start(lambda: None)
+    closed = asyncio.get_running_loop().create_future()
+    sink.start(lambda: None, lambda: closed.set_result(threading.current_thread()))
     for _ in range(100):
         sink.write(b"record\n")
+    assert await asyncio.wait_for(closed, 5) is threading.main_thread()  # on the loop, once
     sink.close()  # no BrokenPipeError
     # The descriptor now points at /dev/null, so the interpreter's own flush at exit works.
     assert os.write(write_end, b"x") == 1
+    stream.close()
+
+
+def test_to_devnull_points_a_stream_at_dev_null() -> None:
+    stream, write_end = pipe_without_a_reader()
+    to_devnull(stream)
+    assert os.write(write_end, b"x") == 1
+    to_devnull(io.BytesIO())  # no descriptor: nothing to do
     stream.close()
 
 
@@ -139,7 +149,7 @@ async def test_a_closed_pipe_without_a_descriptor_is_quiet_too() -> None:
             raise BrokenPipeError(errno.EPIPE, "Broken pipe")
 
     sink = ThreadedSink(Gone())  # type: ignore[arg-type]
-    sink.start(lambda: None)
+    sink.start(lambda: None, lambda: None)
     sink.write(b"record\n")
     sink.close()
 
@@ -150,7 +160,7 @@ async def test_other_write_errors_surface_on_close() -> None:
             raise OSError(errno.ENOSPC, "No space left on device")
 
     sink = ThreadedSink(Full())  # type: ignore[arg-type]
-    sink.start(lambda: None)
+    sink.start(lambda: None, lambda: None)
     for _ in range(10):
         sink.write(b"record\n")
     with pytest.raises(OSError, match="No space left on device"):

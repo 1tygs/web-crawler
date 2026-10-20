@@ -393,7 +393,7 @@ class Valve(MemorySink):
         self.limit = limit
         self.on_drained: Callable[[], object] = lambda: None
 
-    def start(self, on_drained: Callable[[], object]) -> None:
+    def start(self, on_drained: Callable[[], object], on_closed: Callable[[], object]) -> None:
         self.on_drained = on_drained
 
     @property
@@ -427,6 +427,45 @@ async def test_a_backlogged_sink_pauses_dispatch_until_it_drains() -> None:
     report = await task
     assert report.stats.pages == 21
     assert len(pages(transport)) == 21
+
+
+class Gone(MemorySink):
+    """A sink whose reader goes away once it has `limit` records, as `| head` does."""
+
+    def __init__(self, limit: int) -> None:
+        super().__init__()
+        self.limit = limit
+        self.on_closed: Callable[[], object] = lambda: None
+
+    def start(self, on_drained: Callable[[], object], on_closed: Callable[[], object]) -> None:
+        self.on_closed = on_closed
+
+    def write(self, record: bytes) -> None:
+        super().write(record)
+        if len(self.records) == self.limit:
+            asyncio.get_running_loop().call_soon(self.on_closed)
+
+
+async def test_a_sink_whose_reader_goes_away_ends_the_crawl_with_141() -> None:
+    transport = FakeTransport(fan_out(pages=40, delay=0.01))
+    sink = Gone(limit=3)
+    report = await crawl(Config(start_url=START), sink, transport=transport)
+    assert report.exit_code is ExitCode.STDOUT_CLOSED
+    assert len(sink.records) < 41  # what was in flight finished; nothing more started
+    assert len(pages(transport)) < 41
+    assert sink.closed
+    assert transport.in_flight == 0
+
+
+async def test_a_reader_that_goes_away_after_the_crawl_changes_nothing() -> None:
+    class GoneOnClose(Gone):
+        def close(self) -> None:
+            self.on_closed()  # as a writer thread may, flushing the last records
+            super().close()
+
+    sink = GoneOnClose(limit=1 << 30)
+    report = await crawl(Config(start_url=START), sink, transport=FakeTransport(fan_out(3, 0)))
+    assert report.exit_code is ExitCode.OK
 
 
 async def test_cancelling_a_crawl_stops_its_fetches_and_closes_the_sink() -> None:

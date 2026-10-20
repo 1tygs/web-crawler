@@ -10,7 +10,7 @@ from collections.abc import Callable, Sequence
 from web_crawler import __version__
 from web_crawler.config import MIB, USER_AGENT, Config, ConfigError
 from web_crawler.engine import crawl
-from web_crawler.output import ThreadedSink
+from web_crawler.output import ThreadedSink, to_devnull
 from web_crawler.types import ExitCode
 
 log = logging.getLogger(__name__)
@@ -190,5 +190,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         log.exception("internal error")
         return ExitCode.INTERNAL_ERROR
     if report.exit_code is not ExitCode.CANNOT_START:
-        print(report.summary, file=sys.stderr)
+        try:
+            print(report.summary, file=sys.stderr, flush=True)
+        except BrokenPipeError:
+            # stderr went where stdout did, e.g. `2>&1 | head`, whose reader has gone.
+            to_devnull(sys.stderr)
     return report.exit_code

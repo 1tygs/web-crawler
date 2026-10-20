@@ -9,6 +9,7 @@ import asyncio
 import html
 import socket
 import ssl
+import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from types import TracebackType
@@ -48,6 +49,7 @@ class Request:
     headers: Mapping[str, str]
     peer: tuple[str, int]  # the client's address: the same port means a reused connection
     scheme: str = "http"
+    at: float = 0.0  # when it arrived, by time.monotonic()
 
     @property
     def url(self) -> str:
@@ -93,6 +95,7 @@ class Site:
                 dict(request.headers),
                 tuple(peer or ("", 0)),
                 request.scheme,
+                time.monotonic(),
             )
         )
         resource = self.resources.get(request.raw_path)
@@ -137,8 +140,14 @@ class Site:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
+        await self.close()
+
+    async def close(self) -> None:
+        """Stop serving, as a host that goes away does: nothing listens on the ports any
+        more, and the connections open are closed."""
         if self._runner is not None:
             await self._runner.cleanup()
+            self._runner = None
 
 
 class _Response(web.Response):
