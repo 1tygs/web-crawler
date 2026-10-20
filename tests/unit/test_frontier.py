@@ -1,13 +1,17 @@
+import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from web_crawler.frontier import Admission, Frontier
+from web_crawler.frontier import Admission, Frontier, Hop
 from web_crawler.types import CrawlItem
+from web_crawler.urls import Scope
+
+SCOPE = Scope.for_url("https://example.com/")
 
 
 def make() -> tuple[Frontier, Admission]:
     frontier = Frontier()
-    return frontier, Admission(frontier)
+    return frontier, Admission(frontier, SCOPE)
 
 
 def pop_all(frontier: Frontier) -> list[CrawlItem]:
@@ -72,4 +76,36 @@ def test_a_crawl_dispatches_each_key_once_and_ends_when_done(data: st.DataObject
         assert frontier.outstanding == len(in_flight) + len(admission.seen) - len(dispatched)
     assert sorted(dispatched) == sorted(admission.seen)
     assert len(dispatched) == len(set(dispatched))
+    assert frontier.pop() is None
+
+
+@pytest.mark.parametrize(
+    ("url", "chain", "hop"),
+    [
+        # A new in-scope URL is claimed for this item, so no one else fetches it.
+        ("https://example.com/new", set(), Hop.FOLLOW),
+        ("http://example.com/new", set(), Hop.FOLLOW),
+        # One claimed by another item is that item's to print.
+        ("https://example.com/claimed", set(), Hop.CLAIMED),
+        # One in the item's own chain is followed again: a cookie gate coming back.
+        ("https://example.com/claimed", {"https://example.com/claimed"}, Hop.FOLLOW),
+        # Anything else is outside the scope, even if the chain went there.
+        ("https://www.example.com/", set(), Hop.OUT_OF_SCOPE),
+        ("https://www.example.com/", {"https://www.example.com/"}, Hop.OUT_OF_SCOPE),
+    ],
+)
+def test_admit_hop(url: str, chain: set[str], hop: Hop) -> None:
+    frontier, admission = make()
+    admission.seen.add("https://example.com/claimed")
+    assert admission.admit_hop(chain, url, url) is hop
+    assert (url in admission.seen) is (hop is not Hop.OUT_OF_SCOPE)
+    assert frontier.outstanding == 0  # a hop is part of its item, not an item of its own
+
+
+def test_a_claimed_hop_isnt_admitted_again_as_a_link() -> None:
+    frontier, admission = make()
+    assert (
+        admission.admit_hop(set(), "https://example.com/r", "https://example.com/r") is Hop.FOLLOW
+    )
+    assert admission.admit([("https://example.com/r", "https://example.com/r")], depth=1) == 0
     assert frontier.pop() is None

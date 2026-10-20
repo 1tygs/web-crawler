@@ -11,7 +11,7 @@ from aiohttp import web
 
 from tests.support.bench import make_site
 from tests.support.graphs import expected_records, graph_site
-from tests.support.site import Resource, Site, page, redirect, unused_port
+from tests.support.site import Handler, Resource, Site, page, redirect, unused_port
 from web_crawler.config import Config
 from web_crawler.engine import crawl
 from web_crawler.output import MemorySink
@@ -48,6 +48,7 @@ def hand_built(port: int, other_port: int) -> dict[str, Resource]:
             f"http://localhost:{port}/",  # the same server, by another name: another host
             f"http://127.0.0.1:{other_port}/",
             "/old",
+            "/also-old",  # redirects to /new too: /new is fetched and printed once
             "/file.bin",
             "/missing",
             "#top",
@@ -62,6 +63,7 @@ def hand_built(port: int, other_port: int) -> dict[str, Resource]:
         "/a/deeper/": page("../..", "/cycle"),
         "/cycle": page("/a/deeper/"),
         "/old": redirect("/new"),
+        "/also-old": redirect("/new", status=302),
         "/new": page("/"),
         "/file.bin": Resource(
             body=b"\0" * 100, headers=(("Content-Type", "application/octet-stream"),)
@@ -81,6 +83,7 @@ def hand_built_records(port: int, other_port: int) -> list[bytes]:
             f"http://localhost:{port}/",
             f"http://127.0.0.1:{other_port}/",
             f"{o}/old",
+            f"{o}/also-old",
             f"{o}/file.bin",
             f"{o}/missing",
             f"{o}/",
@@ -119,6 +122,7 @@ async def test_a_hand_built_site() -> None:
             "/a/deeper/",
             "/cycle",
             "/old",
+            "/also-old",
             "/new",
             "/file.bin",
             "/missing",
@@ -127,9 +131,11 @@ async def test_a_hand_built_site() -> None:
     )
     assert {request.headers["Host"] for request in site.requests} == {f"127.0.0.1:{site.port}"}
     stats = report.stats
-    assert (stats.pages, stats.not_html, stats.failures) == (8, 1, {"HTTP 404": 1})
-    assert stats.statuses == {200: 9, 301: 1, 404: 1}
-    assert report.unique_urls == 10  # /new, reached only by redirect, wasn't claimed
+    assert (stats.pages, stats.not_html) == (8, 1)
+    # Whichever of /old and /also-old answered second found /new already claimed.
+    assert stats.failures == {"HTTP 404": 1, "redirect to a URL already claimed": 1}
+    assert stats.statuses == {200: 9, 301: 1, 302: 1, 404: 1}
+    assert report.unique_urls == 12  # /new, reached only by redirect, among them
 
 
 @pytest.mark.parametrize("seed", range(4))
@@ -165,8 +171,49 @@ async def test_python_dash_m_crawls_the_hand_built_site() -> None:
         code, stdout, stderr = await run(sys.executable, "-m", "web_crawler", site.url())
     assert code == 0
     assert split_records(stdout) == hand_built_records(site.port, other_port)
-    assert "statuses: 200 (9), 301 (1), 404 (1)" in stderr
-    assert "not printed: not HTML (1), HTTP 404 (1)" in stderr
+    assert "statuses: 200 (9), 301 (1), 302 (1), 404 (1)" in stderr
+    assert (
+        "not printed: not HTML (1), HTTP 404 (1), redirect to a URL already claimed (1)" in stderr
+    )
+
+
+async def test_follows_a_cookie_gate_back_to_the_page() -> None:
+    # /members redirects to a page that sets a cookie and redirects back, as many sites'
+    # consent and login gates do. With the cookie, /members is served.
+    async def members(request: web.Request) -> web.StreamResponse:
+        if request.cookies.get("gate") == "open":
+            return web.Response(body=b'<a href="/">home</a>', content_type="text/html")
+        return web.Response(status=302, headers={"Location": "/gate?next=/members"})
+
+    async def gate(request: web.Request) -> web.StreamResponse:
+        response = web.Response(status=302, headers={"Location": request.query["next"]})
+        response.set_cookie("gate", "open")
+        return response
+
+    resources: dict[str, Resource | Handler] = {
+        "/": page("/members"),
+        "/members": members,
+        "/gate?next=/members": gate,
+    }
+    async with Site(resources) as site:
+        sink = MemorySink()
+        report = await crawl(Config(start_url=site.url()), sink)
+    assert report.exit_code is ExitCode.OK
+    o = site.origin
+    assert sorted(sink.records) == [
+        f"{o}/\n  {o}/members\n\n".encode(),
+        f"{o}/members\n  {o}/\n\n".encode(),
+    ]
+    assert site.targets() == ["/", "/members", "/gate?next=/members", "/members"]
+    assert not report.stats.failures
+
+
+async def test_a_redirect_loop_ends_at_the_hop_limit() -> None:
+    resources = {"/": page("/loop"), "/loop": redirect("/loop/"), "/loop/": redirect("/loop")}
+    async with Site(resources) as site:
+        report = await crawl(Config(start_url=site.url()), MemorySink())
+    assert report.stats.failures == {"redirect loop": 1}
+    assert site.targets() == ["/", *(["/loop", "/loop/"] * 6)[:11]]
 
 
 START_FAILURES = {

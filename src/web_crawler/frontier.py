@@ -5,10 +5,12 @@ the claimed URLs until they're dispatched, shallowest first, and counts the ones
 finished. Both are synchronous and do no I/O: the engine feeds them events.
 """
 
+import enum
 from collections import deque
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 
 from web_crawler.types import CrawlItem
+from web_crawler.urls import Scope
 
 
 class Frontier:
@@ -44,15 +46,25 @@ class Frontier:
         self.outstanding -= 1
 
 
+class Hop(enum.Enum):
+    """What admission says about a redirect's target (DESIGN.md §5.6)."""
+
+    FOLLOW = "follow"  # the item requests it: it claimed it now, or had already
+    CLAIMED = "claimed"  # another item claimed it, and prints it
+    OUT_OF_SCOPE = "out of scope"
+
+
 class Admission:
     """Claims each URL once, on discovery: from then on, no other page can queue it again.
 
     seen holds dedupe keys. A key is checked and claimed with no await in between, so on one
-    event loop a claim is atomic without a lock (DESIGN.md §4.3).
+    event loop a claim is atomic without a lock (DESIGN.md §4.3). Every redirect target is
+    claimed the same way, so a page reached by redirect is fetched once too.
     """
 
-    def __init__(self, frontier: Frontier) -> None:
+    def __init__(self, frontier: Frontier, scope: Scope) -> None:
         self.seen: set[str] = set()
+        self.scope = scope  # links arrive checked; redirect targets are checked here
         self._frontier = frontier
 
     def admit(self, links: Iterable[tuple[str, str]], depth: int) -> int:
@@ -65,3 +77,20 @@ class Admission:
                 seen.add(key)
                 push(CrawlItem(url=url, key=key, depth=depth))
         return len(seen) - before
+
+    def admit_hop(self, chain: Collection[str], url: str, key: str) -> Hop:
+        """Whether an item may request url, a redirect target with dedupe key key. chain
+        holds the keys of the URLs the item has requested so far.
+
+        A target already in the chain is followed again: a cookie-gated page redirects to a
+        page that sets the cookie, which redirects back. A real loop ends at the fetcher's
+        hop limit.
+        """
+        if not self.scope.contains(url):
+            return Hop.OUT_OF_SCOPE
+        if key in chain:
+            return Hop.FOLLOW
+        if key in self.seen:
+            return Hop.CLAIMED
+        self.seen.add(key)
+        return Hop.FOLLOW

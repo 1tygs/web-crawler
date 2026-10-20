@@ -12,7 +12,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from web_crawler.config import Config
-from web_crawler.fetcher import Fetcher, Final, NotPage, Page
+from web_crawler.fetcher import AdmissionHops, Claimed, Fetcher, Final, HopPolicy, NotPage, Page
 from web_crawler.frontier import Admission, Frontier
 from web_crawler.output import Sink
 from web_crawler.parse import parse_page
@@ -53,12 +53,13 @@ async def crawl(
     scope = Scope.for_url(start_url)
     stats = Stats(started=clock())
     frontier = Frontier()
-    admission = Admission(frontier)
+    admission = Admission(frontier, scope)
     owned = transport is None
     if transport is None:
         transport = AiohttpTransport(cfg)
     dispatcher = _Dispatcher(
-        fetcher=Fetcher(transport, scope, cfg.max_page_bytes, stats),
+        fetcher=Fetcher(transport, cfg.max_page_bytes, stats),
+        hops=AdmissionHops(admission),
         frontier=frontier,
         admission=admission,
         sink=sink,
@@ -84,6 +85,7 @@ class _Dispatcher:
     """Starts a fetch whenever one finishes, until nothing is outstanding."""
 
     fetcher: Fetcher
+    hops: HopPolicy
     frontier: Frontier
     admission: Admission
     sink: Sink
@@ -104,8 +106,10 @@ class _Dispatcher:
         start = self.frontier.pop()
         assert start is not None
         # The start URL is fetched on its own: if it isn't a page, there's no crawl.
-        outcome = await self.fetcher.fetch(start)
+        outcome = await self.fetcher.fetch(start, self.hops)
         self.frontier.finish()
+        # Nothing but the start URL's own chain has claimed anything yet.
+        assert not isinstance(outcome, Claimed)
         if not isinstance(outcome, Page):
             self._count(outcome)
             log.error("can't start: %s", _explain(outcome))
@@ -141,7 +145,7 @@ class _Dispatcher:
 
     async def _process(self, item: CrawlItem) -> None:
         try:
-            outcome = await self.fetcher.fetch(item)
+            outcome = await self.fetcher.fetch(item, self.hops)
             if isinstance(outcome, Page):
                 self._page(item, outcome)
             else:
@@ -165,9 +169,12 @@ class _Dispatcher:
         self.stats.pages += 1
         self.stats.links_found += result.links_found
 
-    def _count(self, outcome: NotPage | Final) -> None:
+    def _count(self, outcome: NotPage | Claimed | Final) -> None:
         if isinstance(outcome, NotPage):
             self.stats.not_html += 1
+        elif isinstance(outcome, Claimed):
+            # The page it leads to is printed once, by the item that claimed it.
+            self.stats.failures["redirect to a URL already claimed"] += 1
         else:
             self.stats.failures[outcome.reason] += 1
 

@@ -136,6 +136,30 @@ async def test_all_urls_prints_every_url_but_crawls_only_links() -> None:
     assert report.stats.links_found == 3
 
 
+async def test_a_page_reached_by_redirect_is_fetched_and_printed_once() -> None:
+    # /a and /b both redirect to /page, which /c links to as well, later.
+    replies: dict[str, Reply | ErrorKind] = {
+        START: html("/a", "/b", "/c"),
+        "https://example.com/a": Reply(301, {"Location": "/page"}),
+        "https://example.com/b": Reply(302, {"Location": "/page"}),
+        "https://example.com/c": html("/page", delay=0.01),
+        "https://example.com/page": html(),
+    }
+    transport, sink = FakeTransport(replies), MemorySink()
+    report = await crawl(Config(start_url=START), sink, transport=transport)
+    assert sorted(transport.requested) == sorted(replies)  # each once
+    assert sorted(sink.records) == sorted(
+        [
+            b"https://example.com/\n  https://example.com/a\n  https://example.com/b\n"
+            b"  https://example.com/c\n\n",
+            b"https://example.com/c\n  https://example.com/page\n\n",
+            b"https://example.com/page\n\n",
+        ]
+    )
+    assert report.stats.failures == {"redirect to a URL already claimed": 1}
+    assert report.unique_urls == 5
+
+
 async def test_failures_are_counted_not_printed() -> None:
     replies: dict[str, Reply | ErrorKind] = {
         START: html("/missing", "/image", "/down", "/off"),

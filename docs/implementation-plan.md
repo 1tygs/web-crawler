@@ -271,11 +271,12 @@ Golden fixtures (`tests/fixtures/parse/*.html` with expected JSON) cover:
   7. Otherwise claim it (`seen.add`) and enqueue it.
 
   Every other rejection is claimed, so it's checked only once.
-- **`Admission.admit_hop(item, url, key) -> HopDecision`**:
+- **`Admission.admit_hop(chain, url, key) -> Hop`**, where `chain` holds the keys the item has requested:
+  - outside the scope → `OUT_OF_SCOPE`. Admission holds the scope for this, and the start item's policy can change it (§5.15);
   - the key is in the item's own chain → `FOLLOW` (cookie-gated redirects that come back, §9);
   - claimed elsewhere → `CLAIMED`;
   - robots or a trap rule → `REJECTED(rule)`;
-  - otherwise claim it → `FOLLOW`.
+  - otherwise claim it → `FOLLOW`. A hop isn't an item: it adds nothing to the queues or to `outstanding`.
 - **`Frontier.pop(now)`** moves due retries to the *front* of their depth queue. It returns the head of the shallowest non-empty queue, skipping stale entries (`queued.get(item.key) is not item`). Under `--max-depth`, it returns `None` when that depth is more than `_low + 1`; that is the two-level window of DESIGN §5.1.
 - **`next_retry_at()`, `schedule_retry()`, `finish(item)`** (decrements `incomplete` and `outstanding`, advances `_low`) and **`drop_queued()`** (for `--max-pages` and abort).
 
@@ -339,7 +340,7 @@ Golden fixtures (`tests/fixtures/parse/*.html` with expected JSON) cover:
 `fetch(item, hops: HopPolicy) -> FetchOutcome` returns one of `Page(ParseJob)`, `NotPage(status, mime)`, `Claimed`, `Retry(item_at_hop, cls, retry_after)` or `Final(reason, status, chain)`.
 
 It loops over at most 10 hops. Each iteration opens the request, feeds the limiter, breaker and guard, then calls the pure `triage(status, headers)`:
-- **301, 302, 303, 307, 308 with `Location`:** resolve with ada-url, strip the fragment, `await hops.admit_hop(…)`, drain up to 64 KiB, and continue.
+- **301, 302, 303, 307, 308 with `Location`:** drain up to 64 KiB, resolve with ada-url and strip the fragment. Then, with the response released, `await hops.admit_hop(chain_keys, url, key)` and continue on `FOLLOW`; `CLAIMED` returns `Claimed`, and `OUT_OF_SCOPE` a `Final`. Past the 10th redirect, the result is `Final("redirect loop")` if the chain requested a URL twice, and `Final("too many redirects")` otherwise.
 - **2xx HTML:** `read(max_page_bytes)`.
 - **2xx with no Content-Type:** read the first 16 KiB, sniff the decoded prefix, and keep reading only if it's HTML.
 - **Any other 2xx:** drain if `Content-Length ≤ 64 KiB`, otherwise close.
@@ -514,7 +515,7 @@ Each lands in the PR that implements it:
 
 1. **TTFB from connection-ready,** not from request start, as in A.12's method; it keeps handshake time out of the base round. PR 3.
 2. **One cut per congestion event:** a cut happens only for congestion on requests issued after the previous cut, the exact form of "once per RTT". A cut also discards the partial round. PR 3.
-3. **Cookie-gated redirects:** a redirect back to a URL already in the same chain is followed. Real loops end at the 10-hop limit and are reported as loops. PR 2.
+3. **Cookie-gated redirects:** a redirect back to a URL already in the same chain is followed. Real loops end at the 10-hop limit and are reported as loops. PR 2 (folded into DESIGN §4.2, §5.2 and §5.4).
 4. **The pool starts once the scope is fixed,** after the start URL's redirects, because its initializer carries the scope prefixes. The cost is one worker start before the first parse. PR 3.
 5. **403s are held until their run is settled,** which keeps `--max-depth` exact and gives a requeued URL only one record. PR 4.
 6. **A closed stdout exits 141** (128 + SIGPIPE), consistent with 130 and 143; DESIGN §6.1 is silent on it. PR 4.
