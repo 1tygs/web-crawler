@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "web-crawler"
-version = "1.0.0.dev0"
+version = "1.0.0"
 description = "A fast, accurate and polite single-host web crawler for the command line"
 readme = "README.md"
 license = "MIT"
@@ -12,7 +12,7 @@ license-files = ["LICENSE"]
 authors = [{ name = "Tiago Delgado" }]
 requires-python = ">=3.14"
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 5 - Production/Stable",
     "Environment :: Console",
     "Framework :: AsyncIO",
     "Operating System :: MacOS",
