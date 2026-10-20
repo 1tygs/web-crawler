@@ -216,7 +216,7 @@ class WorkerContext:                      # sent once, through the pool initiali
 
 ### 5.5 `parse.py`: the worker
 
-`init_worker(ctx)` stores the `WorkerContext` in a module global, sets SIGINT and SIGTERM to ignored, then unblocks them (DESIGN §4.3). `parse_page(job) -> ParseResult`:
+`parse_page(job, ctx) -> ParseResult` takes the `WorkerContext` as an argument, so it stays pure and the inline path needs no global (a refinement made in PR 1). In the pool, `init_worker(ctx)` stores the context in a module global, sets SIGINT and SIGTERM to ignored, then unblocks them (DESIGN §4.3), and each job runs a module-level wrapper that calls `parse_page(job, ctx)`, so the context still crosses to a worker only once. `parse_page`:
 
 1. `decode_body(job.body, job.content_encoding, ctx.max_bytes)`. On `ContentDecodeError`, return `ParseResult(b"", [], 0, 0, "bad_encoding")`.
 2. `pick_charset`. UTF-8 goes to lexbor as bytes, with no copy; other charsets go as `bytes.decode(codec, "replace")`.

@@ -447,8 +447,11 @@ class ParseJob:                  # coordinator -> worker (pickled)
 class ParseResult(NamedTuple):   # worker -> coordinator
     record: bytes                # rendered output, written verbatim
     links: list[tuple[str, str]] # in-scope (key, url) pairs, unique, in document order
+    links_found: int             # links printed on the page, for stats
 
-def parse_page(job: ParseJob) -> ParseResult: ...   # pure; context set by the pool initializer
+def parse_page(job: ParseJob, ctx: WorkerContext) -> ParseResult: ...
+                                 # pure; ctx is the static context (§5.5), which a pool
+                                 # worker receives once, from the pool initializer
 ```
 
 `Transport.open` hands the fetcher the status and headers before any body is read, so triage stays in the fetcher ([§5.2](#52-fetcher-and-transport)), and a fake transport can drive the fetcher's tests.
