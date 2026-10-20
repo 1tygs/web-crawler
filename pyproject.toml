@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "web-crawler"
-version = "1.0.0.dev0"
+version = "1.0.0"
 description = "A fast, accurate and polite single-host web crawler for the command line"
 readme = "README.md"
 license = "MIT"
