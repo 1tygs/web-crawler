@@ -312,7 +312,7 @@ The pipeline:
 
 Each URL has two forms:
 - **Display URL:** the WHATWG serialization without its fragment. This form is printed and requested; it's exactly what a browser sends.
-- **Dedupe key:** the display URL plus the RFC 3986 §6.2.2 equivalences that WHATWG leaves alone. Percent-encoded unreserved characters are decoded (`%7E` → `~`) and other escapes are uppercased (`%2f` → `%2F`). This step only runs when the URL contains `%`.
+- **Dedupe key:** the display URL plus the RFC 3986 §6.2.2 equivalences that WHATWG leaves alone. Percent-encoded unreserved characters are decoded (`%7E` → `~`) and other escapes are uppercased (`%2f` → `%2F`). A `%` that starts no escape, which WHATWG leaves as it is, stays distinct from `%25`, and an escaped hex digit right after one stays escaped, so decoding never makes an escape the URL didn't have: `/%%34%31` doesn't become `/%41`, which means `/A`. This step only runs when the URL contains `%`.
 
 | Normalization | Applied? | Why |
 |---|---|---|

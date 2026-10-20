@@ -124,6 +124,19 @@ def test_returns_in_scope_links_only_but_prints_all() -> None:
     assert all(key == url for key, url in result.links)
 
 
+def test_prints_each_spelling_but_crawls_each_resource_once() -> None:
+    # Escapes of unreserved characters and the case of other escapes don't change the
+    # resource (DESIGN.md §5.6), so the first spelling found is the one to crawl.
+    markup = anchors("/~a", "/%7Ea", "/%7ea", "/b%2fc", "/b%2Fc", "/b/c")
+    result = parse_page(ParseJob(url=PAGE, body=markup.encode()), CTX)
+    assert result.links_found == 6
+    assert result.links == [
+        ("https://example.com/~a", "https://example.com/~a"),
+        ("https://example.com/b%2Fc", "https://example.com/b%2fc"),
+        ("https://example.com/b/c", "https://example.com/b/c"),
+    ]
+
+
 def test_skips_valueless_hrefs_and_svg_xlink() -> None:
     # lexbor reports both as None: `<a href>` has no value, and an SVG <a> matched by [href]
     # has only xlink:href. Neither is read as "", which would be a link to the page itself.

@@ -53,6 +53,8 @@ def hand_built(port: int, other_port: int) -> dict[str, Resource]:
             "#top",
             "mailto:someone@example.com",
             "/a#section",
+            "/~user/",
+            "/%7Euser/",  # the same resource: printed as written, requested once
         ),
         "/a": page("/", "/a/deeper/", "../c?x=%2f"),
         "/b": page("/a"),
@@ -64,6 +66,7 @@ def hand_built(port: int, other_port: int) -> dict[str, Resource]:
         "/file.bin": Resource(
             body=b"\0" * 100, headers=(("Content-Type", "application/octet-stream"),)
         ),
+        "/~user/": page("/%7Euser/"),
     }
 
 
@@ -81,6 +84,8 @@ def hand_built_records(port: int, other_port: int) -> list[bytes]:
             f"{o}/file.bin",
             f"{o}/missing",
             f"{o}/",
+            f"{o}/~user/",
+            f"{o}/%7Euser/",
         ],
         f"{o}/a": [f"{o}/", f"{o}/a/deeper/", f"{o}/c?x=%2f"],
         f"{o}/b": [f"{o}/a"],
@@ -88,6 +93,7 @@ def hand_built_records(port: int, other_port: int) -> list[bytes]:
         f"{o}/a/deeper/": [f"{o}/", f"{o}/cycle"],
         f"{o}/cycle": [f"{o}/a/deeper/"],
         f"{o}/new": [f"{o}/"],  # printed under the URL the redirect led to
+        f"{o}/~user/": [f"{o}/%7Euser/"],
     }
     return sorted(
         "".join([url, "\n", *(f"  {link}\n" for link in links), "\n"]).encode()
@@ -116,13 +122,14 @@ async def test_a_hand_built_site() -> None:
             "/new",
             "/file.bin",
             "/missing",
+            "/~user/",
         ]
     )
     assert {request.headers["Host"] for request in site.requests} == {f"127.0.0.1:{site.port}"}
     stats = report.stats
-    assert (stats.pages, stats.not_html, stats.failures) == (7, 1, {"HTTP 404": 1})
-    assert stats.statuses == {200: 8, 301: 1, 404: 1}
-    assert report.unique_urls == 9  # /new, reached only by redirect, wasn't claimed
+    assert (stats.pages, stats.not_html, stats.failures) == (8, 1, {"HTTP 404": 1})
+    assert stats.statuses == {200: 9, 301: 1, 404: 1}
+    assert report.unique_urls == 10  # /new, reached only by redirect, wasn't claimed
 
 
 @pytest.mark.parametrize("seed", range(4))
@@ -158,7 +165,7 @@ async def test_python_dash_m_crawls_the_hand_built_site() -> None:
         code, stdout, stderr = await run(sys.executable, "-m", "web_crawler", site.url())
     assert code == 0
     assert split_records(stdout) == hand_built_records(site.port, other_port)
-    assert "statuses: 200 (8), 301 (1), 404 (1)" in stderr
+    assert "statuses: 200 (9), 301 (1), 404 (1)" in stderr
     assert "not printed: not HTML (1), HTTP 404 (1)" in stderr
 
 

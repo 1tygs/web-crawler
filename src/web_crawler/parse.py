@@ -8,7 +8,7 @@ import ada_url
 from selectolax.lexbor import LexborHTMLParser
 
 from web_crawler.types import ParseJob, ParseResult, WorkerContext
-from web_crawler.urls import strip_fragment
+from web_crawler.urls import dedupe_key, strip_fragment
 
 # Navigational links (DESIGN.md §2.4) as one selector list, which lexbor matches in document
 # order.
@@ -38,8 +38,12 @@ def parse_page(job: ParseJob, ctx: WorkerContext) -> ParseResult:
         if url not in seen:
             seen.add(url)
             printed.append(url)
-    # The dedupe key is the display URL itself. URLs that differ only in percent-encoding,
-    # such as %7E and ~, stay distinct until dedupe_key (DESIGN.md §5.6) merges them.
-    links = [(url, url) for url in printed if url.startswith(ctx.scope_prefixes)]
+    # Both /~a and /%7Ea are printed, as written, but they're one resource to crawl.
+    links: list[tuple[str, str]] = []
+    keys: set[str] = set()
+    for url in printed:
+        if url.startswith(ctx.scope_prefixes) and (key := dedupe_key(url)) not in keys:
+            keys.add(key)
+            links.append((key, url))
     record = "".join([job.url, "\n", *[f"  {url}\n" for url in printed], "\n"]).encode()
     return ParseResult(record=record, links=links, links_found=len(printed))

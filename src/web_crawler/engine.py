@@ -19,7 +19,7 @@ from web_crawler.parse import parse_page
 from web_crawler.stats import Stats
 from web_crawler.transport import AiohttpTransport, Transport
 from web_crawler.types import CrawlItem, ExitCode, WorkerContext
-from web_crawler.urls import Scope, normalize_start
+from web_crawler.urls import Scope, dedupe_key, normalize_start
 
 log = logging.getLogger(__name__)
 
@@ -100,7 +100,7 @@ class _Dispatcher:
 
     async def run(self, start_url: str) -> ExitCode:
         """Crawl from start_url until nothing is outstanding."""
-        self.admission.admit([(start_url, start_url)], depth=0)
+        self.admission.admit([(dedupe_key(start_url), start_url)], depth=0)
         start = self.frontier.pop()
         assert start is not None
         # The start URL is fetched on its own: if it isn't a page, there's no crawl.
