@@ -2,7 +2,7 @@
 
 A fast, accurate and polite web crawler for the command line, written in Python. Give it a start URL and it crawls that host, printing each page's URL followed by every link found on the page.
 
-> **Status: design stage.** [DESIGN.md](DESIGN.md) is the proposed design; the crawler itself isn't implemented yet. The measurements behind the design can be reproduced with the scripts in [`bench/`](bench/).
+> **Status: design stage.** [DESIGN.md](DESIGN.md) is the proposed design, and [docs/implementation-plan.md](docs/implementation-plan.md) is the plan for building v1; the crawler itself isn't implemented yet. The measurements behind the design can be reproduced with the scripts in [`bench/`](bench/).
 
 ## Planned usage
 
