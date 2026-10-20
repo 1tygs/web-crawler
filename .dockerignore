@@ -1,0 +1,9 @@
+# The image is built from these alone: the rest, the virtual environment and caches
+# included, stays out of the build context.
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!LICENSE
+!src/
+**/__pycache__
