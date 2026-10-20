@@ -203,13 +203,13 @@ Few sites will serve one client thousands of pages per second. The crawler's cei
 ### 5.2 Fetcher and transport
 
 **Transport** opens one HTTP exchange as a handle: status, headers and time to first byte arrive first, and the body is read only if the fetcher asks for it ([§6.2](#62-internal-contracts)). It sits behind a `Transport` protocol so it can be swapped:
-- An aiohttp `ClientSession` with `TCPConnector(limit = limit_per_host = max_concurrency, ttl_dns_cache = 300, keepalive_timeout = 30)`. Happy eyeballs is on by default.
+- An aiohttp `ClientSession` with `TCPConnector(limit = limit_per_host = max_concurrency + 4, ttl_dns_cache = 300, keepalive_timeout = 30)`. The four extra connections serve requests the dispatcher doesn't count, such as robots.txt refetches and health probes. Happy eyeballs is on by default.
 - `auto_decompress=False`, with `Accept-Encoding: gzip, deflate, br, zstd`, exactly the encodings the workers can decode. zstd comes from the 3.14 standard library.
 - `Accept: text/html,application/xhtml+xml;q=0.9,*/*;q=0.8` and an honest User-Agent, e.g. `web-crawler/1.0 (+https://github.com/<you>/web-crawler)`.
 - Timeouts: connect 10 s, read 20 s, total 60 s.
 - TLS verification on; `--insecure` turns it off for dev hosts.
 - Cookie jar on, so cookie-gated redirects resolve as they would in a browser.
-- Proxies are taken from the environment.
+- Proxies are taken from the environment (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`) and read once. aiohttp's own `trust_env` re-reads them, and `~/.netrc`, on a thread for every request. That costs 162.5 µs of CPU per request against 26.9 µs (A.4), and it would send `~/.netrc` credentials to the crawled host.
 
 **Fetcher** is the crawl logic on top of the transport:
 - **Manual redirects.** `allow_redirects=False`, then a loop of up to 10 hops. Each hop is resolved with ada-url, scope-checked, admitted (robots and traps; same depth) and checked for loops. aiohttp's automatic redirects would fetch off-host targets, breaking F3, and would re-fetch pages other tasks have already claimed. The start URL's own redirects are resolved before the scope is fixed ([§2.4](#24-how-ambiguous-requirements-are-read)).
@@ -742,6 +742,16 @@ Loopback, 64 concurrent requests, a 52 KB page served gzipped (9.7 KB), 20,000 r
 | httpx 0.28.1 | 950 | 729.2 µs |
 
 Requests/s on loopback also depends on the local test server (six processes). CPU per request is the figure to compare.
+
+`trust_env=True`, which takes proxy settings and `~/.netrc` credentials from the environment, adds two thread round trips to every request in aiohttp 3.14.5: one to read `~/.netrc`, one to look up the proxy. Measured the same way on 2026-10-20 (`client_bench.py` with `+env`), with a synthetic 48 KB page (3.8 KB gzipped), median of three runs:
+
+| Client | Requests/s | Client CPU per request |
+|---|---|---|
+| aiohttp + uvloop, `auto_decompress=False` | 37,006 | 26.9 µs |
+| The same with `trust_env=True` | 8,415 | 162.5 µs |
+| The same with `trust_env=True` and `NO_PROXY=*` | 13,719 | 83.1 µs |
+
+With `NO_PROXY=*` set, Python doesn't read macOS's system proxy settings, which is closer to what Linux pays. The transport reads the proxy variables once instead ([§5.2](#52-fetcher-and-transport)).
 
 **A.5 URL resolution against the base `https://example.com/dir/page.html`**
 

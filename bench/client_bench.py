@@ -2,6 +2,7 @@
 
 Usage: python bench/client_bench.py CLIENT CONCURRENCY TOTAL   (with bench/server.py running)
 CLIENT: aiohttp | aiohttp+uvloop | aiohttp+uvloop+raw | httpx | curl_cffi | niquests
+        add +env to an aiohttp client for trust_env=True (proxies and ~/.netrc from the environment)
 """
 import asyncio, sys, time, resource
 
@@ -23,9 +24,9 @@ async def drive(fetch):
 async def main():
     if NAME.startswith("aiohttp"):
         import aiohttp
-        raw = "raw" in NAME
+        raw = "raw" in NAME; env = "env" in NAME
         conn = aiohttp.TCPConnector(limit=CONC, limit_per_host=CONC, ttl_dns_cache=300)
-        async with aiohttp.ClientSession(connector=conn, auto_decompress=not raw) as s:
+        async with aiohttp.ClientSession(connector=conn, auto_decompress=not raw, trust_env=env) as s:
             async def fetch(u):
                 async with s.get(u) as r: return len(await r.read())
             await fetch(URL + "warm")
