@@ -48,6 +48,6 @@ From the simulation in DESIGN.md A.11 (`bench/limiter_sim.py`, 3 seeds of 20,000
 
 ## Action items
 
-1. [ ] Implement the law as a class with no I/O in `src/web_crawler/limiter.py`.
-2. [ ] Turn the scenarios in `bench/limiter_sim.py` into `tests/unit/test_limiter.py`, asserting that D stays within 15% of B's crawl time where the server has spare capacity, and under half of B's queueing on the small origin.
+1. [x] Implement the law as a class with no I/O in `src/web_crawler/limiter.py`. Done in step 3 of v1: `ConcurrencyLaw`, which also cuts once per congestion event (DESIGN.md §5.3).
+2. [x] Turn the scenarios in `bench/limiter_sim.py` into `tests/unit/test_limiter.py`, asserting that D stays within 15% of B's crawl time where the server has spare capacity, and under half of B's queueing on the small origin. Done in step 3: the tests load the simulator, which runs the production class, on every seed, and add an origin that answers 429 above 20 requests in flight (DESIGN.md A.11).
 3. [ ] Log every decision at `-v`, and check the thresholds against real crawls.
