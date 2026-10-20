@@ -32,7 +32,7 @@ Checked on 2026-10-20 against the versions pinned in Appendix A (Python 3.14.6, 
 | yarl, which aiohttp uses for URLs, rewrites them by default: `?b=%2f` becomes `?b=/`, `%7E` becomes `~`, `/a/%2E%2E/b` resolves to `/b`, and `%zz` becomes `%25zz` | The transport passes `yarl.URL(url, encoded=True)`, so the request line is the WHATWG string byte for byte. An integration test asserts that the server sees exactly the printed URL |
 | aiohttp closes a connection, rather than pooling it, when the response body wasn't read to EOF (`ResponseHandler.should_close`) | DESIGN §6.2's "reuse only if read to the end" holds when the response context exits through `release()` |
 | aiohttp's default header limits are 8,190-byte lines and fields and 128 headers | Raised to 64 KiB, 64 KiB and 256 (`max_line_size`, `max_field_size`, `max_headers`), so a huge `Set-Cookie` or CSP header doesn't fail a page |
-| aiohttp exposes connection set-up timing only through `TraceConfig` (`on_connection_create_end`, `on_connection_queued_end`) | Time to first byte is measured from connection-ready (A.12's method). The trace's overhead is gated in PR 3 |
+| aiohttp exposes connection set-up timing only through `TraceConfig` (`on_connection_create_end`, `on_connection_queued_end`) | Time to first byte is measured from connection-ready (A.12's method). The trace's overhead is gated in PR 3; see PR 3's finding below |
 | aiohttp connects to the port in its resolver's result | A test resolver maps `example.test:80` and `:443` to local ports, so default-port scope, http↔https and apex→`www` run end to end without root |
 | selectolax parses `bytes` as UTF-8, and `scripting=False` (`<noscript>` parsed as markup) is the default. `encoding=True` detection falls back to UTF-8, not windows-1252 | UTF-8 pages go in as bytes; other charsets are decoded by our code (§5.4). lexbor's own detection stays off |
 | `<a href>` (no value) yields `None`; `href=""` yields `''` | `None` is treated as `""`: both resolve to the document's URL |
@@ -53,6 +53,13 @@ Checked on 2026-10-20 against the versions pinned in Appendix A (Python 3.14.6, 
 | Protego has `can_fetch`, `crawl_delay`, `request_rate` and `sitemaps`, and matches percent-encoding equivalents (`/~j` against `/%7Ej`) | Paths need no normalization before `can_fetch` |
 | Found in PR 1: aiohttp's `trust_env=True` reads `~/.netrc` and looks up the proxy on a thread for every request, 162.5 µs of CPU per request against 26.9 µs (DESIGN A.4), and sends `~/.netrc` credentials to the crawled host | `trust_env=False`. The transport reads `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY` once |
 | Found in PR 1: aiohttp 3.14 deprecates `proxy_auth`, but the `proxy_headers` it recommends instead reach the proxy only on the CONNECT that tunnels `https://` | Proxy credentials go on the request itself for `http://`, and in `proxy_headers` for `https://` |
+| Found in PR 3: with any `TraceConfig`, aiohttp builds a trace object for every request and sends it every event, however few have handlers: 8.3 µs of CPU per request (DESIGN A.4). The connector's `connect()` runs in the task that makes the request | The trace fails its 5 µs gate. A `TCPConnector` subclass notes connection-ready in `connect()` and passes it on through a context variable, for 1.3 µs; the fallback that drops new connections' samples isn't needed |
+| Found in PR 3: on a broken pool, `ProcessPoolExecutor` stops the other workers with SIGTERM and waits for them. A worker blocked on its call queue holds both ends of it, so it waits for ever once the coordinator dies | Workers ignore SIGINT only; SIGTERM keeps its default. Each worker exits when its parent does |
+| Found in PR 3: a forkserver's workers import the main module themselves unless the forkserver has preloaded it, and the `crawl` script imports the whole crawler: 140–190 ms and 45 MiB per worker, against 3 ms and 15 MiB (DESIGN A.9) | `set_forkserver_preload(["__main__", "web_crawler.pool"])` |
+| Found in PR 3: MIME Sniffing's resource header is 1,445 bytes, and `X-Content-Type-Options: nosniff` rules out sniffing a missing type as HTML | The fetcher decompresses the first 1,445 bytes to sniff, and honours nosniff |
+| Found in PR 3: Python's brotli binding rejects bytes after the end of a stream, output and all, where Chrome ignores them. Chrome and Firefox read only the first member of a gzip body and skip its CRC; Firefox skips codings it doesn't know and undoes at most 16 | `decode_body` finds the end of a brotli stream by bisection when decoding fails; reads every gzip member, as RFC 1952 has it, and lets zlib check the CRC; skips unknown codings; refuses more than 16 |
+| Found in PR 3: aiohttp's headers give only the first value of a field sent twice | The transport joins a repeated field's values with ", " (RFC 9110 §5.3), so two Content-Encoding fields stack |
+| Found in PR 3: per-link calls to small helpers cost MDN's 376 links 11–12% over the A.2 prototype | `parse.py` strips fragments and takes the dedupe key's fast path inline, and keeps each URL's first occurrence with one dict operation: within 10% on every page (DESIGN A.2) |
 
 ## 3. Repository layout and tooling
 
@@ -100,7 +107,7 @@ This differs from DESIGN §12 only by splitting existing boxes:
 - `requires-python = ">=3.14"`.
 - Runtime dependencies have floors at the Appendix A versions and caps below the next major: aiohttp, uvloop (`sys_platform != 'win32'`), selectolax, ada-url, protego, brotli, orjson. Exact versions live in `uv.lock`.
 - `dev` group: pytest, pytest-asyncio (`asyncio_mode = "auto"`), hypothesis (a derandomized CI profile), coverage, mypy, ruff, trustme (TLS certificates for the test servers), pre-commit.
-- `bench` group: lxml, beautifulsoup4, httpx, curl_cffi, niquests, yarl. This replaces `bench/requirements.txt` in PR 3, when the benches start importing the package; the README's bench commands change to `uv run --group bench …`.
+- `bench` group: lxml, beautifulsoup4, httpx, curl_cffi, niquests, yarl. It replaced `bench/requirements.txt` in PR 3, when the benches started importing the package; the README's bench commands are `uv run --group bench …`.
 - Ruff: line length 100; rule sets E, F, W, I, B, UP, SIM, RUF, ASYNC, PERF, PT and PL, with test-only exemptions for magic values and argument counts.
 - mypy: `strict = true`, `mypy_path = "typings"`.
 - Coverage: branch coverage, `concurrency = ["thread", "multiprocessing"]`. `fail_under` starts at what PR 1 reaches and rises to 90 by PR 5.
@@ -154,7 +161,7 @@ class ParseResult(NamedTuple):
     links: list[tuple[str, str]]          # in-scope (key, url), unique by key, in document order
     links_found: int                      # links printed on the page, for stats
     decoded_bytes: int                    # for stats: wire vs decoded
-    error: str | None                     # e.g. "bad_encoding": deterministic, so final
+    error: str | None                     # e.g. "bad content-encoding": deterministic, so final
 
 @dataclass(frozen=True, slots=True)
 class WorkerContext:                      # sent once, through the pool initializer
@@ -225,9 +232,9 @@ class WorkerContext:                      # sent once, through the pool initiali
 
 ### 5.5 `parse.py`: the worker
 
-`parse_page(job, ctx) -> ParseResult` takes the `WorkerContext` as an argument, so it stays pure and the inline path needs no global (a refinement made in PR 1). In the pool, `init_worker(ctx)` stores the context in a module global, sets SIGINT and SIGTERM to ignored, then unblocks them (DESIGN §4.3), and each job runs a module-level wrapper that calls `parse_page(job, ctx)`, so the context still crosses to a worker only once. `parse_page`:
+`parse_page(job, ctx) -> ParseResult` takes the `WorkerContext` as an argument, so it stays pure and the inline path needs no global (a refinement made in PR 1). In the pool, `init_worker(ctx)` stores the context in a module global, sets SIGINT to ignored, then unblocks it (DESIGN §4.3); SIGTERM keeps its default, and a thread exits the worker when its parent does (§2). Each job runs a module-level wrapper that calls `parse_page(job, ctx)`, so the context still crosses to a worker only once. `parse_page`:
 
-1. `decode_body(job.body, job.content_encoding, ctx.max_bytes)`. On `ContentDecodeError`, return `ParseResult(b"", [], 0, 0, "bad_encoding")`.
+1. `decode_body(job.body, job.content_encoding, ctx.max_bytes)`. On `ContentDecodeError`, return `ParseResult(b"", [], 0, 0, "bad content-encoding")`.
 2. `pick_charset`. UTF-8 goes to lexbor as bytes, with no copy and without a BOM; other charsets go as `encodings.decode(body, encoding)`. If the charset is tentative and the page's first declaring `<meta>` names another encoding, decode and parse again in that one.
 3. `LexborHTMLParser(html)`, with scripting off (the default).
 4. **Base URL:** the first `base[href]`, resolved against `job.url`. It's ignored if resolution fails or gives `data:` or `javascript:` (HTML standard).
@@ -297,7 +304,7 @@ Golden fixtures (`tests/fixtures/parse/*.html` with expected JSON) cover:
   - A congestion signal cuts only if its request was issued after the last cut: one cut per congestion event, the exact form of "once per RTT" (§9). A cut ends slow start, cancels a probe and discards the partial round.
   - Both methods return a `Decision` (grow, hold, slow-start exit, probe start, probe verdict, cut), so the engine logs it at `-v` and tests assert on it.
   - Samples come from responses with status below 500, excluding 429.
-- **`PauseGate`**: the Retry-After pause (the later of the current and new pause, capped at 300 s), plus the rate ceiling. Each request start sets the next allowed start to now + 1/rate, with rate = min(`--max-rps`, 1/Crawl-delay). That spaces requests evenly, with no bursts.
+- **`PauseGate`**: the Retry-After pause (the later of the current and new pause, capped at 300 s), plus the rate ceiling. PR 3 built the rate ceiling; the pause comes with PR 4's retries. Each request start sets the next allowed start to now + 1/rate, with rate = min(`--max-rps`, 1/Crawl-delay). That spaces requests evenly, with no bursts.
 - **`CircuitBreaker`**: opens after 20 consecutive connection-level failures (DNS, connect, TLS, connect timeout). Health probes back off from 1 s to 60 s, and any HTTP response closes it. If it stays open for 5 minutes, the crawl aborts with exit 4. While it's open, connection failures don't use up the items' retry budgets.
 - **`BlockGuard`** (the 403 rule) counts consecutive 403s after at least one page. A 403'd item is held while the run is under 20: it stays outstanding, so `--max-depth` stays exact and a URL that's requeued never gets two records (§9). A run is settled in one of three ways:
   - by a non-403 response: the held items become final;
@@ -335,7 +342,7 @@ Golden fixtures (`tests/fixtures/parse/*.html` with expected JSON) cover:
   - `ssl=False` under `--insecure`;
   - `resolver` and `ssl_context` arguments exist for tests only.
 - **Error mapping.** aiohttp's exceptions become `TransportError(kind)`, so nothing above this module imports aiohttp. The kinds are DNS, CONNECT, TLS, CONNECT_TIMEOUT, TIMEOUT, RESET, PAYLOAD (cut off mid-body), PROTOCOL and INVALID_URL.
-- **TTFB** is header time minus the later of request start and connection-ready time; the trace sets connection-ready.
+- **TTFB** is header time minus the later of request start and connection-ready time; the connector sets connection-ready (§2).
 
 ### 5.11 `fetcher.py`
 
@@ -355,13 +362,13 @@ It loops over at most 10 hops. Each iteration opens the request, feeds the limit
 ### 5.12 `pool.py`: parse gateway
 
 - **Worker count.** `auto` is `max(0, n − 1)`, where n is `os.process_cpu_count()`. Unless `PYTHON_CPU_COUNT` or `-X cpu_count` is set, n is also capped by the cgroup quota: v2 `cpu.max`, read up the process's cgroup path, or v1 `cfs_quota_us/cfs_period_us`. A count of 0 means parse inline.
-- **Start method.** forkserver on Linux with `set_forkserver_preload(["web_crawler.parse"])`, so workers start with lexbor and ada-url already imported; spawn elsewhere.
-- **Submit.** `submit()` runs under `pthread_sigmask(SIG_BLOCK, {SIGINT, SIGTERM})`, restored in `finally`, and is awaited through `asyncio.wrap_future`.
+- **Start method.** forkserver on Linux with `set_forkserver_preload(["__main__", "web_crawler.pool"])`, so workers start with the crawler, lexbor and ada-url already imported (§2); spawn elsewhere.
+- **Submit.** `submit()` runs under `pthread_sigmask(SIG_BLOCK, {SIGINT})`, restored in `finally`, and is awaited through `asyncio.wrap_future`.
 - **Crash isolation (DESIGN §5.4).**
   - The gateway keeps a pool generation number. A `BrokenProcessPool` rebuilds the pool once per generation and resubmits the job, without using up retries.
   - A job that breaks the pool twice runs alone in a one-worker isolation pool. Suspects go one at a time while normal traffic continues.
   - If it breaks that pool too, it raises `ParseCrashed`, a final parse error for that page only.
-- **`close(kill=False)`.** `shutdown(wait=True)`, or `kill_workers()` when `kill=True`.
+- **`close()` and `kill()`.** `close()` runs `shutdown(wait=True)` on a thread, after the submitted parses; `kill()` calls `kill_workers()`, for the second Ctrl-C.
 - **When the pool is created.** Once the scope is fixed after the start URL's redirects, because the initializer carries the scope prefixes (§9).
 
 ### 5.13 `output.py`
@@ -479,6 +486,8 @@ Branches `v1/1-skeleton` through `v1/5-limits-output`, each based on the one bef
 - The trace adds at most 5 µs per request. If it costs more, TTFB falls back to marking samples from new connections, which then count only when a round has no other samples.
 - The full worker pipeline stays within 10% of A.2 on the same pages.
 
+**Measured:** the trace cost 8.3 µs; the connector times connection-ready for 1.3 µs instead, so the fallback wasn't needed (§2). The pipeline came within 10% of the A.2 prototype on every page, 1.1% slower over all twenty page and encoding pairs (DESIGN A.2). A 50,000-page crawl at 50 ms ran at 1,096 pages/s for 268 µs of coordinator CPU per page and 67 MiB (DESIGN A.15), the baseline for PR 5's gates.
+
 ### PR 4: Robustness
 1. `retry.py` and the retry heap, with backoff.
 2. The 429/503 budget and the Retry-After pause.
@@ -528,7 +537,7 @@ Each lands in the PR that implements it:
 
 ## 10. Risks and open questions
 
-- **Trace overhead** is unmeasured. PR 3 measures it, and the fallback is already defined.
+- **Trace overhead** was 8.3 µs per request in PR 3, over its gate; the connector gives connection-ready for 1.3 µs instead (§2).
 - **Windows** has no CI: no uvloop, and signal handling is best effort.
 - **Multi-byte legacy decoders.** Python's codecs for Big5, gb18030, EUC-JP and ISO-2022-JP differ from the standard's on a few hundred rare characters (DESIGN A.14). This affects only hrefs that contain those characters unescaped. Single-byte encodings, including windows-1252, decode exactly since PR 2.
 - **Legacy-encoded query strings** behave as described in DESIGN §13.

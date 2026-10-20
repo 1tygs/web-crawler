@@ -7,7 +7,7 @@
 
 A fast, accurate and polite web crawler for the command line, written in Python. Give it a start URL and it crawls that host, printing each page's URL followed by every link found on the page.
 
-> **Status: in development, step 2 of the 5 in [the v1 plan](docs/implementation-plan.md), plus `--max-pages` and a clean Ctrl-C.** `crawl URL` crawls the start URL's host breadth-first, eight requests at a time, and prints each page's links as a browser resolves them: in the page's charset, against its `<base href>`, from declarative shadow DOM and meta refresh too, and with `--all-urls` every URL-bearing attribute. It obeys robots.txt (RFC 9309), fetches each page once however many links and redirects lead to it, and follows a start URL's redirect to its `www.` host. `--max-pages` bounds a crawl, and Ctrl-C stops one cleanly. Speed, robustness, and the other limits and output options come in the next three steps; until then [DESIGN.md](DESIGN.md) describes more than the code does. The measurements behind the design can be reproduced with the scripts in [`bench/`](bench/).
+> **Status: in development, step 3 of the 5 in [the v1 plan](docs/implementation-plan.md), plus `--max-pages` and a clean Ctrl-C.** `crawl URL` crawls the start URL's host breadth-first and prints each page's links as a browser resolves them: in the page's charset, against its `<base href>`, from declarative shadow DOM and meta refresh too, and with `--all-urls` every URL-bearing attribute. It keeps as many requests in flight as the server sustains, adapting to its response times and halving on signs of distress ([ADR-001](docs/adr/001-concurrency-control.md)), and parses pages in a pool of processes, decompressing them there. It obeys robots.txt (RFC 9309) and its `Crawl-delay`, fetches each page once however many links and redirects lead to it, and follows a start URL's redirect to its `www.` host. `--max-pages` bounds a crawl, and Ctrl-C stops one cleanly. Robustness, with retries and `Retry-After`, and the other limits and output options come in the next two steps; until then [DESIGN.md](DESIGN.md) describes more than the code does. The measurements behind the design can be reproduced with the scripts in [`bench/`](bench/).
 
 ## Usage
 
@@ -32,20 +32,22 @@ https://example.com/about
 - Only the start URL's exact host is crawled (after following a redirect that only adds or removes `www.`). Links to other domains and to subdomains are printed but never fetched.
 - Results stream to stdout as pages complete, and a short summary goes to stderr at the end.
 - `--max-pages N` stops once N pages are printed: exactly N records, or fewer if the site is smaller. A fetch starts only while pages printed plus fetches in flight is below N, so no page is fetched only to be thrown away.
-- Ctrl-C (SIGINT) or SIGTERM stops the crawl cleanly: no more fetches start, those in flight are cancelled, only whole records reach stdout, and the summary still goes to stderr. The exit code is 130 for SIGINT and 143 for SIGTERM. A second Ctrl-C exits at once.
+- `--max-concurrency N` caps the requests in flight, 64 by default; below it, the crawl finds what the server sustains. `--max-rps R` starts at most R requests a second, evenly spaced; a robots.txt `Crawl-delay` can lower that.
+- `--parse-workers N` sets how many processes parse pages: `auto`, the default, is one fewer than the CPUs, within a container's CPU quota, and 0 parses in the crawler's own process.
+- Ctrl-C (SIGINT) or SIGTERM stops the crawl cleanly: no more fetches start, those in flight are cancelled, pages already being parsed are printed, only whole records reach stdout, and the summary still goes to stderr. The exit code is 130 for SIGINT and 143 for SIGTERM. A second Ctrl-C exits at once.
 - Planned: `--format jsonl` gives machine-readable output, and `--max-depth` bounds the crawl by depth.
 
-`crawl --help` lists the options built so far: `--max-pages`, `--all-urls`, `--ignore-robots`, `--strict-host`, `--user-agent` and `--insecure`. [DESIGN.md §6.1](DESIGN.md#61-command-line) lists every v1 option and exit code, including those still to come.
+`crawl --help` lists the options built so far: `--max-pages`, `--max-concurrency`, `--max-rps`, `--parse-workers`, `--all-urls`, `--ignore-robots`, `--strict-host`, `--user-agent` and `--insecure`. [DESIGN.md §6.1](DESIGN.md#61-command-line) lists every v1 option and exit code, including those still to come.
 
 ## Design in brief
 
-This describes the full v1 design. The speed and robustness parts land in steps 3 and 4 of [the plan](docs/implementation-plan.md); until then the crawler parses inline at a fixed eight requests in flight and doesn't retry.
+This describes the full v1 design. Its robustness parts land in step 4 of [the plan](docs/implementation-plan.md); until then a failed request isn't retried, and `Retry-After` isn't honoured.
 
 - **Fast.** One asyncio (uvloop) coordinator owns all crawl state and does only cheap work. A process pool parses response bodies while they're still compressed. An adaptive concurrency limit runs close to what the server can sustain: it halves on 429/503 and timeouts, honours `Retry-After`, and stops growing when a probe confirms the server is queueing ([ADR-001](docs/adr/001-concurrency-control.md)).
 - **Accurate.** Links are resolved as a browser resolves them: HTML5 parsing (selectolax/lexbor), WHATWG URLs (ada-url), `<base href>`, the final URL after redirects, and declarative shadow DOM. Each page is fetched exactly once (redirect-aware dedupe against an exact set), transient failures are retried, and every skipped URL is counted.
 - **Polite.** robots.txt per RFC 9309, `Crawl-delay`, and an honest User-Agent.
 
-Measured on an Apple M5 with the prototypes in `bench/`, the full parse pipeline costs 0.4–2.8 ms per real page and eight parser processes handle about 2,900 pages/s, so the target server, not the crawler, sets the pace.
+Measured on an Apple M5, the crawler's parse pipeline costs 0.4–2.7 ms per real page and eight parser processes handle about 2,800 pages/s, so the target server, not the crawler, sets the pace.
 
 Requires Python 3.14 or later. No JavaScript runs, so links created only by client-side rendering aren't seen; see [limitations](DESIGN.md#13-limitations-risks-and-what-to-revisit).
 
@@ -58,7 +60,7 @@ The brief asks which tools were used, including AI, and how the work was checked
 - **Editor.** Cursor for diff review and small manual changes without AI.
 - **AI tools.**
   - **Claude Code**, Anthropic's coding agent, in the Claude desktop app with Claude Opus 5.5. The first draft of the design came from a session that started from the brief through the `system-design` skill of Anthropic's engineering plugin. It installed candidate libraries in a scratch virtual environment, then wrote and ran the benchmarks for HTML parsers, URL resolution, HTTP clients, the parse pipeline, robots.txt matching and memory per URL on the development machine. It picked each technology from those results and wrote DESIGN.md with the scripts moved into `bench/`. Separate short sessions wrote the README and set up the public repository and licence. In a review session it reviewed the design against this brief, wrote and ran the checks and simulations in Appendix A.9–A.13, and applied the resulting changes to DESIGN.md, including [ADR-001](docs/adr/001-concurrency-control.md).
-  - **Implementation.** A planning session checked each library's behaviour against the pinned versions and wrote [docs/implementation-plan.md](docs/implementation-plan.md). Separate Claude Code sessions then built the steps from it, one pull request each ([#2](https://github.com/1tygs/web-crawler/pull/2), [#4](https://github.com/1tygs/web-crawler/pull/4), [#5](https://github.com/1tygs/web-crawler/pull/5)), each with its tests, and each merged only once CI passed: ruff, mypy --strict and the tests on Linux and macOS.
+  - **Implementation.** A planning session checked each library's behaviour against the pinned versions and wrote [docs/implementation-plan.md](docs/implementation-plan.md). Separate Claude Code sessions then built the steps from it, one pull request each ([#2](https://github.com/1tygs/web-crawler/pull/2), [#4](https://github.com/1tygs/web-crawler/pull/4), [#5](https://github.com/1tygs/web-crawler/pull/5), [#7](https://github.com/1tygs/web-crawler/pull/7)), each with its tests, and each merged only once CI passed: ruff, mypy --strict and the tests on Linux and macOS.
 - **Checking AI output.** Claims were tested rather than taken on trust, and the scripts that test them are kept in `bench/`. The review's simulations rejected the first draft's limiter law and its `--max-depth` rules, and caught a bug in the review's own first proposal for the limiter; re-running a real-site measurement changed one of its numbers (A.12).
 
 ## Development
@@ -75,40 +77,44 @@ CI runs the same targets on Linux and macOS for every pull request.
 
 ## Benchmarks
 
-The scripts in `bench/` produce the measurements in [DESIGN.md Appendix A](DESIGN.md#appendix-a-measurements). They need [uv](https://docs.astral.sh/uv/), Python 3.14, and macOS or Linux.
+The scripts in `bench/` produce the measurements in [DESIGN.md Appendix A](DESIGN.md#appendix-a-measurements). They need [uv](https://docs.astral.sh/uv/), and macOS or Linux. They run in the project's environment with uv's `bench` dependency group, which adds the libraries the crawler was compared with:
 
 ```bash
-uv venv --python 3.14
-source .venv/bin/activate
-uv pip install -r bench/requirements.txt
+uv run --group bench python bench/limiter_sim.py
 ```
 
-Most scripts read a folder of saved HTML pages. These aren't committed because they're third-party content, so save your own:
+Most scripts read a folder of saved HTML pages. These aren't committed because they're third-party content, so save your own, with the headers each was served with, which give its charset. Appendix A used these five, fetched on 2026-10-20:
 
 ```bash
 mkdir -p bench/fixtures
-curl --compressed -o bench/fixtures/python.html https://www.python.org/
+cd bench/fixtures
+curl --compressed -D python.headers -o python.html https://www.python.org/
+curl --compressed -D docs.headers -o docs.html https://docs.python.org/3/library/asyncio-eventloop.html
+curl --compressed -D mdn.headers -o mdn.html https://developer.mozilla.org/en-US/docs/Web/HTML
+curl --compressed -D wikipedia.headers -o wikipedia.html https://en.wikipedia.org/wiki/Web_crawler
+curl --compressed -D guardian.headers -o guardian.html https://www.theguardian.com/international
 ```
 
+Each command runs as `uv run --group bench python bench/SCRIPT …`:
 
-| Command                                         | Measures                                                                               | Appendix |
-| ----------------------------------------------- | -------------------------------------------------------------------------------------- | -------- |
-| `python bench/parse_bench.py bench/fixtures`    | Link extraction: lexbor vs lxml, html.parser and BeautifulSoup                         | A.1      |
-| `python bench/pipeline_bench.py bench/fixtures` | Full parse pipeline per page; coordinator throughput with 0–8 parser processes         | A.2, A.3 |
-| `python bench/client_bench.py CLIENT 64 20000`  | HTTP client CPU per request                                                            | A.4      |
-| `python bench/url_bench.py bench/fixtures`      | URL resolution: `urljoin` vs yarl vs ada-url                                           | A.5      |
-| `python bench/robots_bench.py bench/fixtures`   | robots.txt matching: Protego vs `urllib.robotparser`                                   | A.6      |
-| `python bench/memory_bench.py`                  | Memory per URL in the seen set and frontier                                            | A.7      |
-| `python bench/pool_check.py MODE`               | Process pool: on-demand workers, what one crash takes down, Ctrl-C while workers start | A.9      |
-| `python bench/depth_sim.py`                     | `--max-depth` rules against breadth-first-search ground truth, in simulation           | A.10     |
-| `python bench/limiter_sim.py`                   | Concurrency laws on simulated servers                                                  | A.11     |
-| `python bench/ttfb_spread.py URL`               | How widely a real site's response times spread                                         | A.12     |
-| `uv run python bench/encoding_check.py INDEXES` | The crawler's legacy decoders against the Encoding Standard's indexes                  | A.14     |
+| Script and arguments                | Measures                                                                                       | Appendix |
+| ----------------------------------- | ---------------------------------------------------------------------------------------------- | -------- |
+| `parse_bench.py bench/fixtures`     | Link extraction: lexbor vs lxml, html.parser and BeautifulSoup                                 | A.1      |
+| `pipeline_bench.py bench/fixtures`  | The crawler's parse pipeline per page; the coordinator with 0–8 parser processes               | A.2, A.3 |
+| `client_bench.py CLIENT 64 20000`   | HTTP client CPU per request                                                                    | A.4      |
+| `url_bench.py bench/fixtures`       | URL resolution: `urljoin` vs yarl vs ada-url                                                   | A.5      |
+| `robots_bench.py bench/fixtures`    | robots.txt matching: Protego vs `urllib.robotparser`                                           | A.6      |
+| `memory_bench.py`                   | Memory per URL in the seen set and frontier                                                    | A.7      |
+| `pool_check.py MODE`                | Process pool: on-demand workers, what one crash takes down, Ctrl-C while workers start         | A.9      |
+| `depth_sim.py`                      | `--max-depth` rules against breadth-first-search ground truth, in simulation                   | A.10     |
+| `limiter_sim.py`                    | Concurrency laws, the crawler's among them, on simulated servers                               | A.11     |
+| `ttfb_spread.py URL`                | How widely a real site's response times spread                                                 | A.12     |
+| `encoding_check.py INDEXES`         | The crawler's legacy decoders against the Encoding Standard's indexes                          | A.14     |
+| `e2e.py`                            | A whole crawl of 50,000 synthetic pages at 50 ms: pages/s, coordinator CPU per page, peak RSS  | A.15     |
 
-
-- `client_bench.py` needs `python bench/server.py PAGE.html` running in another shell; it serves that page on 127.0.0.1:8899. `CLIENT` is one of `aiohttp`, `aiohttp+uvloop`, `aiohttp+uvloop+raw` (no decompression), `curl_cffi`, `niquests` or `httpx`. Adding `+env` to an aiohttp client turns on `trust_env`.
+- `client_bench.py` needs `uv run --group bench python bench/server.py PAGE.html` running in another shell; it serves that page, gzipped, on 127.0.0.1:8899. `CLIENT` is one of `aiohttp`, `aiohttp+uvloop`, `aiohttp+uvloop+raw` (no decompression), `curl_cffi`, `niquests` or `httpx`. Adding `+env` to an aiohttp client turns on `trust_env`; `+trace` times each response through aiohttp's `TraceConfig`, and `+ready` as the crawler's transport does.
 - `robots_bench.py` expects `wikipedia.html` and `wikipedia.robots.txt` from en.wikipedia.org, and `guardian.html` and `guardian.robots.txt` from [www.theguardian.com](http://www.theguardian.com).
-- `pool_check.py` takes a `MODE` of `ondemand`, `crash` or `sigint`, and `--method spawn` or `--method forkserver`. It and the two simulations use only the standard library.
+- `pool_check.py` takes a `MODE` of `ondemand`, `crash` or `sigint`, and `--method spawn` or `--method forkserver`. It and `depth_sim.py` use only the standard library.
 - `ttfb_spread.py` needs curl, and sends about 40 requests, one at a time, to the site you give it.
-- `encoding_check.py` imports the crawler, so it runs in the project's environment through `uv run`. `INDEXES` is the Encoding Standard's [`indexes.json`](https://github.com/whatwg/encoding/blob/main/indexes.json).
-
+- `encoding_check.py`'s `INDEXES` is the Encoding Standard's [`indexes.json`](https://github.com/whatwg/encoding/blob/main/indexes.json).
+- `e2e.py` starts its own server and runs the crawl in its own process; `--help` lists its settings, and `--json FILE` keeps the results.

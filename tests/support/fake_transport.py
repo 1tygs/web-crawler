@@ -25,6 +25,7 @@ class FakeResponse:
     headers: Mapping[str, str]
     body: bytes
     read_error: ErrorKind | None
+    ttfb: float = 0.0  # the reply's delay
     position: int = 0  # how far the body has been read
 
     async def read(self, limit: int) -> tuple[bytes, bool]:
@@ -68,7 +69,9 @@ class FakeTransport:
                 await asyncio.sleep(0)
                 raise TransportError(reply, "scripted")
             await asyncio.sleep(reply.delay)
-            response = FakeResponse(url, reply.status, reply.headers, reply.body, reply.read_error)
+            response = FakeResponse(
+                url, reply.status, reply.headers, reply.body, reply.read_error, reply.delay
+            )
             self.responses.append(response)
             yield response
         finally:

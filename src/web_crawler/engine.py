@@ -2,12 +2,13 @@
 
 crawl() is the one place that builds concrete objects; everything else receives its
 collaborators, so tests can swap in fakes. Start-up settles the start URL, its scope and
-robots.txt before anything else is fetched. Then the dispatcher keeps a fixed number of
-fetches in flight, and parses each page inline on the event loop. The first SIGINT or
-SIGTERM stops it cleanly.
+robots.txt before anything else is fetched. Then the dispatcher keeps as many fetches in
+flight as the adaptive limit allows, and hands each page to the parse gateway: a pool of
+processes, or the event loop itself. The first SIGINT or SIGTERM stops it cleanly.
 """
 
 import asyncio
+import functools
 import logging
 import os
 import random
@@ -16,6 +17,7 @@ import time
 from collections import Counter
 from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
+from http import HTTPStatus
 from types import FrameType
 from typing import Any, NoReturn
 
@@ -24,6 +26,7 @@ from web_crawler.fetcher import (
     AdmissionHops,
     Claimed,
     Fetcher,
+    FetchOutcome,
     Final,
     HopPolicy,
     NotPage,
@@ -31,8 +34,10 @@ from web_crawler.fetcher import (
     RobotsFetcher,
 )
 from web_crawler.frontier import Admission, Frontier, Hop
+from web_crawler.limiter import ConcurrencyLaw, Decision, PauseGate, rate_ceiling
 from web_crawler.output import Sink
-from web_crawler.parse import parse_page
+from web_crawler.pool import ParseCrashed, Parser, worker_count
+from web_crawler.pool import start as start_parser
 from web_crawler.robots import Availability, RobotsPolicy, RobotsTxt, product_token
 from web_crawler.stats import Stats
 from web_crawler.transport import AiohttpTransport, ErrorKind, Transport
@@ -41,9 +46,22 @@ from web_crawler.urls import Scope, dedupe_key, normalize_start
 
 log = logging.getLogger(__name__)
 
-# The adaptive limiter's starting limit (DESIGN.md §5.3), held fixed until the limiter
-# replaces it.
-INITIAL_CONCURRENCY = 8
+# Why a page whose parse crashed its worker, even alone, isn't printed.
+PARSE_CRASHED = "parse crashed"
+
+# What says a server is in distress, or the way to it congested, and cuts the concurrency
+# limit (DESIGN.md §5.3): a refused connection, a timeout, a reset or a body cut off. DNS
+# and TLS failures say nothing about load.
+_THROTTLED = frozenset({HTTPStatus.TOO_MANY_REQUESTS, HTTPStatus.SERVICE_UNAVAILABLE})
+_CONGESTED = frozenset(
+    {
+        ErrorKind.CONNECT,
+        ErrorKind.CONNECT_TIMEOUT,
+        ErrorKind.TIMEOUT,
+        ErrorKind.RESET,
+        ErrorKind.PAYLOAD,
+    }
+)
 
 # Failures to reach a start URL given without a scheme after which http:// might work.
 _HTTPS_FAILURES = frozenset({ErrorKind.CONNECT, ErrorKind.CONNECT_TIMEOUT, ErrorKind.TLS})
@@ -69,16 +87,19 @@ class CrawlReport:
         return self.stats.summary(self.unique_urls, self.finished, self.rejected, self.examples)
 
 
-async def crawl(
+async def crawl(  # noqa: PLR0913  (the collaborators that tests replace)
     cfg: Config,
     sink: Sink,
     *,
     transport: Transport | None = None,
     clock: Callable[[], float] = time.monotonic,
     rng: random.Random | None = None,
+    parser: Callable[[WorkerContext], Parser] | None = None,
 ) -> CrawlReport:
     """Crawl the start URL's host, writing a record per page to sink. A transport passed
-    in stays open; sink is always closed. rng draws the jitter of retries' backoff."""
+    in stays open; sink is always closed. rng draws the jitter of retries' backoff. parser
+    makes the parse gateway, once the scope is known; by default it's a pool of
+    cfg.parse_workers processes."""
     start_url, scheme_was_implicit = normalize_start(cfg.start_url)
     stats = Stats(started=clock())
     frontier = Frontier()
@@ -87,8 +108,14 @@ async def crawl(
     if transport is None:
         transport = AiohttpTransport(cfg)
     robots = None if cfg.ignore_robots else RobotsFetcher(transport, rng=rng or random.Random())
-    fetcher = Fetcher(transport, cfg.max_page_bytes, stats)
+    law = ConcurrencyLaw(cfg.max_concurrency)
+    fetcher = Fetcher(
+        transport, cfg.max_page_bytes, stats, signals=_Limiter(law, clock), clock=clock
+    )
     product = product_token(cfg.user_agent)
+    if parser is None:
+        workers = worker_count(cfg.parse_workers)
+        parser = functools.partial(start_parser, workers=workers)
     start = _Start(
         admission=admission,
         frontier=frontier,
@@ -106,7 +133,12 @@ async def crawl(
         sink=sink,
         stats=stats,
         all_urls=cfg.all_urls,
-        concurrency=min(INITIAL_CONCURRENCY, cfg.max_concurrency),
+        max_bytes=cfg.max_page_bytes,
+        make_parser=parser,
+        law=law,
+        max_concurrency=cfg.max_concurrency,
+        max_rps=cfg.max_rps,
+        clock=clock,
         max_pages=cfg.max_pages,
         robots=robots,
         product=product,
@@ -130,6 +162,29 @@ async def crawl(
     )
 
 
+class _Limiter:
+    """Feeds the concurrency law what the fetcher hears (DESIGN.md §5.3), and logs what it
+    decides. Responses below 500, but for 429, are samples of the server's latency."""
+
+    def __init__(self, law: ConcurrencyLaw, clock: Callable[[], float]) -> None:
+        self._law = law
+        self._clock = clock
+
+    def answered(self, status: int, ttfb: float, issued_at: float) -> None:
+        if status in _THROTTLED:
+            self._decided(self._law.on_congestion(issued_at, self._clock()))
+        elif status < HTTPStatus.INTERNAL_SERVER_ERROR:
+            self._decided(self._law.on_sample(ttfb, issued_at, self._clock()))
+
+    def failed(self, kind: ErrorKind, issued_at: float) -> None:
+        if kind in _CONGESTED:
+            self._decided(self._law.on_congestion(issued_at, self._clock()))
+
+    def _decided(self, decision: Decision | None) -> None:
+        if decision is not None:
+            log.info("concurrency limit: %s", decision)
+
+
 async def _run(
     start: _Start, dispatcher: _Dispatcher, start_url: str, scheme_was_implicit: bool
 ) -> ExitCode:
@@ -142,9 +197,10 @@ class _Interrupts:
     """Stops the crawl cleanly on the first SIGINT or SIGTERM (DESIGN.md §5.9).
 
     Dispatching stops and the crawl's task is cancelled; crawl() then cancels the fetches
-    in flight and closes the sink, so only whole records are printed. A second SIGINT exits
-    at once, even while closing the sink blocks the event loop. A signal the process
-    inherited as ignored stays ignored, as nohup relies on.
+    in flight, lets the parses already submitted finish and print, stops the parser
+    processes and closes the sink, so only whole records are printed. A second SIGINT kills
+    the parser processes and exits at once, even while closing the sink blocks the event
+    loop. A signal the process inherited as ignored stays ignored, as nohup relies on.
     """
 
     dispatcher: _Dispatcher
@@ -184,12 +240,13 @@ class _Interrupts:
         self.dispatcher.halt()
         self._work.cancel()
         if signal.SIGINT in self._previous:
-            signal.signal(signal.SIGINT, _exit_now)
+            signal.signal(signal.SIGINT, self._exit_now)
 
-
-def _exit_now(signum: int, frame: FrameType | None) -> NoReturn:
-    """A second Ctrl-C: exit without waiting for anything."""
-    os._exit(ExitCode.INTERRUPTED)
+    def _exit_now(self, signum: int, frame: FrameType | None) -> NoReturn:
+        """A second Ctrl-C: exit without waiting for anything. The parser processes ignore
+        Ctrl-C, so they're killed first."""
+        self.dispatcher.kill_parsers()
+        os._exit(ExitCode.INTERRUPTED)
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,11 +310,11 @@ class _Start:
         assert item is not None
         # The start URL is fetched on its own: if it isn't a page, there's no crawl.
         outcome = await self.fetcher.fetch(item, self)
-        self.frontier.finish()
         # Nothing but the start URL's own chain has claimed anything yet.
         assert not isinstance(outcome, Claimed)
         if isinstance(outcome, Page):
-            return item, outcome
+            return item, outcome  # it's outstanding until the dispatcher parses its page
+        self.frontier.finish()
         _count(self.stats, outcome)
         if self._problem is not None:
             return self._problem
@@ -342,8 +399,13 @@ def _count(stats: Stats, outcome: NotPage | Claimed | Final) -> None:
 
 @dataclass(slots=True, kw_only=True)
 class _Dispatcher:
-    """Starts a fetch whenever one finishes, until nothing is outstanding or, under
-    --max-pages, until that many pages are printed."""
+    """Starts fetches while there's room, until nothing is outstanding or, under
+    --max-pages, until that many pages are printed (DESIGN.md §4.2, §4.3).
+
+    Room is a pipeline slot, which bounds the items held in memory, fetching or parsing; a
+    permit from the concurrency limit, which bounds the requests in flight and is held only
+    while fetching, so parsing never throttles fetching; and the rate ceiling's turn. Each
+    item is one task: it fetches, then hands the page to the parse gateway."""
 
     fetcher: Fetcher
     hops: HopPolicy
@@ -352,16 +414,26 @@ class _Dispatcher:
     sink: Sink
     stats: Stats
     all_urls: bool
-    concurrency: int
+    max_bytes: int  # the most a page's body may decompress to
+    make_parser: Callable[[WorkerContext], Parser]
+    law: ConcurrencyLaw
+    max_concurrency: int
+    max_rps: float | None
+    clock: Callable[[], float]
     max_pages: int | None  # stop once this many pages are printed
     robots: RobotsFetcher | None  # None under --ignore-robots
     product: str  # the User-Agent's product token, which robots.txt groups name
     robots_refresh: float  # seconds between fetches of robots.txt
-    _ctx: WorkerContext = field(init=False)
-    _in_flight: int = field(default=0, init=False)
-    _tasks: set[asyncio.Task[None]] = field(default_factory=set, init=False)
+    _parser: Parser | None = field(default=None, init=False)
+    _gate: PauseGate = field(default_factory=PauseGate, init=False)
+    _slots: int = field(default=0, init=False)
+    _in_pipeline: int = field(default=0, init=False)  # items dispatched and not finished
+    _requests: int = field(default=0, init=False)  # fetches in progress: permits held
+    _fetching: set[asyncio.Task[None]] = field(default_factory=set, init=False)
+    _parsing: set[asyncio.Task[None]] = field(default_factory=set, init=False)
     _stopping: bool = field(default=False, init=False)
     _done: asyncio.Future[None] = field(init=False)
+    _wake: asyncio.TimerHandle | None = field(default=None, init=False)
     _refresh: asyncio.TimerHandle | None = field(default=None, init=False)
     _refreshing: asyncio.Task[None] | None = field(default=None, init=False)
 
@@ -370,52 +442,113 @@ class _Dispatcher:
 
     async def run(self, start: CrawlItem, page: Page) -> ExitCode:
         """Crawl from the start page until nothing is outstanding."""
-        # The scope is fixed now, so the parsers' context can be too.
-        self._ctx = WorkerContext(self.admission.scope.prefixes, self.all_urls)
+        # The scope is fixed now, so the parsers' context can be, and the gateway can start:
+        # each worker gets the context once, as it starts (DESIGN.md §5.5).
+        ctx = WorkerContext(self.admission.scope.prefixes, self.max_bytes, self.all_urls)
+        self._parser = self.make_parser(ctx)
+        # Room for every request the limit may allow, and for each worker's parse in
+        # progress and a few queued for it.
+        self._slots = self.max_concurrency + 4 * self._parser.workers
+        self._set_rate()
         if self.robots is not None:
             self._refresh = asyncio.get_running_loop().call_later(
                 self.robots_refresh, self._start_refresh
             )
-        self._page(start, page)
+        self._start(start, page)
         self.pump()
         await self._done
         return ExitCode.INTERNAL_ERROR if self.stats.internal_errors else ExitCode.OK
 
     def pump(self) -> None:
-        """Start fetches while there's room. It runs after every completion, and when the
+        """Start fetches while there's room. It runs after every completion and every
+        release of a permit, when the rate ceiling allows the next start, and when the
         sink's backlog clears."""
         if self._stopping:
             return
-        while self._in_flight < self.concurrency and not self.sink.backlogged:
+        while (
+            self._in_pipeline < self._slots
+            and self._requests < self.law.limit
+            and not self.sink.backlogged
+        ):
             # Under --max-pages, no page is fetched only to be thrown away (DESIGN.md §5.1).
-            if self.max_pages is not None and self.stats.pages + self._in_flight >= self.max_pages:
+            if (
+                self.max_pages is not None
+                and self.stats.pages + self._in_pipeline >= self.max_pages
+            ):
+                break
+            now = self.clock()
+            if (wait := self._gate.delay(now)) > 0:
+                self._wake_in(wait)
                 break
             item = self.frontier.pop()
             if item is None:
                 break
-            self._in_flight += 1
-            task = asyncio.create_task(self._process(item))
-            self._tasks.add(task)
-            task.add_done_callback(self._tasks.discard)
+            self._gate.take(now)
+            self._start(item)
         complete = self.frontier.outstanding == 0 or self.stats.pages == self.max_pages
         if complete and not self._done.done():
             self._done.set_result(None)
+
+    def _start(self, item: CrawlItem, page: Page | None = None) -> None:
+        self._in_pipeline += 1
+        if page is None:
+            self._requests += 1  # the fetch's permit, taken now, as the task runs later
+        task = asyncio.create_task(self._process(item, page))
+        self._fetching.add(task)
+        task.add_done_callback(self._fetching.discard)
+        task.add_done_callback(self._parsing.discard)
+
+    def _wake_in(self, delay: float) -> None:
+        """Pump after delay seconds, unless it's already due to run sooner."""
+        loop = asyncio.get_running_loop()
+        when = loop.time() + delay
+        if self._wake is not None:
+            if self._wake.when() <= when:
+                return
+            self._wake.cancel()
+        self._wake = loop.call_at(when, self._woken)
+
+    def _woken(self) -> None:
+        self._wake = None
+        self.pump()
+
+    def _set_rate(self) -> None:
+        """The rate ceiling: --max-rps, or robots.txt's Crawl-delay if it allows fewer."""
+        delay = self.admission.robots.crawl_delay
+        rate = rate_ceiling(self.max_rps, delay)
+        if rate != self._gate.rate and delay and rate == 1 / delay:
+            log.warning(
+                "robots.txt asks for %g s between requests (Crawl-delay), so a request starts "
+                "every %g s at most; --ignore-robots ignores it",
+                delay,
+                delay,
+            )
+        self._gate.rate = rate
 
     def halt(self) -> None:
         """Start no more fetches."""
         self._stopping = True
 
     async def stop(self) -> None:
-        """Cancel the fetches still running, and wait for them to end."""
+        """Cancel the fetches still running; let the parses already submitted finish, so
+        that their records are printed; then stop the parse gateway (DESIGN.md §5.9)."""
         self.halt()
-        if self._refresh is not None:
-            self._refresh.cancel()
-        tasks = list(self._tasks)
+        for timer in (self._wake, self._refresh):
+            if timer is not None:
+                timer.cancel()
+        cancelled = list(self._fetching)
         if self._refreshing is not None:
-            tasks.append(self._refreshing)
-        for task in tasks:
+            cancelled.append(self._refreshing)
+        for task in cancelled:
             task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(*cancelled, *self._parsing, return_exceptions=True)
+        if self._parser is not None:
+            await self._parser.close()
+
+    def kill_parsers(self) -> None:
+        """Stop the parse gateway at once, for an exit that can't wait."""
+        if self._parser is not None:
+            self._parser.kill()
 
     def _start_refresh(self) -> None:
         self._refresh = None
@@ -435,6 +568,7 @@ class _Dispatcher:
                 else:
                     files[origin] = file
             self.admission.robots = RobotsPolicy(self.product, files)
+            self._set_rate()  # its Crawl-delay may have changed
         except Exception:
             self.stats.internal_errors += 1
             log.exception("internal error while refetching robots.txt")
@@ -442,11 +576,18 @@ class _Dispatcher:
             self.robots_refresh, self._start_refresh
         )
 
-    async def _process(self, item: CrawlItem) -> None:
+    async def _process(self, item: CrawlItem, page: Page | None) -> None:
+        """Fetch item, unless its page is already here, and parse the page it leads to."""
         try:
-            outcome = await self.fetcher.fetch(item, self.hops)
+            outcome = page if page is not None else await self._fetch(item)
             if isinstance(outcome, Page):
-                self._page(item, outcome)
+                # From here the task is a parse, which a stop lets finish and print rather
+                # than cancel: once submitted, it runs to its end in its worker anyway.
+                task = asyncio.current_task()
+                assert task is not None
+                self._fetching.discard(task)
+                self._parsing.add(task)
+                await self._page(item, outcome)
             else:
                 _count(self.stats, outcome)
         except Exception:
@@ -455,15 +596,34 @@ class _Dispatcher:
             self.stats.internal_errors += 1
             log.exception("internal error while crawling %s", item.url)
         finally:
-            self._in_flight -= 1
+            self._in_pipeline -= 1
             self.frontier.finish()
             self.pump()
 
-    def _page(self, item: CrawlItem, page: Page) -> None:
-        result = parse_page(page.job, self._ctx)
+    async def _fetch(self, item: CrawlItem) -> FetchOutcome:
+        """item's fetch, which holds a permit of the concurrency limit until it's done."""
+        try:
+            return await self.fetcher.fetch(item, self.hops)
+        finally:
+            self._requests -= 1
+            self.pump()
+
+    async def _page(self, item: CrawlItem, page: Page) -> None:
+        assert self._parser is not None
+        try:
+            result = await self._parser.parse(page.job)
+        except ParseCrashed:
+            log.warning("%s isn't printed: parsing it crashed the parser process", item.url)
+            self.stats.failures[PARSE_CRASHED] += 1
+            return
+        self.stats.body_bytes += len(page.job.body)
+        if result.error is not None:
+            self.stats.failures[result.error] += 1
+            return
         self.sink.write(result.record)
         # The links are admitted before the page finishes, so that outstanding reaches 0
         # only when the crawl is complete (DESIGN.md §4.2).
         self.admission.admit(result.links, item.depth + 1)
         self.stats.pages += 1
         self.stats.links_found += result.links_found
+        self.stats.decoded_bytes += result.decoded_bytes

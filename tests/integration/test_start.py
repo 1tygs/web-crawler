@@ -28,11 +28,14 @@ async def crawl_hosts(
     hosts: HostedSites,
     start: str,
     *,
+    parse_workers: int,
     trusted: bool = True,
     strict_host: bool = False,
     insecure: bool = False,
 ) -> tuple[CrawlReport, list[bytes]]:
-    cfg = Config(start_url=start, strict_host=strict_host, insecure=insecure)
+    cfg = Config(
+        start_url=start, strict_host=strict_host, insecure=insecure, parse_workers=parse_workers
+    )
     async with hosts.transport(cfg, trusted=trusted) as transport:
         sink = MemorySink()
         report = await crawl(cfg, sink, transport=transport, rng=Lowest())
@@ -57,7 +60,7 @@ def https_only(resource: Resource) -> Handler:
     return handle
 
 
-async def test_http_and_https_on_the_default_ports_are_one_site() -> None:
+async def test_http_and_https_on_the_default_ports_are_one_site(parse_workers: int) -> None:
     home = page(
         "/both",
         "http://example.test/plain",  # the other scheme, which serves this page itself
@@ -72,7 +75,9 @@ async def test_http_and_https_on_the_default_ports_are_one_site() -> None:
         "/explicit": https_only(page()),
     }
     async with HostedSites({"example.test": resources, "blog.example.test": {}}) as hosts:
-        report, records = await crawl_hosts(hosts, "https://example.test/")
+        report, records = await crawl_hosts(
+            hosts, "https://example.test/", parse_workers=parse_workers
+        )
     assert report.exit_code is ExitCode.OK
     assert records == sorted(
         [
@@ -109,12 +114,15 @@ async def test_http_and_https_on_the_default_ports_are_one_site() -> None:
 
 async def test_an_apex_start_url_that_redirects_to_www_crawls_www(
     caplog: pytest.LogCaptureFixture,
+    parse_workers: int,
 ) -> None:
     caplog.set_level(logging.WARNING)
     apex = {"/": redirect("https://www.example.test/")}
     www = {"/": page("/a", "https://example.test/apex"), "/a": page("/")}
     async with HostedSites({"example.test": apex, "www.example.test": www}) as hosts:
-        report, records = await crawl_hosts(hosts, "https://example.test/")
+        report, records = await crawl_hosts(
+            hosts, "https://example.test/", parse_workers=parse_workers
+        )
     assert report.exit_code is ExitCode.OK
     assert records == sorted(
         [
@@ -143,12 +151,15 @@ async def test_an_apex_start_url_that_redirects_to_www_crawls_www(
 
 async def test_the_www_hosts_robots_txt_is_obeyed_before_the_hop(
     caplog: pytest.LogCaptureFixture,
+    parse_workers: int,
 ) -> None:
     disallow = Resource(body=b"User-agent: *\nDisallow: /\n", headers=TEXT)
     apex = {"/": redirect("https://www.example.test/")}
     www = {"/robots.txt": disallow, "/": page()}
     async with HostedSites({"example.test": apex, "www.example.test": www}) as hosts:
-        report, records = await crawl_hosts(hosts, "https://example.test/")
+        report, records = await crawl_hosts(
+            hosts, "https://example.test/", parse_workers=parse_workers
+        )
     assert report.exit_code is ExitCode.CANNOT_START
     assert records == []
     assert (
@@ -158,10 +169,14 @@ async def test_the_www_hosts_robots_txt_is_obeyed_before_the_hop(
     assert "https://www.example.test/" not in hosts.requested()
 
 
-async def test_strict_host_refuses_even_the_www_redirect(caplog: pytest.LogCaptureFixture) -> None:
+async def test_strict_host_refuses_even_the_www_redirect(
+    caplog: pytest.LogCaptureFixture, parse_workers: int
+) -> None:
     apex = {"/": redirect("https://www.example.test/")}
     async with HostedSites({"example.test": apex, "www.example.test": {"/": page()}}) as hosts:
-        report, _ = await crawl_hosts(hosts, "https://example.test/", strict_host=True)
+        report, _ = await crawl_hosts(
+            hosts, "https://example.test/", parse_workers=parse_workers, strict_host=True
+        )
     assert report.exit_code is ExitCode.CANNOT_START
     assert (
         "can't start: https://example.test/ redirects to https://www.example.test/, and "
@@ -171,10 +186,12 @@ async def test_strict_host_refuses_even_the_www_redirect(caplog: pytest.LogCaptu
     assert hosts.sites["www.example.test"].requests == []
 
 
-async def test_a_redirect_to_another_host_cant_start(caplog: pytest.LogCaptureFixture) -> None:
+async def test_a_redirect_to_another_host_cant_start(
+    caplog: pytest.LogCaptureFixture, parse_workers: int
+) -> None:
     apex = {"/": redirect("https://blog.example.test/")}
     async with HostedSites({"example.test": apex, "blog.example.test": {"/": page()}}) as hosts:
-        report, _ = await crawl_hosts(hosts, "https://example.test/")
+        report, _ = await crawl_hosts(hosts, "https://example.test/", parse_workers=parse_workers)
     assert report.exit_code is ExitCode.CANNOT_START
     assert (
         "can't start: https://example.test/ redirects to https://blog.example.test/, outside "
@@ -186,11 +203,12 @@ async def test_a_redirect_to_another_host_cant_start(caplog: pytest.LogCaptureFi
 
 async def test_a_start_url_without_a_scheme_falls_back_to_http(
     caplog: pytest.LogCaptureFixture,
+    parse_workers: int,
 ) -> None:
     caplog.set_level(logging.WARNING)
     async with HostedSites({"example.test": {"/": page("/a"), "/a": page()}}) as hosts:
         hosts.resolver.ports["example.test", 443] = unused_port()  # nothing listens on https
-        report, records = await crawl_hosts(hosts, "example.test")
+        report, records = await crawl_hosts(hosts, "example.test", parse_workers=parse_workers)
     assert report.exit_code is ExitCode.OK
     assert records == sorted(
         [
@@ -206,21 +224,29 @@ async def test_a_start_url_without_a_scheme_falls_back_to_http(
 
 async def test_only_a_start_url_without_a_scheme_falls_back(
     caplog: pytest.LogCaptureFixture,
+    parse_workers: int,
 ) -> None:
     async with HostedSites({"example.test": {"/": page()}}) as hosts:
         hosts.resolver.ports["example.test", 443] = unused_port()
-        report, _ = await crawl_hosts(hosts, "https://example.test/")
+        report, _ = await crawl_hosts(hosts, "https://example.test/", parse_workers=parse_workers)
     assert report.exit_code is ExitCode.CANNOT_START
     assert "can't start: https://example.test/robots.txt got no answer (connect: " in caplog.text
 
 
 async def test_tls_certificates_are_verified_unless_insecure(
     caplog: pytest.LogCaptureFixture,
+    parse_workers: int,
 ) -> None:
     async with HostedSites({"example.test": {"/": page()}}) as hosts:
-        refused, _ = await crawl_hosts(hosts, "https://example.test/", trusted=False)
+        refused, _ = await crawl_hosts(
+            hosts, "https://example.test/", parse_workers=parse_workers, trusted=False
+        )
         allowed, records = await crawl_hosts(
-            hosts, "https://example.test/", trusted=False, insecure=True
+            hosts,
+            "https://example.test/",
+            parse_workers=parse_workers,
+            trusted=False,
+            insecure=True,
         )
     assert refused.exit_code is ExitCode.CANNOT_START
     assert "can't start: https://example.test/robots.txt got no answer (tls: " in caplog.text
@@ -228,10 +254,13 @@ async def test_tls_certificates_are_verified_unless_insecure(
     assert records == [record("https://example.test/")]
 
 
-async def test_the_crawl_command_falls_back_to_http_for_localhost() -> None:
+async def test_the_crawl_command_falls_back_to_http_for_localhost(parse_workers: int) -> None:
     # `crawl localhost:PORT` against a plain local server: https fails its TLS handshake.
     async with Site({"/": page("/a"), "/a": page()}) as site:
-        code, stdout, stderr = await run(CRAWL, f"localhost:{site.port}")
+        workers = str(parse_workers)
+        code, stdout, stderr = await run(
+            CRAWL, "--parse-workers", workers, f"localhost:{site.port}"
+        )
     assert code == 0, stderr
     origin = f"http://localhost:{site.port}"
     assert split_records(stdout) == sorted(
@@ -240,12 +269,15 @@ async def test_the_crawl_command_falls_back_to_http_for_localhost() -> None:
     assert f"https://localhost:{site.port}/ got no answer (tls); trying {origin}/" in stderr
 
 
-async def test_the_crawl_command_with_insecure_accepts_any_certificate() -> None:
+async def test_the_crawl_command_with_insecure_accepts_any_certificate(parse_workers: int) -> None:
     ca = trustme.CA()  # trusted by nothing
     server_ssl = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
     ca.issue_cert("127.0.0.1").configure_cert(server_ssl)
     async with Site({"/": page()}, tls=server_ssl) as site:
-        code, stdout, _ = await run(CRAWL, "--insecure", f"{site.tls_origin}/")
+        workers = str(parse_workers)
+        code, stdout, _ = await run(
+            CRAWL, "--insecure", "--parse-workers", workers, f"{site.tls_origin}/"
+        )
         refused, _, stderr = await run(CRAWL, f"{site.tls_origin}/")
     assert code == 0
     assert split_records(stdout) == [record(f"{site.tls_origin}/")]

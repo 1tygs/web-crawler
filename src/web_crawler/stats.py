@@ -17,6 +17,8 @@ class Stats:
     statuses: Counter[int] = field(default_factory=Counter)  # every response, redirects too
     failures: Counter[str] = field(default_factory=Counter)  # items that ended without a page
     internal_errors: int = 0  # unexpected exceptions while processing an item
+    body_bytes: int = 0  # pages' bodies as they arrived, compressed or not
+    decoded_bytes: int = 0  # the bodies of the pages printed, decompressed
 
     def summary(
         self,
@@ -37,6 +39,11 @@ class Stats:
         ]
         if self.statuses:
             lines.append(f"statuses: {_counts(sorted(self.statuses.items()))}")
+        if self.body_bytes:
+            lines.append(
+                f"page bodies: {_size(self.body_bytes)} received, "
+                f"{_size(self.decoded_bytes)} decompressed"
+            )
         skipped = sorted(self.failures.items())
         if self.not_html:
             skipped.insert(0, ("not HTML", self.not_html))
@@ -63,3 +70,18 @@ def _counts(pairs: list[tuple[str, int]] | list[tuple[int, int]]) -> str:
 
 def _count(n: int, noun: str) -> str:
     return f"{n:,} {noun}" if n == 1 else f"{n:,} {noun}s"
+
+
+def _size(n: int) -> str:
+    """A byte count in decimal units: 950 B, 12.3 kB, 4.5 MB, 1,234.5 GB."""
+    if n < _THOUSAND:
+        return f"{n} B"
+    value = n / _THOUSAND
+    for unit in ("kB", "MB"):
+        if value < _THOUSAND:
+            return f"{value:.1f} {unit}"
+        value /= _THOUSAND
+    return f"{value:,.1f} GB"
+
+
+_THOUSAND = 1000

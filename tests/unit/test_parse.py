@@ -1,15 +1,21 @@
+import gzip
 import html
+import zlib
+from collections.abc import Callable
+from compression import zstd
 
+import brotli
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 from selectolax.lexbor import LexborHTMLParser
 
+from web_crawler.config import MIB
 from web_crawler.parse import parse_page, parse_refresh, parse_srcset
 from web_crawler.types import ParseJob, WorkerContext
 
 PAGE = "https://example.com/dir/page.html"
-CTX = WorkerContext(scope_prefixes=("https://example.com/", "http://example.com/"))
+CTX = WorkerContext(scope_prefixes=("https://example.com/", "http://example.com/"), max_bytes=MIB)
 
 
 def links(markup: str, url: str = PAGE) -> list[str]:
@@ -23,6 +29,10 @@ def links(markup: str, url: str = PAGE) -> list[str]:
 
 def anchors(*hrefs: str) -> str:
     return "".join(f'<a href="{html.escape(href)}">x</a>' for href in hrefs)
+
+
+def zstd_then_deflate(data: bytes) -> bytes:
+    return zlib.compress(zstd.compress(data))
 
 
 def test_renders_the_text_record() -> None:
@@ -42,7 +52,36 @@ def test_renders_the_text_record() -> None:
 
 def test_a_page_without_links() -> None:
     result = parse_page(ParseJob(url=PAGE, body=b"<p>nothing here</p>"), CTX)
-    assert result == (b"https://example.com/dir/page.html\n\n", [], 0)
+    assert result == (b"https://example.com/dir/page.html\n\n", [], 0, 19, None)
+
+
+@pytest.mark.parametrize(
+    ("content_encoding", "compress"),
+    [("gzip", gzip.compress), ("br", brotli.compress), ("zstd, deflate", zstd_then_deflate)],
+)
+def test_decompresses_the_body(content_encoding: str, compress: Callable[[bytes], bytes]) -> None:
+    markup = anchors("/a", "/b")
+    job = ParseJob(url=PAGE, body=compress(markup.encode()), content_encoding=content_encoding)
+    result = parse_page(job, CTX)
+    assert [url for _, url in result.links] == ["https://example.com/a", "https://example.com/b"]
+    assert result.decoded_bytes == len(markup)
+    assert result.error is None
+
+
+def test_a_body_that_cant_be_decompressed_is_an_error() -> None:
+    job = ParseJob(url=PAGE, body=anchors("/a").encode(), content_encoding="gzip")
+    assert parse_page(job, CTX) == (b"", [], 0, 0, "bad content-encoding")
+
+
+def test_reads_a_body_up_to_the_cap() -> None:
+    markup = (anchors("/caf\u00e9") + "<p>\u65e5</p>" + anchors("/b")).encode()
+    # The cap falls inside a three-byte character. The body was cut short, so that doesn't
+    # count against UTF-8, and /café isn't read as windows-1252.
+    cap = markup.index("\u65e5".encode()) + 1
+    job = ParseJob(url=PAGE, body=gzip.compress(markup), content_encoding="gzip")
+    result = parse_page(job, WorkerContext(CTX.scope_prefixes, max_bytes=cap))
+    assert result.links == [("https://example.com/caf%C3%A9", "https://example.com/caf%C3%A9")]
+    assert result.decoded_bytes == cap
 
 
 def test_finds_navigational_links_in_document_order() -> None:
@@ -188,7 +227,7 @@ def test_a_byte_order_mark_is_not_text() -> None:
 def test_a_page_in_the_replacement_encoding_has_no_links() -> None:
     # Some encodings aren't safe to decode; a browser shows such a page as one U+FFFD.
     job = ParseJob(url=PAGE, body=b'<a href="/x">x</a>', http_charset="iso-2022-kr")
-    assert parse_page(job, CTX) == (b"https://example.com/dir/page.html\n\n", [], 0)
+    assert parse_page(job, CTX) == (b"https://example.com/dir/page.html\n\n", [], 0, 18, None)
 
 
 def test_a_truncated_page_may_end_inside_a_utf8_character() -> None:

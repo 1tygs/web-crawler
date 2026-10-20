@@ -53,6 +53,34 @@ def test_max_pages_below_1_is_a_usage_error(capsys: pytest.CaptureFixture[str]) 
     assert "max_pages must be at least 1, not 0" in capsys.readouterr().err
 
 
+def test_speed_options() -> None:
+    speed = ["--max-concurrency", "10", "--max-rps", "2.5", "--parse-workers", "3"]
+    cfg = parse_args(["https://example.com/", *speed])
+    assert (cfg.max_concurrency, cfg.max_rps, cfg.parse_workers) == (10, 2.5, 3)
+    cfg = parse_args(["https://example.com/", "--parse-workers", "auto"])
+    assert (cfg.max_concurrency, cfg.max_rps, cfg.parse_workers) == (64, None, None)
+    assert parse_args(["https://example.com/", "--parse-workers", "0"]).parse_workers == 0
+
+
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        (["--parse-workers", "some"], "argument --parse-workers: auto or a number, not 'some'"),
+        (["--parse-workers", "-1"], "parse_workers must be at least 0, not -1"),
+        (["--max-rps", "0"], "max_rps must be a positive number of requests per second, not 0.0"),
+        (["--max-rps", "inf"], "max_rps must be a positive number"),
+        (["--max-concurrency", "0"], "max_concurrency must be at least 1, not 0"),
+    ],
+)
+def test_speed_options_out_of_range_are_usage_errors(
+    argv: list[str], message: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        parse_args(["https://example.com/", *argv])
+    assert exit_info.value.code == 2
+    assert message in capsys.readouterr().err
+
+
 def test_start_url_options() -> None:
     cfg = parse_args(["https://example.com/", "--strict-host", "--insecure"])
     assert (cfg.strict_host, cfg.insecure) == (True, True)
@@ -78,8 +106,10 @@ def test_help_exits_zero(capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit) as exit_info:
         parse_args(["--help"])
     assert exit_info.value.code == 0
-    assert capsys.readouterr().out.startswith(
-        "usage: crawl [-h] [--all-urls] [--max-pages N] [--ignore-robots]"
+    usage = " ".join(capsys.readouterr().out.split())  # however the terminal's width wraps it
+    assert usage.startswith(
+        "usage: crawl [-h] [--all-urls] [--max-pages N] [--max-concurrency N] [--max-rps R] "
+        "[--parse-workers N] [--ignore-robots]"
     )
 
 

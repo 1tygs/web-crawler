@@ -1,20 +1,34 @@
 import asyncio
 import itertools
 import logging
-from collections.abc import AsyncIterator, Callable
+import time
+from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
+from typing import Any
 
 import pytest
 
 from tests.support.fake_transport import Answer, FakeResponse, FakeTransport, Reply
 from tests.support.jitter import Lowest
+from web_crawler import engine
 from web_crawler.config import Config
-from web_crawler.engine import INITIAL_CONCURRENCY, crawl
-from web_crawler.output import MemorySink
+from web_crawler.engine import CrawlReport
+from web_crawler.limiter import START as INITIAL_LIMIT
+from web_crawler.limiter import ConcurrencyLaw
+from web_crawler.output import MemorySink, Sink
+from web_crawler.pool import InlineParser
 from web_crawler.transport import ErrorKind
-from web_crawler.types import ExitCode
+from web_crawler.types import ExitCode, ParseJob, ParseResult, WorkerContext
 
 START = "https://example.com/"
+
+
+async def crawl(cfg: Config, sink: Sink, **collaborators: Any) -> CrawlReport:
+    """engine.crawl, parsing inline: these tests are about dispatch, and the parse gateway's
+    own are in tests/integration/test_pool.py."""
+    return await engine.crawl(cfg, sink, parser=InlineParser, **collaborators)
+
+
 HTML = {"Content-Type": "text/html"}
 TEXT = {"Content-Type": "text/plain"}
 ROBOTS = "https://example.com/robots.txt"
@@ -69,15 +83,181 @@ async def test_prints_each_reachable_page_once() -> None:
     assert (report.stats.pages, report.stats.links_found, report.unique_urls) == (4, 8, 4)
 
 
-@pytest.mark.parametrize(("max_concurrency", "expected"), [(64, INITIAL_CONCURRENCY), (3, 3)])
-async def test_keeps_a_fixed_number_of_fetches_in_flight(
-    max_concurrency: int, expected: int
+@pytest.mark.parametrize(("max_concurrency", "expected"), [(64, 64), (20, 20), (3, 3)])
+async def test_the_limit_doubles_up_to_the_ceiling_while_responses_stay_as_fast(
+    max_concurrency: int, expected: int, caplog: pytest.LogCaptureFixture
 ) -> None:
-    transport = FakeTransport(fan_out(pages=40, delay=0.01))
+    caplog.set_level(logging.INFO, "web_crawler.engine")
+    transport = FakeTransport(fan_out(pages=300, delay=0.01))
     cfg = Config(start_url=START, max_concurrency=max_concurrency)
     report = await crawl(cfg, MemorySink(), transport=transport)
-    assert report.stats.pages == 41
+    assert report.stats.pages == 301
     assert transport.max_in_flight == expected
+    if max_concurrency == 64:  # slow start: 8, 16, 32, then the ceiling
+        grown = [record.getMessage() for record in caplog.records if "grow" in record.message]
+        assert [line.split(", ")[0] for line in grown[:3]] == [
+            "concurrency limit: grow: 8 -> 16",
+            "concurrency limit: grow: 16 -> 32",
+            "concurrency limit: grow: 32 -> 64",
+        ]
+
+
+def cuts(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        record.message for record in caplog.records if "concurrency limit: cut" in record.message
+    ]
+
+
+@pytest.mark.parametrize(
+    ("answer", "cut"),
+    [
+        (Reply(429, HTML), True),
+        (Reply(503, HTML), True),
+        (ErrorKind.TIMEOUT, True),
+        (ErrorKind.CONNECT_TIMEOUT, True),
+        (ErrorKind.RESET, True),
+        (ErrorKind.CONNECT, True),  # refused
+        (Reply(headers=HTML, read_error=ErrorKind.PAYLOAD), True),  # cut off mid-body
+        (Reply(500, HTML), False),
+        (Reply(404, HTML), False),
+        (ErrorKind.DNS, False),
+        (ErrorKind.TLS, False),
+    ],
+)
+async def test_distress_cuts_the_limit(
+    answer: Answer, cut: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, "web_crawler.engine")
+    replies = fan_out(pages=40, delay=0.01)
+    replies["https://example.com/7"] = answer
+    report = await crawl(Config(start_url=START), MemorySink(), transport=FakeTransport(replies))
+    assert report.stats.pages == 40
+    assert cuts(caplog) == (["concurrency limit: cut: 8 -> 4"] if cut else [])
+
+
+async def test_one_congestion_event_cuts_the_limit_once(caplog: pytest.LogCaptureFixture) -> None:
+    # Eight requests in flight all get a 429: one cut answers them all.
+    caplog.set_level(logging.INFO, "web_crawler.engine")
+    replies = fan_out(pages=8, delay=0.01)
+    replies |= {f"https://example.com/{n}": Reply(429, HTML, delay=0.01) for n in range(8)}
+    await crawl(Config(start_url=START), MemorySink(), transport=FakeTransport(replies))
+    assert cuts(caplog) == ["concurrency limit: cut: 8 -> 4"]
+
+
+def test_samples_are_responses_below_500_other_than_429(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, "web_crawler.engine")
+    limiter = engine._Limiter(ConcurrencyLaw(64), clock=lambda: 1.0)
+    for status in (500, 502, 504):  # not samples, slow as they are
+        limiter.answered(status, 9.0, issued_at=0.0)
+    for status in (200, 301, 404, 410, 499, 200, 200, 200):
+        limiter.answered(status, 0.1, issued_at=0.0)
+    # The eight samples made the first round, which measured the server at low load.
+    assert caplog.messages == ["concurrency limit: base: 8 -> 8, median 100.0 ms, base 100.0 ms"]
+
+
+class Times(FakeTransport):
+    """Records when each request started, by the real clock."""
+
+    def __init__(self, replies: Mapping[str, Answer | list[Answer]]) -> None:
+        super().__init__(replies)
+        self.started: list[tuple[str, float]] = []
+
+    @asynccontextmanager
+    async def open(self, url: str) -> AsyncIterator[FakeResponse]:
+        self.started.append((url, time.monotonic()))
+        async with super().open(url) as response:
+            yield response
+
+    def gaps(self) -> list[float]:
+        """Seconds between the starts of successive page requests after the start page."""
+        times = [at for url, at in self.started if not url.endswith("/robots.txt")][1:]
+        return [later - earlier for earlier, later in itertools.pairwise(times)]
+
+
+async def test_max_rps_spaces_requests_evenly() -> None:
+    transport = Times(fan_out(pages=6, delay=0.0))
+    report = await crawl(Config(start_url=START, max_rps=50), MemorySink(), transport=transport)
+    assert report.stats.pages == 7
+    gaps = transport.gaps()
+    assert len(gaps) == 5
+    assert min(gaps) >= 0.02 - 0.002  # 1 / 50 s, give or take the event loop's clock
+
+
+@pytest.mark.parametrize("ignore_robots", [False, True])
+async def test_robots_txt_crawl_delay_spaces_requests(
+    ignore_robots: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    replies = fan_out(pages=4, delay=0.0)
+    replies[ROBOTS] = robots("User-agent: *\nCrawl-delay: 0.05\n")
+    transport = Times(replies)
+    cfg = Config(start_url=START, max_rps=1000, ignore_robots=ignore_robots)
+    await crawl(cfg, MemorySink(), transport=transport)
+    if ignore_robots:
+        assert max(transport.gaps()) < 0.05
+        assert "Crawl-delay" not in caplog.text
+    else:
+        assert min(transport.gaps()) >= 0.05 - 0.002
+        assert (
+            "robots.txt asks for 0.05 s between requests (Crawl-delay), so a request starts "
+            "every 0.05 s at most; --ignore-robots ignores it" in caplog.text
+        )
+
+
+async def test_max_rps_wins_over_a_longer_crawl_delay_only_when_lower(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    replies = fan_out(pages=3, delay=0.0)
+    replies[ROBOTS] = robots("User-agent: *\nCrawl-delay: 0.01\n")
+    transport = Times(replies)
+    await crawl(Config(start_url=START, max_rps=20), MemorySink(), transport=transport)
+    assert min(transport.gaps()) >= 0.05 - 0.002  # --max-rps 20 is the lower rate
+    assert "Crawl-delay" not in caplog.text
+
+
+class Stalled:
+    """A parse gateway of two workers that holds every parse but the start page's until
+    told to go."""
+
+    workers = 2
+
+    def __init__(self, ctx: WorkerContext) -> None:
+        self._inline = InlineParser(ctx)
+        self.go = asyncio.Event()
+        self.waiting = 0
+
+    async def parse(self, job: ParseJob) -> ParseResult:
+        if job.url != START:
+            self.waiting += 1
+            await self.go.wait()
+        return await self._inline.parse(job)
+
+    async def close(self) -> None:
+        pass
+
+    def kill(self) -> None:
+        pass
+
+
+async def test_pipeline_slots_bound_the_pages_held_while_parsing_is_slow() -> None:
+    # A fast server and slow parsing would otherwise fetch pages without bound.
+    stalled: list[Stalled] = []
+
+    def parser(ctx: WorkerContext) -> Stalled:
+        stalled.append(Stalled(ctx))
+        return stalled[0]
+
+    transport = FakeTransport(fan_out(pages=40, delay=0.0))
+    cfg = Config(start_url=START, max_concurrency=4)
+    task = asyncio.create_task(engine.crawl(cfg, MemorySink(), transport=transport, parser=parser))
+    await settle()
+    # 4 requests in flight at most, and 4 + 4 * 2 workers items held, fetched or not.
+    assert len(pages(transport)) == 1 + 12
+    assert stalled[0].waiting == 12
+    stalled[0].go.set()
+    report = await task
+    assert report.stats.pages == 41
 
 
 @pytest.mark.parametrize(
@@ -239,7 +419,7 @@ async def test_cancelling_a_crawl_stops_its_fetches_and_closes_the_sink() -> Non
     sink = MemorySink()
     task = asyncio.create_task(crawl(Config(start_url=START), sink, transport=transport))
     await settle()
-    assert transport.in_flight == INITIAL_CONCURRENCY
+    assert transport.in_flight == INITIAL_LIMIT
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
@@ -249,12 +429,12 @@ async def test_cancelling_a_crawl_stops_its_fetches_and_closes_the_sink() -> Non
 
 
 async def test_reports_the_clock() -> None:
-    ticks = itertools.count(100.0, 2.5)
+    times = iter([100.0])  # when the crawl starts; it's 102.5 from then on
     report = await crawl(
         Config(start_url=START),
         MemorySink(),
         transport=FakeTransport({START: html()}),
-        clock=lambda: next(ticks),
+        clock=lambda: next(times, 102.5),
     )
     assert report.summary.startswith("1 page in 2.5 s (0.4 pages/s), 0 links found")
 

@@ -21,10 +21,10 @@ Three things bound the crawler's speed, in this order: the target server's capac
 Accuracy comes from matching browser semantics: HTML5 parsing, WHATWG URL resolution, `<base href>`, the final URL after redirects, declarative shadow DOM, and normalization that never merges two distinct resources. Retries mean transient failures don't silently drop pages.
 
 **Measured headroom (Apple M5, CPython 3.14.6):**
-- The full parse pipeline costs 0.4–2.8 ms per real page.
+- The full parse pipeline costs 0.4–2.7 ms per real page.
 - Parsing inline on one core tops out around 610 pages/s.
-- Eight parser processes reach about 2,900 pages/s.
-- The coordinator's own cost is about 140–230 µs per page (A.3's 110–205 µs plus A.4's 26.5 µs of HTTP), so it saturates only at roughly 4,000–7,000 pages/s.
+- Eight parser processes reach about 2,800 pages/s.
+- The coordinator's own cost is about 150–250 µs per page (A.3's 120–220 µs plus A.4's 27 µs of HTTP), and 250–275 µs in a whole crawl, its bookkeeping included (A.15), so it saturates only at roughly 3,500–6,500 pages/s.
 
 The target server will be the limit, not the crawler.
 
@@ -80,11 +80,11 @@ JavaScript rendering, authenticated areas, link extraction from non-HTML files (
 
 | Page (decoded size) | Unique links | CPU per page |
 |---|---|---|
-| python.org (50 KB) | 134 | 0.43 ms |
-| docs.python.org (173 KB) | 38 | 1.14 ms |
-| MDN (220 KB) | 440 | 1.22 ms |
-| Wikipedia (339 KB) | 497 | 1.91 ms |
-| The Guardian (1.5 MB) | 299 | 2.80 ms |
+| python.org (52 KB) | 133 | 0.45 ms |
+| docs.python.org (249 KB) | 58 | 1.71 ms |
+| MDN (187 KB) | 376 | 1.04 ms |
+| Wikipedia (348 KB) | 497 | 1.89 ms |
+| The Guardian (1.4 MB) | 246 | 2.44 ms |
 
 Parsing inline on the event loop caps one core at about 610 pages/s on this mix. In practice it's lower, because that core also runs the HTTP work. A CDN-served site at 30 ms latency with 32 requests in flight could deliver about 1,000 pages/s. CPU work therefore has to leave the loop.
 
@@ -97,9 +97,9 @@ Parsing inline on the event loop caps one core at about 610 pages/s on this mix.
 
 | Component | Cost | Saturates at |
 |---|---|---|
-| Coordinator (fetch + IPC + dedupe + write) | ~140–230 µs per page | ~4,000–7,000 pages/s |
+| Coordinator (fetch + IPC + dedupe + write) | ~150–275 µs per page | ~3,500–6,500 pages/s |
 | One parser process | ~1.6 ms per page (mix above) | ~600 pages/s |
-| Eight parser processes (measured) | — | ~2,900 pages/s |
+| Eight parser processes (measured) | — | ~2,800 pages/s |
 
 Few sites will serve one client thousands of pages per second. The crawler's ceiling sits above the server's, so the client should never be the bottleneck.
 
@@ -152,7 +152,7 @@ Few sites will serve one client thousands of pages per second. The crawler's cei
 1. **Discovered.** A parse result lists the page's in-scope links as `(dedupe key, URL)` pairs.
 2. **Admitted.** The coordinator checks `key in seen` (~50 ns). If the key is new, it applies the trap rules, the extension filter, robots.txt (Protego, ~3 µs) and the depth limit. If all pass, the key goes into `seen` and the URL into the frontier. This is *claim on discovery*: from now on, no other page, redirect or retry can cause a second fetch.
 3. **Dispatched.** The dispatcher takes a *pipeline slot*, which bounds memory (fetches plus the parse queue). It then takes a *limiter permit*, which bounds load on the server, and starts a fetch task. Under `--max-depth` it dispatches only inside the depth window, and under `--max-pages` only while pages printed plus fetches in flight is below the limit ([§5.1](#51-frontier-and-admission)).
-4. **Fetched.** A GET is sent with compression enabled and auto-decompression off. When the headers arrive, the limiter records time-to-first-byte and the status is triaged ([§5.4](#54-errors-and-retries)). Non-HTML responses are never parsed, and their bodies are only read when small enough to drain for connection reuse. HTML bodies are streamed up to the size cap. The limiter permit is then released, so parse time never throttles fetching.
+4. **Fetched.** A GET is sent with compression enabled and auto-decompression off. When the headers arrive, the limiter records the time to first byte, counted from when the request had its connection, and the status is triaged ([§5.4](#54-errors-and-retries)). Non-HTML responses are never parsed, and their bodies are only read when small enough to drain for connection reuse. HTML bodies are streamed up to the size cap. The limiter permit is then released, so parse time never throttles fetching.
 5. **Redirected** (on 3xx). `Location` is resolved, scope-checked and admitted as a hop, which claims it. If another item has already claimed it, this task stops; that page is fetched by its own task. A target already in this task's own chain is followed again ([§5.2](#52-fetcher-and-transport)).
 6. **Parsed.** The final URL, content-encoding, charset, raw body and depth go to a worker. The worker returns the rendered output record and the page's in-scope links.
 7. **Completed.** The record goes to the writer and the links go to admission (step 2). The pipeline slot is released and `outstanding` is decremented.
@@ -164,8 +164,11 @@ Few sites will serve one client thousands of pages per second. The crawler's cei
 - **Parser pool.** A `ProcessPoolExecutor` with up to `os.process_cpu_count() − 1` workers by default.
   - That count sees CPU affinity but not container quotas: in a 2-CPU container on a 64-core host it would allow 63 workers. So the default is also capped by the cgroup CPU quota (`cpu.max`) when one is set, and `PYTHON_CPU_COUNT` overrides both.
   - The start method is set explicitly: `forkserver` on Linux, `spawn` on macOS and Windows. With either, the executor starts a process only when no idle one exists (verified, A.9). A slow site keeps one or two workers busy; a fast one scales out. `fork` would start every worker up front, and forking a process that has threads isn't safe.
-  - An idle worker costs about 40 MiB and no CPU.
-  - Workers ignore SIGINT and SIGTERM, so the coordinator handles Ctrl-C once. But a worker started with `spawn` runs for its first 30–50 ms before the pool's initializer can ignore anything, and a Ctrl-C in that window kills it and breaks the whole pool (A.9). So the gateway calls `submit()` with both signals blocked (`signal.pthread_sigmask`): a new worker inherits the mask, and the initializer sets both signals to ignored before unblocking them. With `forkserver`, `submit()` returns only once the worker has been forked, and no loss was seen in 10 trials; blocking the signals costs nothing there either.
+  - An idle worker costs 15 MiB forked from the forkserver, or 52 MiB spawned (A.9), and no CPU.
+  - The forkserver preloads the main module as well as the parser, so each worker forks with everything imported: it starts in about 3 ms instead of 140–190 ms, at 15 MiB instead of 45, since without `__main__` preloaded every worker imports the crawl script, and with it all of the crawler, again (A.9). A spawned worker on macOS still takes about 180 ms to start.
+  - Workers ignore SIGINT, so the coordinator handles Ctrl-C once. But a worker started with `spawn` runs for its first 30–50 ms before the pool's initializer can ignore anything, and a Ctrl-C in that window kills it and breaks the whole pool (A.9). So the gateway calls `submit()` with SIGINT blocked (`signal.pthread_sigmask`): a new worker inherits the mask, and the initializer sets SIGINT to ignored before unblocking it. With `forkserver`, `submit()` returns only once the worker has been forked, and no loss was seen in 10 trials; blocking the signal costs nothing there either.
+  - Workers keep SIGTERM's default. `ProcessPoolExecutor` stops the other workers of a broken pool with SIGTERM and waits for them, so a worker that ignored it would hang the pool's recovery for ever. A SIGTERM sent to the whole group kills the workers, and the parses they held are submitted again.
+  - A worker exits when the coordinator does. Blocked on a queue it holds both ends of, it would otherwise wait for work for ever after a `kill -9` of the coordinator.
 - **Writer thread.** Blocking writes to stdout happen off the loop. A stalled reader (`| less`, a slow disk) builds a bounded backlog. Past 64 MiB the dispatcher pauses until it drains, so memory stays bounded and in-flight requests never stall.
 - **Backpressure** uses two limits:
   - *Limiter permits* bound requests in flight, i.e. load on the server. A permit is held from request start until the body has arrived.
@@ -217,8 +220,8 @@ Few sites will serve one client thousands of pages per second. The crawler's cei
 - **Headers-first triage:**
   - HTML: stream the body up to `--max-page-bytes` (default 32 MiB) and flag truncation.
   - Non-HTML: don't read the body. If `Content-Length ≤ 64 KiB`, drain it so the connection can be reused; otherwise close it.
-  - Missing `Content-Type`: decompress just the first 512 bytes (zlib, brotli and zstd all take an output cap) and sniff them for the WHATWG HTML signatures. The body is still compressed at this point, so the raw bytes can't be sniffed.
-- **Latency sample** is time to response headers. It tracks server queueing without being skewed by body size.
+  - Missing or unknown `Content-Type` (`*/*`, `unknown/unknown`, `application/unknown` or one that doesn't parse): decompress the start of the body, the 1,445 bytes MIME Sniffing reads, and sniff it for the standard's HTML patterns, unless `X-Content-Type-Options: nosniff` forbids it. The body is still compressed at this point, so the raw bytes can't be sniffed.
+- **Latency sample** is the time from when the request had its connection, from the pool at once or new once DNS, TCP and TLS are done, to its response headers. It tracks server queueing without being skewed by body size, or by connection set-up: the first rounds of a crawl are mostly new connections, and their handshakes would inflate the base. The transport's connector notes the moment it hands a request its connection, for 1.3 µs of CPU per request; aiohttp's `TraceConfig` reports the same moment, but costs 8.3 µs (A.4).
 
 ### 5.3 Adaptive concurrency limiter
 
@@ -244,18 +247,20 @@ once per round:
         after 10 held rounds in a row:
             probing for 2 rounds; held_m = m; resume = limit; limit = limit / 2
 
-on 429 / 503 / timeout / connection reset / refused:
-    if no cut within the last RTT:  limit = max(1, limit / 2); slow_start = False
-    if Retry-After:                 pause all dispatch until then (capped, default 300 s)
+on 429 / 503 / timeout / connection reset or refused / body cut off:
+    if the request was sent after the last cut:      # once per congestion event
+        limit = max(1, limit / 2); slow_start = False; end any probe; drop the partial round
+    if Retry-After:  pause all dispatch until then (capped, default 300 s)
 ```
 
 - **Why the probe.** Queueing caused by our own load disappears when we halve it; a slowdown caused by slower pages or other users doesn't. The idea is borrowed from BBR's ProbeRTT phase, which drains its own queue to re-measure the path's base delay. Comparing each round's median with the median at low load, rather than with a low percentile, keeps a wide but steady spread of response times from reading as congestion.
-- **Evidence (A.11).** In simulation this law stays within about 10% of the ceiling's crawl time when the server has spare capacity. On a small origin that saturates at ~22 requests in flight, it cuts the time each request waits in the server's queue from 137 ms to 37–42 ms, for 1–2% more crawl time. The first draft's law, which cut the limit when the recent median passed 2× a p10 baseline, mistook spread for congestion: it held healthy sites to a mean of 1.4–2.9 requests in flight, 20–43× slower. Its baseline also drifted up once every sample came from a queue, so it never protected the small origin.
+- **Evidence (A.11).** In simulation this law stays within about 10% of the ceiling's crawl time when the server has spare capacity. On a small origin that saturates at ~22 requests in flight, it cuts the time each request waits in the server's queue from 137 ms to 37–40 ms, for 1–2% more crawl time. The first draft's law, which cut the limit when the recent median passed 2× a p10 baseline, mistook spread for congestion: it held healthy sites to a mean of 1.4–2.9 requests in flight, 20–43× slower. Its baseline also drifted up once every sample came from a queue, so it never protected the small origin.
+- **One cut per congestion event.** A burst of 429s answers requests that were all in flight at once, and one halving answers all of them: a congestion signal cuts only if its request was sent after the last cut, which is "once per round trip" made exact. On a simulated origin that answers 429 to a request arriving while 20 others are being served, slow start's overshoot to 32 draws a dozen 429s and one cut; the limit then cycles between 10 and 23 and averages 16, AIMD's sawtooth. Cutting for every 429 sends it as low as 2 (A.11).
 - **Untuned.** The thresholds (1.5×, 10 rounds, 20%) are validated in simulation only. Every decision is logged at `-v`, so real crawls can check them.
 - A new limit takes effect as permits are released. In-flight requests are never cancelled to shrink it.
 - **The ceiling.** It stays at 64 by default. It only binds on servers with spare capacity, and the error signals and the 403 rule ([§5.4](#54-errors-and-retries)) catch a server that objects. It's still about ten times the six connections a browser opens per host, so `--max-concurrency` is the first setting to turn down.
 - Optional hard ceilings:
-  - `--max-rps` is a token bucket on request starts.
+  - `--max-rps R` spaces request starts evenly, 1/R seconds apart, with no bursts: a quiet spell earns no catching up.
   - A robots.txt `Crawl-delay: d` becomes a 1/d requests-per-second ceiling. This is on by default; `--ignore-robots` turns it off along with the rules.
 - **Circuit breaker.** After 20 consecutive connection-level failures (DNS, connect, TLS), dispatch pauses and single probe requests back off from 1 s to 60 s. If the host stays unreachable for 5 minutes, the crawl aborts with exit code 4 and keeps its partial results. That's better than burning every URL's retry budget.
 
@@ -263,25 +268,29 @@ on 429 / 503 / timeout / connection reset / refused:
 
 | Condition | Action |
 |---|---|
-| DNS failure, connection refused or reset, TLS error, timeout, body cut off mid-transfer | Retry up to 3 times with exponential backoff and full jitter (base 0.5 s, cap 30 s); hard signal to the limiter |
+| DNS failure, connection refused or reset, TLS error, timeout, body cut off mid-transfer | Retry up to 3 times with exponential backoff and full jitter (base 0.5 s, cap 30 s). A hard signal to the limiter, except for DNS and TLS failures, which say nothing about the server's load |
 | 429, 503 | Honour `Retry-After` (seconds or HTTP-date), halve the limit, retry. These have their own budget of 5, so throttling doesn't use up the error retries |
 | 408, 500, 502, 504 | Retry up to 3 times with backoff |
 | Other 4xx/5xx (404, 410, 401, 403, …) | Final: counted, logged at `-v`, optional JSONL error record |
 | 20 consecutive 403s after successful pages | Likely a firewall block, not 20 forbidden pages. Pause dispatch and re-request the start URL with backoff. If it recovers, requeue those URLs once; if it's still blocked after 5 minutes, abort with exit code 4 and keep the partial results |
 | Redirect loop, more than 10 hops, off-host redirect | Final: recorded with the redirect chain. A redirect back into its own chain is followed first, for cookie gates; a loop ends at the 10-hop limit |
 | Body over the size cap | Parse the part received and flag `truncated` |
-| Invalid compression in a complete body | Final; the result is deterministic, so retrying won't help |
+| Corrupt compression | Final ("bad content-encoding"); the result is deterministic, so retrying won't help. A compressed stream that ends early isn't corrupt: it's parsed as far as it got and flagged `truncated`, as a browser renders it |
 | Worker crash (`BrokenProcessPool`) | Every job in the pool fails, not just the one that crashed (A.9). Rebuild the pool and resubmit them all without using up retries. If it breaks again, rerun the survivors one at a time: the page that crashes on its own gets a parse error, and the rest go through |
 
 Retries go back through the retry heap. Nothing sleeps while holding a permit.
 
 ### 5.5 Parser workers
 
-`parse_page(job) -> ParseResult` is a **pure function**: bytes in; bytes and strings out; no I/O; no shared state. That makes it independent of how it runs (a process pool today, threads on a free-threaded build later, inline with `--parse-workers 0`) and easy to unit-test. Static context (scope prefixes, output format, flags) is sent once, through the pool initializer, which also sets SIGINT and SIGTERM to ignored ([§4.3](#43-concurrency-model)).
+`parse_page(job) -> ParseResult` is a **pure function**: bytes in; bytes and strings out; no I/O; no shared state. That makes it independent of how it runs (a process pool today, threads on a free-threaded build later, inline with `--parse-workers 0`) and easy to unit-test. Static context (scope prefixes, output format, flags) is sent once, through the pool initializer, which also sets SIGINT to ignored ([§4.3](#43-concurrency-model)).
 
 The pipeline:
 
-1. **Decompress with an output cap:** gzip/deflate via zlib, br via brotli's `output_buffer_limit`, zstd via `compression.zstd` with `max_length`. A small gzip bomb can expand a thousandfold, so the cap applies to what is produced, not just what is downloaded.
+1. **Decompress with an output cap:** gzip/deflate via zlib, br via brotli's `output_buffer_limit`, zstd via `compression.zstd` with `max_length`. A small gzip bomb can expand a thousandfold, so the cap applies to what is produced, not just what is downloaded, and to every stage of stacked codings such as `gzip, br`.
+   - A stream that ends early, as one cut off at the size cap does, gives what it decodes to so far, flagged `truncated`: a browser renders a page whose body ended early. Only corrupt data is an error.
+   - `deflate` is zlib's format, or raw deflate when the zlib header is missing, as browsers accept. A zstd frame may not ask for a window over 8 MB (RFC 9659). Bytes after the end of the data are ignored, as Chrome ignores them after a gzip or brotli stream.
+   - Codings the crawler never asks for are skipped, as Firefox skips them: a server that sends `Content-Encoding: utf-8` applied none. More than 16 are refused.
+   - Where browsers differ from the standards, the crawler takes the standards: every member of a gzip body is read, where Chrome and Firefox stop after the first, and zlib checks each member's CRC, which they skip.
 2. **Pick the charset in WHATWG order:**
    - Byte-order mark.
    - HTTP `charset` parameter.
@@ -335,10 +344,10 @@ Each URL has two forms:
 
 ### 5.7 robots.txt
 
-- **When.** Rules are per origin (RFC 9309), so the file for every in-scope origin (at most two: `https` and `http` on the default ports) is fetched in parallel before the first page, while the parser pool warms up. Admission then never waits for a file, so it stays synchronous ([§4.3](#43-concurrency-model)). Most sites redirect `http://host/robots.txt` to `https://host/robots.txt`; each URL is requested once, and its answer serves both origins.
+- **When.** Rules are per origin (RFC 9309), so the file for every in-scope origin (at most two: `https` and `http` on the default ports) is fetched in parallel before the first page. The parser pool starts after them, once the start URL's redirects have fixed the scope, since each worker receives the scope with its context: the cost is one worker start before the first parse. Admission then never waits for a file, so it stays synchronous ([§4.3](#43-concurrency-model)). Most sites redirect `http://host/robots.txt` to `https://host/robots.txt`; each URL is requested once, and its answer serves both origins.
 - **Status handling per RFC 9309:**
   - Follow at least 5 redirects, to other hosts too; the file found governs the origin it was asked for. More than 5: there is no file.
-  - 2xx: parse the first 500 KiB, as UTF-8 with replacement. A line cut off at the limit is dropped, and so is a byte-order mark, which would hide the first line from Protego.
+  - 2xx: parse the first 500 KiB after decompression, as UTF-8 with replacement. A line cut off at the limit is dropped, and so is a byte-order mark, which would hide the first line from Protego.
   - 4xx other than 429, and anything else that isn't a file: allow everything.
   - 429, 5xx or no answer: 3 tries with backoff, then treat as complete disallow. For the start URL's origin that means exit 3, suggesting `--ignore-robots` for site owners; if the host never answered at all, the message says so instead, since `--ignore-robots` wouldn't help. For the other origin, its URLs are skipped and counted. RFC 9309 doesn't single out 429, but reading "too many requests" as permission would be the wrong way round; Google treats it as a server error too.
 - **Parser: Protego.** A small pure-Python library with no dependencies; the Scrapy project maintains it, but it doesn't need Scrapy. It implements longest-match precedence, `*` and `$` wildcards, and `Allow`. `urllib.robotparser` was rejected: it uses first-match semantics, doesn't support wildcards, and is 6–17× slower (measured).
@@ -429,7 +438,7 @@ class Response(Protocol):        # one HTTP exchange, no redirect handling
     url: str
     status: int
     headers: Mapping[str, str]   # the few the crawler reads
-    ttfb: float                  # seconds to response headers
+    ttfb: float                  # seconds to response headers, from connection-ready
     async def read(self, limit: int) -> tuple[bytes, bool]: ...
                                  # (body, still compressed; truncated at limit)
 
@@ -450,9 +459,11 @@ class ParseJob:                  # coordinator -> worker (pickled)
     truncated: bool
 
 class ParseResult(NamedTuple):   # worker -> coordinator
-    record: bytes                # rendered output, written verbatim
+    record: bytes                # rendered output, written verbatim; b"" on an error
     links: list[tuple[str, str]] # in-scope (key, url) pairs, unique, in document order
     links_found: int             # links printed on the page, for stats
+    decoded_bytes: int           # the body's size decompressed, for stats
+    error: str | None            # e.g. "bad content-encoding": deterministic, so final
 
 def parse_page(job: ParseJob, ctx: WorkerContext) -> ParseResult: ...
                                  # pure; ctx is the static context (§5.5), which a pool
@@ -472,11 +483,11 @@ A worked example: 100,000 pages, 80 KB of HTML on average (about 18 KB gzipped),
 | Throughput | 64 ÷ 0.15 s ≈ 430 pages/s, about 4 minutes in total |
 | Bandwidth | 430 × 18 KB ≈ 7.7 MB/s (~62 Mbit/s) |
 | Parser CPU | ~0.6 ms/page × 430/s ≈ 0.3 cores, so only a few worker processes ever start |
-| Coordinator CPU | ~0.2 ms/page × 430/s ≈ 0.09 cores |
-| Memory | Seen set: ~200k in-scope URLs × 136 B ≈ 27 MB. In-flight bodies, still compressed: under 100 slots × 18 KB ≈ 2 MB. About 40 MiB per worker. Well under 300 MB in total |
+| Coordinator CPU | ~0.27 ms/page × 430/s ≈ 0.12 cores (A.15) |
+| Memory | Seen set: ~200k in-scope URLs × 136 B ≈ 27 MB. In-flight bodies, still compressed: under 100 slots × 18 KB ≈ 2 MB. 15–52 MiB per worker. Well under 300 MB in total |
 | Output | 100k pages × 120 links × ~60 B ≈ 720 MB of text, so write to a file rather than a terminal |
 
-On this machine the client becomes the bottleneck only above about 2,900 pages/s with eight parser workers (more cores raise that) or about 4,000–7,000 pages/s at the coordinator.
+On this machine the client becomes the bottleneck only above about 2,800 pages/s with eight parser workers (more cores raise that) or about 3,500–6,500 pages/s at the coordinator.
 
 ---
 
@@ -490,7 +501,7 @@ On this machine the client becomes the bottleneck only above about 2,900 pages/s
 | D4 | selectolax (lexbor) | lxml, BeautifulSoup, html.parser, regex | Measured 2.6–3.2× faster than lxml, 12–16× faster than html.parser and 16–45× faster than BeautifulSoup. lexbor implements the full HTML5 parsing algorithm, including tree construction; libxml2's HTML parser doesn't. Regex is simply wrong: entities like `&amp;`, comments, scripts and quoting all break it |
 | D5 | ada-url (WHATWG) | urllib.parse, yarl | Matches browsers exactly and was the fastest measured: 0.67 µs per link, against 1.86 µs (urljoin) and 1.20 µs (yarl). urllib.parse differs from browsers on 10 of 16 tricky inputs. yarl follows RFC 3986: it maps `\` to `%5C` and decodes `%2F` in queries |
 | D6 | Process pool for parsing, fed compressed bytes | Inline parsing; free-threaded threads; subinterpreters; sharding the whole crawl across processes | Inline parsing caps at about 610 pages/s per core. Free-threading is blocked today because ada-url and brotli publish no cp314t wheels. Subinterpreters need C-extension support that isn't established. Sharding needs distributed dedupe and rate control, and almost every link found would have to cross to the process that owns it |
-| D7 | `ProcessPoolExecutor`, with submits under a blocked signal mask and crash isolation around it | A custom pipe-based pool with batching | The measured coordinator overhead of 110–205 µs per page (140–230 µs with HTTP) puts its ceiling at roughly 4,000–7,000 pages/s, far above realistic server rates. Its two sharp edges, a Ctrl-C while a worker starts and one crash failing every job, are handled around it (A.9). Revisit only if profiling shows the coordinator saturating |
+| D7 | `ProcessPoolExecutor`, with submits under a blocked signal mask and crash isolation around it | A custom pipe-based pool with batching | The measured coordinator overhead of 120–220 µs per page (150–250 µs with HTTP, 250–275 µs in a whole crawl) puts its ceiling at roughly 3,500–6,500 pages/s, far above realistic server rates. Its two sharp edges, a Ctrl-C while a worker starts and one crash failing every job, are handled around it (A.9). Revisit only if profiling shows the coordinator saturating |
 | D8 | Decompress in the workers | aiohttp auto-decompress | Halves coordinator CPU per request (51.7 → 26.5 µs). Lets the zip-bomb cap apply to decoded size |
 | D9 | An exact in-memory `set` | Bloom or cuckoo filter; an on-disk key-value store | False positives silently drop pages. 130 MiB per million URLs is affordable; disk only pays off beyond about 10M URLs |
 | D10 | BFS by depth, with a two-level dispatch window under `--max-depth` | DFS; heuristic priority; lowering depths and keeping cut-off pages' links | Wide frontier, predictable `--max-pages` subsets, exact depth semantics. DFS dives into traps first. The window was exact on 600 of 600 simulated sites; keeping links missed pages on 27–34% of them (A.10) |
@@ -558,7 +569,7 @@ Python 3.14 or later is required, because `compression.zstd` is in its standard 
 | Unit: limiter | Within 15% of the ceiling's crawl time when the server has spare capacity; under half the unthrottled queueing on a small origin; halves on 429; honours `Retry-After`; one cut per congestion event | The simulator behind ADR-001 (`bench/limiter_sim.py`) with a fake clock: a narrow and a wide steady spread of response times, a page-mix shift late and during slow start, and a small origin that queues |
 | Unit: robots | The crawler's own handling: fetching every origin up front, each status class including 429, redirects, re-fetching after 24 hours | Table tests, plus a few pinned Protego behaviours (longest match, wildcards, group selection). Google's test suite isn't run against Protego, which matches groups more loosely ([§5.7](#57-robotstxt)) |
 | Integration | Output matches ground truth exactly; each URL is fetched at most once | An in-process aiohttp server, over http and https, serving sites with known link graphs; a test resolver serves `*.test` hosts on their default ports: the scenarios below, plus seeded random graphs with random latencies, compared against a breadth-first search with and without `--max-depth`. The server's request log proves there are no double fetches |
-| Fault injection | Recovery without losing pages | Connection resets mid-body, truncated gzip, `kill -9` on one worker of a busy pool (only its page fails), Ctrl-C mid-crawl and while workers are starting (no partial records; summary printed), a run of 403s mid-crawl |
+| Fault injection | Recovery without losing pages | Connection resets mid-body, truncated gzip, `kill -9` on one worker of a busy pool (no page lost), a page that crashes its worker every time (only it fails), Ctrl-C mid-crawl and while workers are starting (no partial records; summary printed), a run of 403s mid-crawl |
 | Performance | No regressions | A local server with 50 ms of injected latency and 50k pages, tracking pages/s, coordinator CPU per page and peak RSS in CI. `bench/` holds the scripts behind this document |
 
 The integration test sites cover:
@@ -700,7 +711,7 @@ Designed here but after v1: the HSTS upgrade ([§5.1](#51-frontier-and-admission
 
 **Method:** five real pages were fetched once, then served from disk or from a local server. Figures are medians of repeated runs.
 
-**Reproducing:** run the scripts in `bench/`. The fixture pages aren't committed because they're third-party content; fetch your own with `curl --compressed`.
+**Reproducing:** run the scripts in `bench/` with `uv run --group bench`. The fixture pages aren't committed because they're third-party content; fetch your own with `curl --compressed`, as the README shows.
 
 **A.1 Link extraction only (`a[href]`), median time per page**
 
@@ -716,25 +727,42 @@ All five parsers found the same number of `<a href>` elements except on MDN. The
 
 **A.2 Full worker pipeline per page (decompress, parse, extract, resolve, normalize, render)**
 
-| Page | Unique links | gzip | br | zstd | uncompressed |
+The crawler's `parse_page` (`bench/pipeline_bench.py`), on pages fetched on 2026-10-20 with their charset from the response headers: [www.theguardian.com/international](https://www.theguardian.com/international), [en.wikipedia.org/wiki/Web_crawler](https://en.wikipedia.org/wiki/Web_crawler), [developer.mozilla.org/en-US/docs/Web/HTML](https://developer.mozilla.org/en-US/docs/Web/HTML), [docs.python.org/3/library/asyncio-eventloop.html](https://docs.python.org/3/library/asyncio-eventloop.html) and [www.python.org](https://www.python.org/). Bodies compressed at gzip 6, brotli 5 and zstd 3; the median of 7 rounds of 50 parses.
+
+| Page (decoded size) | Unique links | gzip | br | zstd | uncompressed |
 |---|---|---|---|---|---|
-| The Guardian | 299 | 2.80 ms | 3.11 | 2.72 | 2.37 |
-| Wikipedia | 497 | 1.91 | 2.05 | 1.88 | 1.73 |
-| MDN | 440 | 1.22 | 1.28 | 1.22 | 1.13 |
-| docs.python.org | 38 | 1.14 | 1.18 | 1.15 | 1.09 |
-| python.org | 134 | 0.43 | 0.44 | 0.43 | 0.40 |
+| The Guardian (1,426 KB) | 246 | 2.44 ms | 2.72 | 2.34 | 2.04 |
+| Wikipedia (348 KB) | 497 | 1.89 | 2.05 | 1.89 | 1.74 |
+| MDN (187 KB) | 376 | 1.04 | 1.09 | 1.05 | 0.99 |
+| docs.python.org (249 KB) | 58 | 1.71 | 1.78 | 1.73 | 1.65 |
+| python.org (52 KB) | 133 | 0.45 | 0.46 | 0.45 | 0.43 |
+
+These numbers first came from a prototype of the worker (`git show fe39313:bench/pipeline_bench.py`), which skipped charset detection and several of the standards' finer rules. The crawler's code had to stay within 10% of it. Run on the same pages, in alternating rounds:
+
+| Page | Crawler ÷ prototype, over the four encodings |
+|---|---|
+| The Guardian | 0.987–0.991 |
+| Wikipedia | 0.974–0.997 |
+| MDN | 1.074–1.082 |
+| docs.python.org | 1.023–1.027 |
+| python.org | 1.037–1.046 |
+| All twenty | 1.011 |
+
+MDN's 376 links had cost 11–12% more, until `parse.py`'s per-link path stopped calling helpers: it now strips the fragment inline, computes a dedupe key only for a URL with a `%` in it, and keeps the first of each URL with one dict operation.
 
 **A.3 Coordinator with and without the parser pool**
 
-Mixed pages from A.2 with gzip bodies; the coordinator submits, receives, dedupes and writes.
+A.2's pages with gzip bodies, round robin, through the crawler's parse gateway (`web_crawler.pool`): the coordinator submits, receives, dedupes and writes. Its CPU is its own process's, its threads included.
 
 | Parser processes | Pages/s | Coordinator CPU per page |
 |---|---|---|
-| 0 (inline) | 613 | 1,629 µs |
-| 1 | 591 | 114 µs |
-| 2 | 1,154 | 111 µs |
-| 4 | 2,030 | 181 µs |
-| 8 | 2,915 | 205 µs |
+| 0 (inline) | 611 | 1,632 µs |
+| 1 | 583 | 127 µs |
+| 2 | 1,135 | 119 µs |
+| 4 | 1,970 | 197 µs |
+| 8 | 2,812 | 220 µs |
+
+On the same pages, the prototype's coordinator, which passed its arguments to the executor directly, with no signal mask, reached pages/s within 4% of these for 12–17 µs less CPU per page with parser processes.
 
 **A.4 HTTP client cost**
 
@@ -760,6 +788,16 @@ Requests/s on loopback also depends on the local test server (six processes). CP
 | The same with `trust_env=True` and `NO_PROXY=*` | 13,719 | 83.1 µs |
 
 With `NO_PROXY=*` set, Python doesn't read macOS's system proxy settings, which is closer to what Linux pays. The transport reads the proxy variables once instead ([§5.2](#52-fetcher-and-transport)).
+
+Timing each response from when its connection is ready ([§5.2](#52-fetcher-and-transport)), measured the same way on 2026-10-20 with python.org's page from A.2 (9.6 KB gzipped): `client_bench.py` with `+trace` (aiohttp's `TraceConfig`) and `+ready` (the connector, as the transport does), five runs of each, each run next to one of the plain client:
+
+| Client | Requests/s | Client CPU per request |
+|---|---|---|
+| aiohttp + uvloop, `auto_decompress=False` | 38,974–38,987 | 25.6–25.7 µs |
+| The same, timed through `TraceConfig` | 29,539 | 33.9 µs (+8.3) |
+| The same, timed by the connector | 37,045 | 27.0 µs (+1.3) |
+
+The plan allowed the timing 5 µs. With any `TraceConfig`, aiohttp builds a trace object for every request and sends it every event, however few have handlers. The connector's `connect()` runs in the task that makes the request, so a context variable carries the moment to it.
 
 **A.5 URL resolution against the base `https://example.com/dir/page.html`**
 
@@ -799,7 +837,7 @@ p = Protego.parse("User-agent: crawler\nDisallow: /a\n\nUser-agent: web\nDisallo
 |---|---|
 | Seen set | 136 B per URL (62-character average), i.e. 130 MiB per million |
 | Frontier entry | 72 B |
-| Parser worker | ~40 MiB RSS |
+| Parser worker | 15 MiB RSS forked from the forkserver, 52 MiB spawned (A.9) |
 
 **A.8 Free-threaded wheels on PyPI for CPython 3.14t (October 2026)**
 
@@ -820,6 +858,20 @@ p = Protego.parse("User-agent: crawler\nDisallow: /a\n\nUser-agent: web\nDisallo
 | SIGINT 5–30 ms after starting 8 workers | All 8 jobs lost in 8 of 8 trials, with KeyboardInterrupt tracebacks on stderr | No loss in 8 trials |
 | SIGINT 50 ms after | No loss (2 trials) | No loss (2 trials) |
 | The fix: SIGINT blocked around `submit()`, then ignored and unblocked in the initializer | No loss in 10 of 10 trials (5–50 ms) | No loss in 10 of 10 trials |
+
+The crawler's own pool (`web_crawler.pool`) is tested the same way in `tests/integration/test_pool.py`: SIGINT to the process group 0–100 ms after eight workers start loses no parse and replaces no worker, while without the mask three of the four timings fail. Two more of the executor's habits came to light there:
+- On a broken pool, `ProcessPoolExecutor` stops the other workers with SIGTERM and waits for them. Workers that ignored SIGTERM, as this design first had them do, hung that wait, and with it the pool's recovery, for ever. They now keep its default.
+- A worker blocks on a queue it holds both ends of, so when the coordinator dies of a `kill -9` it waits for work for ever. Each now exits when its parent does.
+
+How fast a worker starts, with the `crawl` console script as the main module, 2026-10-20: the time to the first result of a new pool of two, and a worker's peak RSS.
+
+| Start method | First pool | Later pools | Worker RSS |
+|---|---|---|---|
+| `spawn` | 189 ms | 177 ms | 52 MiB |
+| `forkserver`, preloading the parser | 186 ms | 141 ms | 45 MiB |
+| `forkserver`, preloading `__main__` and the parser | 187 ms | 3 ms | 15 MiB |
+
+A worker imports the main module unless the forkserver has, and the crawl script imports all of the crawler. The first pool's time is the forkserver's own start.
 
 **A.10 `--max-depth` rules** (`bench/depth_sim.py`)
 
@@ -842,6 +894,9 @@ An event-driven simulation of 20,000 requests with a 20 ms round trip, over 3 se
 - **CDN, late shift:** cached pages at 20 ms with 10% uncached at 250 ms, then 80% uncached after 2,000 requests; ample capacity.
 - **CDN, early shift:** the same shift after 40 requests, during slow start.
 - **Small origin:** 16 workers at 50 ms per page, saturating at ~22 requests in flight.
+- **Throttling origin:** steady narrow pages, but a request that arrives while 20 others are being served is answered 429 at once, and sent again as soon as the limit allows.
+
+The guard + probe rows run the crawler's own class, `web_crawler.limiter.ConcurrencyLaw`. Its integer limit gives the float prototype's numbers but on the small origin, where the prototype's were 32.3–34.1 and 37–42.
 
 | Scenario | Law | Crawl time | × errors only | Mean limit | Queued in the server, 2nd half (ms/request) |
 |---|---|---|---|---|---|
@@ -860,7 +915,16 @@ An event-driven simulation of 20,000 requests with a 20 ms round trip, over 3 se
 | Small origin | first draft | 65–66 s | 1.00 | 62.7–63.1 | 137 |
 | | errors only | 65–66 s | 1.00 | 62.7 | 137 |
 | | guard, no probe | 65–66 s | 1.00 | 36.9–39.7 | 49–59 |
-| | guard + probe | 66–67 s | 1.01–1.02 | 32.3–34.1 | 37–42 |
+| | guard + probe | 66–67 s | 1.01–1.02 | 32.4–34.0 | 37–40 |
+
+On the throttling origin, with one cut per congestion event (§5.3) and with every 429 cutting:
+
+| Law | Crawl time | Mean limit | 429s | Cuts | Limit after the first cut |
+|---|---|---|---|---|---|
+| guard + probe | 159–160 s | 15.9–16.0 | 140–146 | 113–114 | 10–23 |
+| every 429 cuts | 162–164 s | 15.4–15.6 | 132–140 | 120–130 | 2–23 |
+
+Slow start overshoots to 32, and a dozen requests get a 429 at once: one cut answers them all. The limit then climbs back past 20 and is halved, over and over, AIMD's sawtooth; it averages 16, and the crawl takes 159 s where 20 requests in flight would take about 120. Cutting for every 429 costs little time here, but lets one burst halve the limit again and again.
 
 The first draft gave the same results with baseline windows of the last 300, 1,000 or 3,000 samples, or all of them: 2,898–2,917 s on the late-shift CDN site, and 137 ms of queueing on the small origin (seed 1).
 
@@ -917,3 +981,21 @@ The standard's `indexes.json` at whatwg/encoding commit `be17ac5`, against Pytho
 | ISO-2022-JP | iso2022_jp_ext | 7,336 | 6,873 | 6 | 457 |
 
 The differences are rare symbols and vendor extensions, such as EUC-JP 0xA1C1, which Python decodes as U+301C WAVE DASH and the standard as U+FF5E FULLWIDTH TILDE. All 20 gb18030 differences are sequences Python decodes to private-use characters and the standard to real ones, most of them characters that GB18030's 2022 revision moved out of the private-use area. They change a link only when its href contains one of these characters unescaped. Each codec errs on a single bad byte without swallowing the ASCII byte after it, so the markup around it parses the same.
+
+**A.15 A whole crawl** (`bench/e2e.py`)
+
+50,000 synthetic pages from a pre-fork aiohttp server on the same machine, each answered after 50 ms: 70 KB of HTML, 9.9 KB gzipped, with 123 links: the next page, 119 other pages of the site picked at random, the page itself as its canonical URL, and two pages on other hosts. The crawl runs in the benchmark's own process with the crawler's defaults (`--max-concurrency 64`, parser processes started on demand up to 9), writing to /dev/null, so its CPU and peak RSS are the coordinator's: its threads are counted, its parser processes aren't. Measured on 2026-10-20:
+
+| Crawl | Pages/s | Coordinator CPU per page | Coordinator peak RSS |
+|---|---|---|---|
+| 50,000 pages, 4 server processes | 1,096 | 268 µs | 67 MiB |
+| 50,000 pages, 6 server processes | 1,110 | 269 µs | 66 MiB |
+| 20,000 pages, at most 2 parser processes | 1,056 | 248 µs | 61 MiB |
+| 20,000 pages, at most 4 | 1,096 | 256 µs | 62 MiB |
+| 20,000 pages, at most 9 | 1,098 | 268 µs | 62 MiB |
+| 20,000 pages, parsed inline | 1,095 | 332 µs | 63 MiB |
+
+- In the two 50,000-page crawls the concurrency limit averaged 63.0 and 63.6, with no rounds held and no probes. Slow start takes it to its ceiling within 0.4 s, and the law stays in slow start at the ceiling, so a round whose median reaches 1.5 times the base halves the limit there rather than holding it. That happened in one of the five crawls of this size whose decisions were logged, the table's first, and the limit grew back by one a round. The rounds' median time to first byte was 56.7–56.8 ms: the injected 50 ms, plus the server's own work on a machine it shares with the crawl. At 64 requests in flight that allows about 1,127 pages/s, and the crawls reached 97–98% of it.
+- Parsing one of these pages takes 205 µs, so the inline crawl's 332 µs leaves about 125 µs for HTTP, the engine's bookkeeping and the output; the parser processes' machinery costs about as much again, a little more with more of them. Adding A.3's cost to A.4's, as §1 does, leaves the engine's bookkeeping out.
+- Over repeated runs of the same code, pages/s varied by about 5% and CPU per page by about 15 µs.
+- The coordinator's memory stays far below §7's 300 MB.

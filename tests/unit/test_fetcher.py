@@ -1,7 +1,9 @@
 import asyncio
+import gzip
 import itertools
 from collections.abc import Collection
 
+import brotli
 import pytest
 
 from tests.support.fake_transport import Answer, FakeTransport, Reply
@@ -9,6 +11,7 @@ from tests.support.jitter import Highest
 from web_crawler.fetcher import (
     DRAIN_LIMIT,
     MAX_REDIRECTS,
+    SNIFF_READ,
     AdmissionHops,
     Claimed,
     Fetcher,
@@ -66,8 +69,16 @@ async def fetch(
         (203, {"Content-Type": "TEXT/HTML"}, Triage.PAGE),
         (200, {"Content-Type": "text/plain"}, Triage.NOT_PAGE),
         (200, {"Content-Type": "text/html-sandboxed"}, Triage.NOT_PAGE),
-        (200, {}, Triage.NOT_PAGE),  # sniffing a missing type comes later
-        (204, {}, Triage.NOT_PAGE),
+        # No usable type: sniffed, unless the server forbids it.
+        (200, {}, Triage.SNIFF),
+        (204, {}, Triage.SNIFF),
+        (200, {"Content-Type": "*/*"}, Triage.SNIFF),
+        (200, {"Content-Type": "unknown/unknown"}, Triage.SNIFF),
+        (200, {"Content-Type": "Application/Unknown"}, Triage.SNIFF),
+        (200, {"Content-Type": "nonsense"}, Triage.SNIFF),
+        (200, {"X-Content-Type-Options": "nosniff"}, Triage.NOT_PAGE),
+        (200, {"X-Content-Type-Options": " NoSniff , other"}, Triage.NOT_PAGE),
+        (200, {"X-Content-Type-Options": "other, nosniff"}, Triage.SNIFF),  # the first counts
         (301, {"Location": "/x"}, Triage.REDIRECT),
         (302, {"Location": "/x"}, Triage.REDIRECT),
         (303, {"Location": "/x"}, Triage.REDIRECT),
@@ -113,6 +124,67 @@ async def test_passes_the_headers_charset_to_the_parser(
     outcome, _, _ = await fetch({START: Reply(headers={"Content-Type": content_type})})
     assert isinstance(outcome, Page)
     assert outcome.job.http_charset == charset
+
+
+async def test_a_page_stays_compressed() -> None:
+    body = gzip.compress(b"<p>hi")
+    headers = HTML | {"Content-Encoding": "gzip"}
+    outcome, _, _ = await fetch({START: Reply(headers=headers, body=body)})
+    assert outcome == Page(ParseJob(START, body, "utf-8", content_encoding="gzip"))
+
+
+@pytest.mark.parametrize(
+    ("headers", "body"),
+    [
+        ({}, b"<!DOCTYPE html><a href=/x>"),
+        ({"Content-Type": "unknown/unknown"}, b"\n\t <HTML>"),
+        ({"Content-Encoding": "gzip"}, gzip.compress(b" <p>gzipped")),
+        ({"Content-Encoding": "br"}, brotli.compress(b"<!-- x -->" + b"x" * 100_000)),
+    ],
+)
+async def test_sniffs_a_page_without_a_type(headers: dict[str, str], body: bytes) -> None:
+    outcome, transport, _ = await fetch({START: Reply(headers=headers, body=body)})
+    assert outcome == Page(
+        ParseJob(START, body, None, content_encoding=headers.get("Content-Encoding"))
+    )
+    assert transport.responses[0].position == len(body)
+
+
+async def test_sniffing_reads_a_long_page_to_the_cap() -> None:
+    body = b"<html>" + b"x" * SNIFF_READ * 3
+    outcome, _, _ = await fetch(
+        {START: Reply(headers={}, body=body)}, max_page_bytes=SNIFF_READ * 2
+    )
+    assert outcome == Page(ParseJob(START, body[: SNIFF_READ * 2], None, truncated=True))
+    outcome, _, _ = await fetch({START: Reply(headers={}, body=body)}, max_page_bytes=10)
+    assert outcome == Page(ParseJob(START, body[:10], None, truncated=True))
+
+
+@pytest.mark.parametrize(
+    ("headers", "body", "read"),
+    [
+        ({}, b"%PDF-1.7 " + b"x" * 100, 109),
+        ({}, b"", 0),
+        ({"Content-Type": "*/*", "Content-Length": "70000"}, b"x" * 70_000, SNIFF_READ),
+        ({"Content-Length": "20000"}, b"x" * 20_000, 20_000),  # drained
+        # The body is HTML, but the server forbids sniffing: not even its start is read.
+        ({"X-Content-Type-Options": "nosniff"}, b"<html>", 6),
+    ],
+)
+async def test_a_body_without_a_type_that_isnt_html_is_not_a_page(
+    headers: dict[str, str], body: bytes, read: int
+) -> None:
+    outcome, transport, _ = await fetch({START: Reply(headers=headers, body=body)})
+    assert outcome == NotPage(START, headers.get("Content-Type"))
+    assert transport.responses[0].position == (0 if "X-Content-Type-Options" in headers else read)
+
+
+async def test_a_body_without_a_type_that_cant_be_decompressed() -> None:
+    reply = Reply(headers={"Content-Encoding": "gzip"}, body=b"<html> not gzip")
+    outcome, _, _ = await fetch({START: reply})
+    assert isinstance(outcome, Final)
+    assert outcome.reason == "bad content-encoding"
+    assert outcome.detail.startswith("HTTP 200, gzip: Error -3 while decompressing data")
 
 
 async def test_follows_redirects_and_reports_the_final_url() -> None:
@@ -399,6 +471,40 @@ async def test_robots_redirect_to_a_url_that_cant_be_fetched(location: str) -> N
     assert file == RobotsTxt(
         ROBOTS, Availability.UNAVAILABLE, "HTTP 302 to a URL that can't be fetched"
     )
+
+
+@pytest.mark.parametrize("encoding", ["gzip", "br"])
+async def test_robots_is_decompressed(encoding: str) -> None:
+    rules = b"User-agent: *\nDisallow: /private\n"
+    body = gzip.compress(rules) if encoding == "gzip" else brotli.compress(rules)
+    headers = TEXT | {"Content-Encoding": encoding}
+    [file], _, _ = await robots_txt({ROBOTS: Reply(headers=headers, body=body)})
+    assert (file.availability, file.detail) == (Availability.FOUND, "33 bytes")
+    assert not file.allowed("https://example.com/private", "web-crawler")
+
+
+async def test_robots_reads_at_most_500_kib_decompressed() -> None:
+    rule = b"Disallow: /x\n"
+    rules = b"User-agent: *\n" + rule * (MAX_ROBOTS_BYTES // len(rule) + 10)
+    headers = TEXT | {"Content-Encoding": "gzip"}
+    [file], transport, _ = await robots_txt(
+        {ROBOTS: Reply(headers=headers, body=gzip.compress(rules))}
+    )
+    kept = rules[:MAX_ROBOTS_BYTES]
+    kept = kept[: kept.rfind(b"\n") + 1]  # without the line cut off at the limit
+    assert file.detail == f"{len(kept):,} bytes, truncated"
+    assert transport.responses[0].position < MAX_ROBOTS_BYTES  # all of it, compressed
+
+
+async def test_robots_that_cant_be_decompressed_is_unreachable() -> None:
+    headers = TEXT | {"Content-Encoding": "gzip"}
+    [file], transport, sleeps = await robots_txt({ROBOTS: Reply(headers=headers, body=b"junk")})
+    assert file.availability is Availability.UNREACHABLE
+    assert file.detail.startswith("HTTP 200, gzip: Error -3 while decompressing data")
+    assert file.detail.endswith(", 3 tries")
+    assert file.no_answer is None  # the host answered
+    assert transport.requested == [ROBOTS] * 3
+    assert sleeps.delays == [0.5, 1.0]
 
 
 async def test_robots_reads_at_most_500_kib() -> None:

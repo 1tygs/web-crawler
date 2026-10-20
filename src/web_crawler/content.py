@@ -1,18 +1,30 @@
-"""What a response's body is: its Content-Type and its charset (DESIGN.md §2.4, §5.2, §5.5).
+"""What a response's body is: its Content-Type, its content codings and its charset
+(DESIGN.md §2.4, §5.2, §5.5).
 
-The algorithms are the WHATWG ones browsers use, step for step: "parse a MIME type" from
-MIME Sniffing, "extract a MIME type" and "collect an HTTP quoted string" from Fetch, and,
-from HTML, how a page's character encoding is determined.
+The algorithms are the WHATWG ones browsers use, step for step: "parse a MIME type" and the
+rules for identifying an unknown MIME type from MIME Sniffing, "extract a MIME type",
+"collect an HTTP quoted string" and "determine nosniff" from Fetch, and, from HTML, how a
+page's character encoding is determined.
 """
 
 import codecs
 import enum
+import functools
 import re
+import zlib
+from compression import zstd
 from typing import NamedTuple
+
+import brotli
 
 from web_crawler.encodings import UTF_8, WINDOWS_1252, get_encoding, sniff_bom
 
 HTML_TYPES = frozenset({"text/html", "application/xhtml+xml"})
+# Essences that say nothing, so a body that has one is sniffed, as one without a type is.
+UNKNOWN_TYPES = frozenset({"unknown/unknown", "application/unknown"})
+
+# Why a page isn't printed when its body's content codings can't be undone.
+UNDECODABLE = "bad content-encoding"
 
 _HTTP_WHITESPACE = "\t\n\r "
 _HTTP_TAB_OR_SPACE = "\t "
@@ -24,10 +36,14 @@ _QUOTED_STRING_TOKEN = frozenset(
 type MimeType = tuple[str, dict[str, str]]  # essence, parameters
 
 
+@functools.lru_cache(maxsize=256)
 def parse_content_type(value: str | None) -> tuple[str | None, str | None]:
     """The essence (type/subtype, lowercase) and charset parameter of a Content-Type header
     value, or (None, None) when it's missing or unparseable. value may be several header
-    lines combined with commas, as a server that sends Content-Type twice produces."""
+    lines combined with commas, as a server that sends Content-Type twice produces.
+
+    A host sends a few Content-Types over and over, and a page's is read twice, so the
+    answers are kept: parsing one costs about 2 µs, and looking it up 0.05 µs."""
     if value is None:
         return None, None
     found: MimeType | None = None
@@ -124,6 +140,14 @@ def _collect_quoted_string(text: str, position: int, *, extract_value: bool) -> 
     return ("".join(value) if extract_value else text[start:position]), position
 
 
+def nosniff(value: str | None) -> bool:
+    """Fetch's "determine nosniff", from an X-Content-Type-Options header value: whether it
+    forbids sniffing, which keeps a body without a type from being read as HTML."""
+    if value is None:
+        return False
+    return _split_header_value(value)[0].translate(_ASCII_LOWERCASE) == "nosniff"
+
+
 def _split_header_value(value: str) -> list[str]:
     """Fetch's "get, decode, and split": the comma-separated items, with commas inside
     quoted strings kept."""
@@ -145,6 +169,231 @@ def _split_header_value(value: str) -> list[str]:
         if position >= len(value):
             return items
         position += 1  # past ","
+
+
+class ContentDecodeError(ValueError):
+    """A body whose content codings can't be undone: its data is corrupt. Fetching it again
+    would give the same bytes, so the page fails for good (DESIGN.md §5.4)."""
+
+
+# More codings than this are refused. A real response has one, rarely two, and each is
+# undone in full, up to the cap, so a long list could make one page cost far more. Firefox
+# undoes no more than 16 either.
+MAX_CODINGS = 16
+
+_GZIP_OR_ZLIB = 32 + zlib.MAX_WBITS  # zlib detects which header the stream starts with
+_GZIP_MAGIC = b"\x1f\x8b"
+_MAX_ZLIB_WINDOW = 7  # 2 ** (7 + 8) bytes, 32 KiB: the most a zlib header can declare
+_ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+_ZSTD_SKIPPABLE = re.compile(rb"[\x50-\x5f]\x2a\x4d\x18")  # a skippable frame's magic
+# RFC 9659 caps a zstd frame's window at 8 MB for HTTP, and lets a decoder fail a frame that
+# asks for more. zstd's own default would allow 128 MiB.
+_ZSTD_OPTIONS: dict[int, int] = {zstd.DecompressionParameter.window_log_max: 23}
+
+
+def decode_body(body: bytes, content_encoding: str | None, cap: int) -> tuple[bytes, bool]:
+    """Undo a body's content codings: what they encode, at most cap bytes of it, and whether
+    that was cut short.
+
+    content_encoding is the Content-Encoding header. It lists the codings in the order the
+    server applied them, so they're undone last first. Each stage stops at cap bytes of
+    output, so a decompression bomb costs no more than cap bytes however far it would
+    expand. A stream that ends early, as one cut off at the size cap does, gives what it
+    decodes to so far, which is what a browser renders; either way the result is flagged as
+    cut short. Corrupt data raises ContentDecodeError.
+
+    The codings are gzip (and x-gzip), deflate, br and zstd, the ones the crawler asks for.
+    "identity" means none, and any other coding, which a server shouldn't send, is skipped,
+    as Firefox skips it: a server that sends "Content-Encoding: utf-8" applied no coding.
+    """
+    truncated = False
+    if content_encoding is not None:
+        for coding in reversed(_codings(content_encoding)):
+            if not body:  # the empty stream, in any coding
+                break
+            try:
+                body, cut = _DECODERS[coding](body, cap)
+            except (zlib.error, brotli.error, zstd.ZstdError) as error:
+                raise ContentDecodeError(f"{coding}: {error}") from None
+            truncated = truncated or cut
+    if len(body) > cap:
+        return body[:cap], True
+    return body, truncated
+
+
+def _codings(content_encoding: str) -> list[str]:
+    """The codings to undo, from a Content-Encoding header value, in the order applied."""
+    lowercase = content_encoding.translate(_ASCII_LOWERCASE)
+    names = [item.strip(_HTTP_TAB_OR_SPACE) for item in lowercase.split(",")]
+    codings = [name for name in names if name in _DECODERS]
+    if len(codings) > MAX_CODINGS:
+        raise ContentDecodeError(f"{len(codings)} content codings; at most {MAX_CODINGS} count")
+    return codings
+
+
+def _gunzip(data: bytes, cap: int) -> tuple[bytes, bool]:
+    """gzip. RFC 1952 lets a body be several gzip files, or members, in a row, and all of
+    them are read, where Chrome and Firefox stop after the first. zlib checks each member's
+    CRC, which they skip. Bytes after the last member are ignored, as they ignore them."""
+    output: list[bytes] = []
+    size = 0
+    while True:
+        decoder = zlib.decompressobj(_GZIP_OR_ZLIB)
+        try:
+            output.append(chunk := decoder.decompress(data, cap + 1 - size))
+        except zlib.error:
+            if not output:
+                raise
+            return b"".join(output), False  # bytes that only looked like another member
+        size += len(chunk)
+        if size > cap or not decoder.eof:  # at the cap, or the data ended mid-member
+            return b"".join(output)[:cap], True
+        data = decoder.unused_data
+        if not data.startswith(_GZIP_MAGIC):
+            return b"".join(output), False
+
+
+def _inflate(data: bytes, cap: int) -> tuple[bytes, bool]:
+    """deflate, which RFC 9110 defines as zlib's format. Some servers send raw deflate,
+    without zlib's header, and browsers accept that too: data that doesn't start with a
+    valid header is read as raw."""
+    decoder = zlib.decompressobj(zlib.MAX_WBITS if _zlib_header(data) else -zlib.MAX_WBITS)
+    output = decoder.decompress(data, cap + 1)
+    if len(output) > cap:
+        return output[:cap], True
+    return output, not decoder.eof
+
+
+def _zlib_header(data: bytes) -> bool:
+    """Whether data starts with RFC 1950's header: method 8, deflate, with a window of at
+    most 32 KiB, and check bits that make the two bytes, read as a number, a multiple of 31."""
+    if len(data) <= 1:
+        return False
+    method_and_window, flags = data[0], data[1]
+    return (
+        method_and_window & 0x0F == zlib.DEFLATED
+        and method_and_window >> 4 <= _MAX_ZLIB_WINDOW
+        and (method_and_window << 8 | flags) % 31 == 0
+    )
+
+
+def _unbrotli(data: bytes, cap: int) -> tuple[bytes, bool]:
+    """br. Bytes after the end of the stream are ignored, as Chrome ignores them."""
+    try:
+        return _unbrotli_whole(data, cap)
+    except brotli.error:
+        # The data is corrupt, or bytes follow the end of the stream, which the decoder
+        # rejects, along with all its output.
+        if (end := _brotli_end(data, cap)) is None:
+            raise
+        return _unbrotli_whole(data[:end], cap)
+
+
+def _unbrotli_whole(data: bytes, cap: int) -> tuple[bytes, bool]:
+    """br, when data is the stream and nothing after it. The decoder's output limit is soft,
+    so the output can pass cap (plan §2), and is sliced."""
+    decoder = brotli.Decompressor()
+    output = decoder.process(data, output_buffer_limit=cap + 1)
+    if len(output) > cap:
+        return output[:cap], True
+    return output, not decoder.is_finished()
+
+
+def _brotli_end(data: bytes, cap: int) -> int | None:
+    """Where the brotli stream that data starts with ends, if other bytes follow it.
+
+    A prefix of data that ends before the stream does decodes to an unfinished stream, one
+    that ends after it fails, and one that ends with it is finished: so it's found by
+    bisection. A prefix that decodes past cap is as good as the whole stream. There's no
+    end if the data is corrupt, as then no prefix finishes.
+    """
+    low, high = 1, len(data) - 1  # data itself failed
+    while low <= high:
+        middle = (low + high) // 2
+        decoder = brotli.Decompressor()
+        try:
+            output = decoder.process(data[:middle], output_buffer_limit=cap + 1)
+        except brotli.error:
+            high = middle - 1
+            continue
+        if decoder.is_finished() or len(output) > cap:
+            return middle
+        low = middle + 1
+    return None
+
+
+def _unzstd(data: bytes, cap: int) -> tuple[bytes, bool]:
+    """zstd, frame by frame: RFC 8878 lets a body be several frames, some of them skippable.
+    Bytes after the last frame are ignored, as for gzip."""
+    output: list[bytes] = []
+    size = 0
+    while True:
+        decoder = zstd.ZstdDecompressor(options=_ZSTD_OPTIONS)
+        try:
+            output.append(chunk := decoder.decompress(data, max_length=cap + 1 - size))
+        except zstd.ZstdError:
+            if not output:
+                raise
+            return b"".join(output), False  # bytes that only looked like another frame
+        size += len(chunk)
+        if size > cap or not decoder.eof:
+            return b"".join(output)[:cap], True
+        data = decoder.unused_data
+        if not (data.startswith(_ZSTD_MAGIC) or _ZSTD_SKIPPABLE.fullmatch(data[:4])):
+            return b"".join(output), False
+
+
+_DECODERS = {
+    "gzip": _gunzip,
+    "x-gzip": _gunzip,
+    "deflate": _inflate,
+    "br": _unbrotli,
+    "zstd": _unzstd,
+}
+
+# How much of a body sniffing reads: MIME Sniffing's resource header.
+SNIFF_BYTES = 1445
+
+_WHITESPACE_BYTES = b"\t\n\x0c\r "
+# MIME Sniffing's patterns for text/html, which a space or ">" must follow. Letters match in
+# either case.
+_HTML_PATTERNS = tuple(
+    pattern.encode()
+    for pattern in (
+        "<!DOCTYPE HTML",
+        "<HTML",
+        "<HEAD",
+        "<SCRIPT",
+        "<IFRAME",
+        "<H1",
+        "<DIV",
+        "<FONT",
+        "<TABLE",
+        "<A",
+        "<STYLE",
+        "<TITLE",
+        "<B",
+        "<BODY",
+        "<BR",
+        "<P",
+        "<!--",
+    )
+)
+
+
+def sniff_html(header: bytes) -> bool:
+    """Whether a body with no usable type is HTML, from its first SNIFF_BYTES, decoded.
+
+    These are MIME Sniffing's rules for identifying an unknown MIME type, as far as they
+    concern HTML: after any whitespace, the body starts with one of the patterns above,
+    then a space or ">". Whether sniffing is allowed at all is nosniff's to say.
+    """
+    start = len(header) - len(header.lstrip(_WHITESPACE_BYTES))
+    for pattern in _HTML_PATTERNS:
+        end = start + len(pattern)
+        if header[start:end].upper() == pattern and header[end : end + 1] in (b" ", b">"):
+            return True
+    return False
 
 
 class Source(enum.Enum):

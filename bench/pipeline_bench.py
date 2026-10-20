@@ -1,133 +1,109 @@
-"""Appendix A.2/A.3: full parse-pipeline cost per page, and coordinator cost with/without a process pool.
+"""Appendix A.2/A.3: the parse pipeline's cost per page, and the coordinator's with and without
+parser processes.
 
-Usage: python bench/pipeline_bench.py FIXTURES_DIR
+Usage: uv run --group bench python bench/pipeline_bench.py FIXTURES_DIR
 
-parse_page() here is a measurement prototype of the worker contract in DESIGN.md §5.5:
-compressed body in -> (rendered output bytes, in-scope dedupe keys) out. It omits charset
-sniffing (UTF-8 fast path only) and returns keys rather than (key, url) pairs.
+Both run the crawler's own code. A.2 times web_crawler.parse.parse_page, which a parser process
+runs for each page: decompress, decode, parse, extract, resolve, normalize, render. A.3 sends
+gzipped pages through the parse gateway, web_crawler.pool, as the crawl's coordinator does:
+submit, receive, dedupe the links, write the record.
+
+FIXTURES_DIR holds saved pages, NAME.html, and if it's there the headers each was served with,
+NAME.headers (curl -D), for its charset. A page is parsed as https://www.NAME.org/some/dir/page.
 """
-import asyncio, gzip, os, re, sys, time, resource, pathlib, zlib, statistics
-from concurrent.futures import ProcessPoolExecutor
-import brotli, ada_url, orjson
+import asyncio, gzip, os, pathlib, resource, statistics, sys, time
+import brotli
+import uvloop
 from compression import zstd
-from selectolax.lexbor import LexborHTMLParser
 
-MAX_OUT = 32 * 1024 * 1024
-NAV_SEL = "a[href], area[href], iframe[src], frame[src], link[href][rel], meta[http-equiv]"
-LINK_RELS = {"canonical", "alternate", "next", "prev", "previous"}
-_PCT = re.compile(r"%[0-9A-Fa-f]{2}")
-_UNRESERVED = frozenset(b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
-_REFRESH = re.compile(r"^\s*\d*(?:\.\d*)?\s*[;,]?\s*(?:url\s*=\s*)?(['\"]?)(.+?)\1\s*$", re.I)
+from web_crawler.content import parse_content_type
+from web_crawler.parse import parse_page
+from web_crawler.pool import InlineParser, ProcessParser
+from web_crawler.types import ParseJob, WorkerContext
 
-def _pct(m):
-    v = int(m.group(0)[1:], 16)
-    return chr(v) if v in _UNRESERVED else m.group(0).upper()
+MAX_BYTES = 32 * 1024 * 1024  # --max-page-bytes' default
+ROUNDS, PER_ROUND = 7, 50
 
-def dedupe_key(url):  # RFC 3986 6.2.2.2 on top of WHATWG serialization
-    return _PCT.sub(_pct, url) if "%" in url else url
 
-def decompress(body, enc):
-    if not enc or enc == "identity": return body[:MAX_OUT]
-    if enc in ("gzip", "x-gzip", "deflate"):
-        wbits = 47 if enc != "deflate" else 15  # 47 = auto gzip/zlib header
-        d = zlib.decompressobj(wbits); out = d.decompress(body, MAX_OUT); return out
-    if enc == "br": return brotli.Decompressor().process(body, output_buffer_limit=MAX_OUT)
-    if enc == "zstd": return zstd.ZstdDecompressor().decompress(body, max_length=MAX_OUT)
-    raise ValueError(enc)
-
-def _attrs_links(root, out):
-    for n in root.css(NAV_SEL):
-        tag = n.tag; a = n.attributes
-        if tag in ("a", "area"): v = a.get("href")
-        elif tag in ("iframe", "frame"): v = a.get("src")
-        elif tag == "link":
-            rel = (a.get("rel") or "").lower().split()
-            v = a.get("href") if LINK_RELS.intersection(rel) else None
-        else:  # meta refresh
-            if (a.get("http-equiv") or "").lower() != "refresh": continue
-            m = _REFRESH.match(a.get("content") or ""); v = m.group(2) if m else None
-        if v is not None: out.append(v)
-    for frag in root.template_fragments():  # declarative shadow DOM is rendered; plain <template> is inert
-        p = frag.parent
-        if p is not None and "shadowrootmode" in p.attributes: _attrs_links(frag, out)
-    return out
-
-def parse_page(page_url, content_encoding, body, scope_prefixes, fmt="text", depth=0):
-    html = decompress(body, content_encoding)
-    tree = LexborHTMLParser(html)  # UTF-8 fast path (charset sniffing omitted in proto)
-    base = page_url
-    b = tree.css_first("base[href]")
-    if b is not None:
-        try: base = ada_url.join_url(page_url, b.attributes.get("href") or "")
-        except ValueError: pass
-    seen, links, keys = set(), [], []
-    for raw in _attrs_links(tree, []):
-        try: u = ada_url.join_url(base, raw)
-        except ValueError: continue
-        if not u.startswith(("https:", "http:")): continue
-        h = u.find("#")
-        if h != -1: u = u[:h]
-        if u in seen: continue
-        seen.add(u); links.append(u)
-        if u.startswith(scope_prefixes): keys.append(dedupe_key(u))
-    if fmt == "jsonl":
-        out = orjson.dumps({"url": page_url, "depth": depth, "links": links}) + b"\n"
-    else:
-        out = (page_url + "\n" + "".join("  " + l + "\n" for l in links) + "\n").encode()
-    return out, keys
-
-# ---------------------------------------------------------------- benchmarks
-def load_pages(fix):
+def load_pages(fixtures):
+    """(name, url, page, charset, scope prefixes) for each saved page."""
     pages = []
-    for p in sorted(pathlib.Path(fix).glob("*.html")):
-        raw = p.read_bytes()
-        host = f"www.{p.stem}.org"
-        pages.append((f"https://{host}/some/dir/page", raw, (f"https://{host}/", f"http://{host}/")))
+    for path in sorted(pathlib.Path(fixtures).glob("*.html")):
+        headers = path.with_suffix(".headers")
+        content_type = None
+        if headers.exists():
+            for line in headers.read_text("latin-1").splitlines():
+                if line.lower().startswith("content-type:"):
+                    content_type = line.split(":", 1)[1].strip()
+        host = f"www.{path.stem}.org"
+        scope = (f"https://{host}/", f"http://{host}/")
+        pages.append((path.stem, f"https://{host}/some/dir/page", path.read_bytes(),
+                      parse_content_type(content_type)[1], scope))
     return pages
 
-def cpu():
-    r = resource.getrusage(resource.RUSAGE_SELF); return r.ru_utime + r.ru_stime
 
-def bench_inline(pages):
-    print("per-page worker CPU (inline, single core):")
-    for url, raw, scope in pages:
-        variants = {"gzip": gzip.compress(raw, 6), "br": brotli.compress(raw, quality=5), "zstd": zstd.compress(raw, 3), None: raw}
-        row = []
-        for enc, body in variants.items():
-            parse_page(url, enc, body, scope)
-            n = 200; t0 = time.perf_counter()
-            for _ in range(n): out, keys = parse_page(url, enc, body, scope)
-            row.append(f"{str(enc):>5}={((time.perf_counter()-t0)/n)*1e3:6.2f}ms")
-        print(f"  {url.split('.')[1]:<10} {len(raw)//1024:>5} KB  links={len(out.decode().splitlines())-2:<4} in-scope={len(keys):<4} " + "  ".join(row))
+def encodings(page):
+    return {"gzip": gzip.compress(page, 6), "br": brotli.compress(page, quality=5),
+            "zstd": zstd.compress(page, 3), None: page}
+
+
+def per_page(pages):
+    print(f"A.2: parse_page per page, ms, the median of {ROUNDS} rounds of {PER_ROUND}")
+    print(f"  {'page':<10} {'KB':>6} {'links':>6} {'gzip':>7} {'br':>7} {'zstd':>7} {'none':>7}")
+    for name, url, page, charset, scope in pages:
+        ctx = WorkerContext(scope, MAX_BYTES)
+        times = []
+        for encoding, body in encodings(page).items():
+            job = ParseJob(url, body, charset, False, encoding)
+            result = parse_page(job, ctx)
+            rounds = []
+            for _ in range(ROUNDS):
+                started = time.perf_counter()
+                for _ in range(PER_ROUND):
+                    parse_page(job, ctx)
+                rounds.append((time.perf_counter() - started) / PER_ROUND)
+            times.append(statistics.median(rounds) * 1e3)
+        print(f"  {name:<10} {len(page) // 1000:>6} {result.links_found:>6} "
+              + " ".join(f"{t:7.2f}" for t in times))
+
+
+def cpu():
+    usage = resource.getrusage(resource.RUSAGE_SELF)  # this process alone, not its workers
+    return usage.ru_utime + usage.ru_stime
+
 
 async def coordinator(pages, workers, total):
-    """Simulates the coordinator: submit compressed bodies, receive results, dedupe, write."""
-    loop = asyncio.get_running_loop()
-    bodies = [(u, "gzip", gzip.compress(r, 6), s) for u, r, s in pages]
-    pool = ProcessPoolExecutor(max_workers=workers) if workers else None
-    if pool:  # warm workers
-        await asyncio.gather(*(loop.run_in_executor(pool, parse_page, *bodies[0]) for _ in range(workers * 2)))
-    seen = set(); sink = open(os.devnull, "wb", buffering=1 << 20)
-    sem = asyncio.Semaphore(max(4, workers * 4))
+    """Pages/s and this process's CPU per page, sending total gzipped pages, round robin."""
+    ctx = WorkerContext(tuple(prefix for *_, scope in pages for prefix in scope), MAX_BYTES)
+    jobs = [ParseJob(url, gzip.compress(page, 6), charset, False, "gzip")
+            for _, url, page, charset, _ in pages]
+    parser = ProcessParser(ctx, workers) if workers else InlineParser(ctx)
+    if workers:  # start the workers first
+        await asyncio.gather(*(parser.parse(jobs[0]) for _ in range(workers * 2)))
+    seen = set()
+    sink = open(os.devnull, "wb", buffering=1 << 20)
+    room = asyncio.Semaphore(max(4, workers * 4))  # the parses in flight, as pipeline slots allow
+
     async def one(i):
-        u, e, b, s = bodies[i % len(bodies)]
-        async with sem:
-            if pool: out, keys = await loop.run_in_executor(pool, parse_page, u, e, b, s)
-            else: out, keys = parse_page(u, e, b, s)
-        for k in keys:
-            if k not in seen: seen.add(k)
-        sink.write(out)
-    c0, t0 = cpu(), time.perf_counter()
+        async with room:
+            result = await parser.parse(jobs[i % len(jobs)])
+        for key, _ in result.links:  # admission's dedupe
+            if key not in seen:
+                seen.add(key)
+        sink.write(result.record)
+
+    cpu_before, started = cpu(), time.perf_counter()
     await asyncio.gather(*(one(i) for i in range(total)))
-    dt, dc = time.perf_counter() - t0, cpu() - c0
-    if pool: pool.shutdown()
-    return total / dt, dc / total * 1e6
+    elapsed, used = time.perf_counter() - started, cpu() - cpu_before
+    await parser.close()
+    sink.close()
+    return total / elapsed, used / total * 1e6
+
 
 if __name__ == "__main__":
-    import uvloop
     pages = load_pages(sys.argv[1])
-    bench_inline(pages)
-    print("\ncoordinator: pages/s and coordinator-process CPU per page (gzip bodies, mixed pages):")
-    for w in (0, 1, 2, 4, 8):
-        rate, us = uvloop.run(coordinator(pages, w, 4000 if w else 2000))
-        print(f"  workers={w}  {rate:8.0f} pages/s   coordinator CPU {us:7.1f} µs/page")
+    per_page(pages)
+    print("\nA.3: the coordinator, gzipped pages, round robin: pages/s and its own CPU per page")
+    for workers in (0, 1, 2, 4, 8):
+        rate, us = uvloop.run(coordinator(pages, workers, 4000 if workers else 2000))
+        print(f"  {workers} parser processes  {rate:8.0f} pages/s   coordinator CPU {us:7.1f} µs/page")
