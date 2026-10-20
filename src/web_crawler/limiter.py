@@ -3,9 +3,9 @@
 ConcurrencyLaw is ADR-001's law: errors cut the limit, latency only stops it growing, and a
 probe confirms that a slowdown is the crawl's own doing. PauseGate holds request starts back
 for as long as a Retry-After asks, and spaces them under --max-rps and robots.txt's
-Crawl-delay. CircuitBreaker stops the crawl when the host can't be reached, until a probe
-finds it again. All of it is pure: the engine passes the time in, and bench/limiter_sim.py
-runs the same law on simulated servers.
+Crawl-delay. CircuitBreaker stops the crawl when the host can't be reached, and BlockGuard
+when it seems to block the crawl, until a probe finds it well again. All of it is pure: the
+engine passes the time in, and bench/limiter_sim.py runs the same law on simulated servers.
 """
 
 import email.utils
@@ -15,7 +15,7 @@ import statistics
 from dataclasses import dataclass
 from datetime import UTC
 
-from web_crawler.types import ErrorKind
+from web_crawler.types import CrawlItem, ErrorKind
 
 START = 8  # the limit a crawl starts with, in slow start
 INFLATED = 1.5  # a round's median this many times the base: the server is queueing
@@ -24,6 +24,7 @@ PROBE_ROUNDS = 2
 OURS = 0.8  # a probe whose median falls to this share of the held one: the queueing was ours
 MAX_PAUSE = 300.0  # seconds: the longest a Retry-After holds requests back
 OPENS_AFTER = 20  # connection-level failures in a row that open the circuit breaker
+BLOCKED_AFTER = 20  # 403 Forbidden answers in a row that look like a block
 LONGEST_PROBE = 60.0  # seconds between probes of a host the crawl paused for, at most
 
 
@@ -296,6 +297,80 @@ class CircuitBreaker:
         self._failures = 0
         was_open, self.open = self.open, False
         return was_open
+
+
+class Verdict(enum.Enum):
+    """What the block guard makes of a 403."""
+
+    HELD = "held"  # its fate waits on the rest of the run
+    TRIPPED = "tripped"  # held, and the run is long enough to look like a block
+    FINAL = "final"  # the page is forbidden
+
+
+class BlockGuard:
+    """Tells a block, a firewall refusing the crawl, from forbidden pages (DESIGN.md §5.4).
+
+    A 403 is held while the run of 403s it belongs to is under BLOCKED_AFTER: its page
+    stays outstanding, with no outcome yet, so that a page tried again later has only one,
+    and --max-depth stays exact. A run is settled in one of three ways:
+    - a response other than 403, to a request sent after the run's earliest: the host serves
+      the crawl, so the held 403s are final;
+    - the run reaching BLOCKED_AFTER trips the guard: the crawl pauses, and probes of the
+      start page back off as the circuit breaker's do. The first answer other than a 403
+      ends the block, and the held pages are tried again, once: a page tried again that
+      gets another 403 is forbidden. If none comes in give_up_after seconds, the crawl
+      aborts;
+    - nothing else can move the crawl on, so nothing else can settle it: the held 403s are
+      final.
+
+    A response to a request sent before the run's earliest 403'd one says nothing about the
+    block: the host may have answered it before the block began. The start URL is a page,
+    so every 403 a crawl's dispatcher sees comes after a page, as the rule asks.
+    """
+
+    def __init__(self, *, first_probe: float = 1.0, give_up_after: float = 300.0) -> None:
+        self.tripped = False
+        self.probes = Probes(first_probe, give_up_after)
+        self._held: list[CrawlItem] = []
+        self._since = math.inf  # when the request of the run's earliest 403 was sent
+        self._requeued: set[str] = set()  # keys of the pages tried again after a block
+
+    @property
+    def held(self) -> int:
+        return len(self._held)
+
+    def forbidden(self, item: CrawlItem, issued_at: float, now: float) -> Verdict:
+        """item got a 403 for a request sent at issued_at."""
+        if item.key in self._requeued:
+            return Verdict.FINAL
+        self._held.append(item)
+        self._since = min(self._since, issued_at)
+        if self.tripped or len(self._held) < BLOCKED_AFTER:
+            return Verdict.HELD
+        self.tripped = True
+        self.probes.start(now)
+        return Verdict.TRIPPED
+
+    def answered(self, issued_at: float) -> list[CrawlItem]:
+        """A response other than 403, to a request sent at issued_at. Returns the held
+        pages whose 403s it makes final: none, unless it settles a run."""
+        if self.tripped or issued_at <= self._since:
+            return []
+        return self.settle()
+
+    def settle(self) -> list[CrawlItem]:
+        """End the run: returns the held pages, whose 403s are final."""
+        held, self._held = self._held, []
+        self._since = math.inf
+        return held
+
+    def recovered(self) -> list[CrawlItem]:
+        """A probe got an answer other than 403: the block is over. Returns the held pages,
+        to be tried again, once."""
+        self.tripped = False
+        held = self.settle()
+        self._requeued.update(item.key for item in held)
+        return held
 
 
 def rate_ceiling(max_rps: float | None, crawl_delay: float | None) -> float | None:

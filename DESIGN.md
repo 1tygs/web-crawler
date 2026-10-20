@@ -274,11 +274,16 @@ on 429 / 503 / timeout / connection reset or refused / body cut off:
 | 429, 503 | Honour `Retry-After` (seconds or HTTP-date): no request starts until it ends, at most 300 s later, and the page that asked goes first. Halve the limit, retry. These have their own budget of 5, so throttling doesn't use up the error retries; without a `Retry-After`, they back off as errors do |
 | 408, 500, 502, 504 | Retry up to 3 times with backoff |
 | Other 4xx/5xx (404, 410, 401, 403, …) | Final: counted, logged at `-v`, optional JSONL error record |
-| 20 consecutive 403s after successful pages | Likely a firewall block, not 20 forbidden pages. Pause dispatch and re-request the start URL with backoff. If it recovers, requeue those URLs once; if it's still blocked after 5 minutes, abort with exit code 4 and keep the partial results |
+| 20 consecutive 403s after successful pages | Likely a firewall block, not 20 forbidden pages. Pause dispatch and re-request the start URL with backoff, as the circuit breaker does. If it's served, requeue those URLs once; if it's still refused after 5 minutes, abort with exit code 4 and keep the partial results |
 | Redirect loop, more than 10 hops, off-host redirect | Final: recorded with the redirect chain. A redirect back into its own chain is followed first, for cookie gates; a loop ends at the 10-hop limit |
 | Body over the size cap | Parse the part received and flag `truncated` |
 | Corrupt compression | Final ("bad content-encoding"); the result is deterministic, so retrying won't help. A compressed stream that ends early isn't corrupt: it's parsed as far as it got and flagged `truncated`, as a browser renders it |
 | Worker crash (`BrokenProcessPool`) | Every job in the pool fails, not just the one that crashed (A.9). Rebuild the pool and resubmit them all without using up retries. If it breaks again, rerun the survivors one at a time: the page that crashes on its own gets a parse error, and the rest go through |
+
+**A 403 is held until its run of 403s is settled.** Its page stays outstanding, with no outcome yet, so a page requeued after a block gets one record, not an error and then a page, and `--max-depth` stays exact. A run is settled in one of three ways:
+- a response other than 403, to a request sent after the run's earliest: the host serves the crawl, so the 403s are final. A response to a request sent before it may predate the block, and says nothing;
+- the 20th 403, which trips the rule above. Requests already in flight that get a 403 join the run, and only a probe ends the pause; a page requeued that gets another 403 is final;
+- nothing else can move the crawl on, with nothing queued, in flight or waiting to retry: the 403s are final.
 
 Retries go back through the retry heap. Nothing sleeps while holding a permit. A retry resumes where its item failed, after the redirects it had followed: those URLs were claimed for it, so starting again from the first would find them claimed, by no one who will print them. The start URL is retried in place, before the crawl begins, since nothing else is queued yet.
 

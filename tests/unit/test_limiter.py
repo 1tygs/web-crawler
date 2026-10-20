@@ -10,19 +10,22 @@ from hypothesis import strategies as st
 
 from tests.support.bench import simulate
 from web_crawler.limiter import (
+    BLOCKED_AFTER,
     LONGEST_PROBE,
     MAX_PAUSE,
     OPENS_AFTER,
+    BlockGuard,
     CircuitBreaker,
     ConcurrencyLaw,
     Decision,
     Kind,
     PauseGate,
     Probes,
+    Verdict,
     parse_retry_after,
     rate_ceiling,
 )
-from web_crawler.types import ErrorKind
+from web_crawler.types import CrawlItem, ErrorKind
 
 BASE = 0.100  # seconds: the first round's median time to first byte
 
@@ -386,6 +389,77 @@ def test_failures_while_open_change_nothing() -> None:
     assert breaker.last is ErrorKind.CONNECT
     assert (breaker.probes.next, breaker.probes.deadline) == probes
     assert breaker.open
+
+
+def page(n: int) -> CrawlItem:
+    return CrawlItem(f"https://example.com/{n}", f"https://example.com/{n}", 1)
+
+
+def test_403s_are_held_while_their_run_is_short_of_a_block() -> None:
+    guard = BlockGuard()
+    for n in range(BLOCKED_AFTER - 1):
+        assert guard.forbidden(page(n), issued_at=n, now=n) is Verdict.HELD
+    assert guard.held == BLOCKED_AFTER - 1
+    assert not guard.tripped
+
+
+def test_a_response_to_a_request_sent_after_the_runs_first_403_settles_it() -> None:
+    guard = BlockGuard()
+    guard.forbidden(page(0), issued_at=5.0, now=6.0)
+    guard.forbidden(page(1), issued_at=7.0, now=8.0)
+    assert guard.answered(issued_at=4.0) == []  # sent before the run began: may be stale
+    assert guard.answered(issued_at=5.0) == []
+    assert guard.answered(issued_at=5.5) == [page(0), page(1)]  # the host serves the crawl
+    assert guard.held == 0
+    assert guard.answered(issued_at=100.0) == []  # no run to settle
+
+
+def test_a_run_begins_with_its_earliest_request() -> None:
+    # A 403 for a request sent earlier, though it came later, moves the run's start back.
+    guard = BlockGuard()
+    guard.forbidden(page(0), issued_at=5.0, now=6.0)
+    guard.forbidden(page(1), issued_at=3.0, now=7.0)
+    assert guard.answered(issued_at=4.0) == [page(0), page(1)]
+
+
+def tripped(guard: BlockGuard, now: float = 20.0) -> BlockGuard:
+    for n in range(BLOCKED_AFTER - 1):
+        assert guard.forbidden(page(n), issued_at=n, now=n) is Verdict.HELD
+    assert guard.forbidden(page(19), issued_at=19.0, now=now) is Verdict.TRIPPED
+    return guard
+
+
+def test_the_20th_403_in_a_row_trips_the_guard() -> None:
+    guard = tripped(BlockGuard(first_probe=1.0, give_up_after=300.0))
+    assert guard.tripped
+    assert (guard.probes.next, guard.probes.deadline) == (21.0, 320.0)
+    # Tripped, it holds every 403, and only a probe ends it.
+    assert guard.forbidden(page(20), issued_at=18.0, now=21.0) is Verdict.HELD
+    assert guard.answered(issued_at=25.0) == []
+    assert guard.tripped
+    assert guard.held == BLOCKED_AFTER + 1
+
+
+def test_when_the_block_ends_the_held_pages_are_tried_again_once() -> None:
+    guard = tripped(BlockGuard())
+    assert guard.recovered() == [page(n) for n in range(BLOCKED_AFTER)]
+    assert not guard.tripped
+    assert guard.held == 0
+    # A page tried again that gets another 403 is forbidden; other pages are held again.
+    assert guard.forbidden(page(3), issued_at=30.0, now=31.0) is Verdict.FINAL
+    assert guard.forbidden(page(99), issued_at=30.0, now=31.0) is Verdict.HELD
+    assert guard.held == 1
+
+
+def test_settling_makes_the_held_403s_final() -> None:
+    guard = BlockGuard()
+    for n in range(3):
+        guard.forbidden(page(n), issued_at=n, now=n)
+    assert guard.settle() == [page(0), page(1), page(2)]
+    assert guard.settle() == []
+    # A new run starts afresh: a response sent after the old run's start doesn't settle it.
+    guard.forbidden(page(5), issued_at=10.0, now=10.0)
+    assert guard.answered(issued_at=5.0) == []
 
 
 SEEDS = (1, 2, 3)
