@@ -3,11 +3,12 @@
 import argparse
 import asyncio
 import logging
+import re
 import sys
 from collections.abc import Callable, Sequence
 
 from web_crawler import __version__
-from web_crawler.config import USER_AGENT, Config, ConfigError
+from web_crawler.config import MIB, USER_AGENT, Config, ConfigError
 from web_crawler.engine import crawl
 from web_crawler.output import ThreadedSink
 from web_crawler.types import ExitCode
@@ -68,6 +69,23 @@ def build_parser() -> argparse.ArgumentParser:
         "quota, or a number; 0 parses in the crawler's own process (default: auto)",
     )
     parser.add_argument(
+        "--timeout",
+        type=float,
+        metavar="S",
+        default=60.0,
+        help="seconds a request may take, from connecting to the end of its body "
+        "(default: %(default)g)",
+    )
+    parser.add_argument(
+        "--max-page-bytes",
+        type=_size,
+        metavar="N",
+        default=32 * MIB,
+        help="the most of a page that's read, and that it may decompress to: bytes, or with "
+        "K, M or G for KiB, MiB or GiB; a page cut short is parsed as far as it got "
+        "(default: 32M)",
+    )
+    parser.add_argument(
         "--retries",
         type=int,
         metavar="N",
@@ -111,6 +129,19 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+_SIZE = re.compile(r"([0-9]+)([KMG]?)", re.IGNORECASE)
+_UNITS = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3}  # binary, as for memory
+
+
+def _size(value: str) -> int:
+    """A number of bytes, with an optional binary suffix: 512K, 32M or 2G."""
+    if (match := _SIZE.fullmatch(value)) is None:
+        raise argparse.ArgumentTypeError(
+            f"a number of bytes, with K, M or G if you like, not {value!r}"
+        )
+    return int(match[1]) * _UNITS[match[2].upper()]
+
+
 def _parse_workers(value: str) -> int | None:
     if value == "auto":
         return None
@@ -133,6 +164,8 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
             max_concurrency=args.max_concurrency,
             max_rps=args.max_rps,
             parse_workers=args.parse_workers,
+            timeout=args.timeout,
+            max_page_bytes=args.max_page_bytes,
             retries=args.retries,
             skip_extensions=args.skip_extensions,
             ignore_robots=args.ignore_robots,

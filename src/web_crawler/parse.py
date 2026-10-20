@@ -104,12 +104,14 @@ def parse_page(job: ParseJob, ctx: WorkerContext) -> ParseResult:
         body, cut = decode_body(job.body, job.content_encoding, ctx.max_bytes)
     except ContentDecodeError:
         return ParseResult(b"", [], 0, 0, UNDECODABLE)
-    tree, _ = parse_html(body, job.http_charset, truncated=job.truncated or cut)
+    truncated = job.truncated or cut
+    tree, _ = parse_html(body, job.http_charset, truncated=truncated)
     links = _Links(job.url, _base_url(tree, job.url), ctx)
     links.extract(tree)
     printed = links.printed
     record = "".join([job.url, "\n", *[f"  {url}\n" for url in printed], "\n"]).encode()
-    return ParseResult(record, list(links.followed.items()), len(printed), len(body), None)
+    followed = list(links.followed.items())
+    return ParseResult(record, followed, len(printed), len(body), None, truncated)
 
 
 def _base_url(tree: LexborHTMLParser, url: str) -> str:

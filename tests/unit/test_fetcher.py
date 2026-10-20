@@ -374,6 +374,45 @@ async def test_drains_a_small_non_html_body_and_drops_a_large_one(
     assert transport.responses[0].position == read
 
 
+@pytest.mark.parametrize(
+    ("status", "length", "read"),
+    [
+        (404, DRAIN_LIMIT, DRAIN_LIMIT),
+        (503, 100, 100),
+        (500, DRAIN_LIMIT + 1, 0),  # bigger: cheaper to drop with its connection
+        (404, None, 0),  # of unknown size
+    ],
+)
+async def test_drains_a_small_error_body_and_drops_a_large_one(
+    status: int, length: int | None, read: int
+) -> None:
+    headers = HTML | ({"Content-Length": str(length)} if length is not None else {})
+    body = b"x" * (length or 100)
+    outcome, transport, _ = await fetch({START: Reply(status, headers, body)})
+    assert isinstance(outcome, Final | Retry)
+    assert transport.responses[0].position == read
+
+
+@pytest.mark.parametrize(
+    ("reply", "outcome"),
+    [
+        (Reply(301, {"Location": "/a"}), Page(ParseJob("https://example.com/a", b"page", "utf-8"))),
+        (
+            Reply(200, {"Content-Type": "image/png", "Content-Length": "10"}),
+            NotPage(START, "image/png"),
+        ),
+        (Reply(404, HTML | {"Content-Length": "10"}), Final("HTTP 404", "HTTP 404", (START,), 404)),
+    ],
+)
+async def test_a_body_that_fails_while_being_drained_is_no_matter(
+    reply: Reply, outcome: object
+) -> None:
+    # Its connection is closed rather than reused, and the fetch goes on.
+    reply.read_error = ErrorKind.RESET
+    replies: Replies = {START: reply, "https://example.com/a": Reply(headers=HTML, body=b"page")}
+    assert (await fetch(replies))[0] == outcome
+
+
 @pytest.mark.parametrize("status", [404, 410, 401, 403, 400, 501])
 async def test_an_error_status_is_final(status: int) -> None:
     outcome, _, stats = await fetch({START: Reply(status, HTML)})

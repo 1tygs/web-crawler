@@ -19,6 +19,13 @@ def test_summary_of_a_crawl() -> None:
     ]
 
 
+def test_summary_counts_pages_cut_short() -> None:
+    stats = Stats(started=0.0, pages=3, body_bytes=2000, decoded_bytes=9000, truncated=2)
+    assert stats.summary(unique_urls=3, now=1.0).splitlines()[1] == (
+        "page bodies: 2.0 kB received, 9.0 kB decompressed, 2 cut short"
+    )
+
+
 @pytest.mark.parametrize(
     ("received", "decompressed", "line"),
     [

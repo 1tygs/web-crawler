@@ -6,6 +6,7 @@ Nothing above this module imports aiohttp: its exceptions arrive as TransportErr
 
 import contextvars
 import logging
+import math
 import ssl
 import time
 import urllib.request
@@ -174,7 +175,14 @@ class _Exchange:
             )
             ttfb = time.perf_counter() - max(started, _connected.get(started))
         except (aiohttp.ClientError, TimeoutError, ValueError) as error:
-            raise transport_error(error) from error
+            failure = transport_error(error)
+            if failure.kind is ErrorKind.TIMEOUT and _connected.get(-math.inf) < started:
+                # The whole request's timeout ran out before it had a connection, as it does
+                # when it's shorter than the connect timeout, or while the host's name is
+                # resolved: the host wasn't reached.
+                detail = str(error) or type(error).__name__
+                failure = TransportError(ErrorKind.CONNECT_TIMEOUT, detail)
+            raise failure from error
         return _AiohttpResponse(self._url, self._response, ttfb)
 
     async def __aexit__(

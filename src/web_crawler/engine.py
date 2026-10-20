@@ -870,3 +870,4 @@ class _Dispatcher:
         self.stats.pages += 1
         self.stats.links_found += result.links_found
         self.stats.decoded_bytes += result.decoded_bytes
+        self.stats.truncated += result.truncated

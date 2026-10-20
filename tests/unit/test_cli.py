@@ -81,6 +81,42 @@ def test_speed_options_out_of_range_are_usage_errors(
     assert message in capsys.readouterr().err
 
 
+def test_timeout_and_max_page_bytes() -> None:
+    cfg = parse_args(["https://example.com/", "--timeout", "2.5", "--max-page-bytes", "4096"])
+    assert (cfg.timeout, cfg.max_page_bytes) == (2.5, 4096)
+    cfg = parse_args(["https://example.com/"])
+    assert (cfg.timeout, cfg.max_page_bytes) == (60.0, 32 * 1024 * 1024)
+
+
+@pytest.mark.parametrize(
+    ("value", "size"),
+    [("1", 1), ("512K", 512 * 1024), ("512k", 512 * 1024), ("32M", 32 << 20), ("2G", 2 << 30)],
+)
+def test_max_page_bytes_takes_binary_suffixes(value: str, size: int) -> None:
+    assert parse_args(["https://example.com/", "--max-page-bytes", value]).max_page_bytes == size
+
+
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        (["--max-page-bytes", "32MB"], "a number of bytes, with K, M or G if you like, not '32MB'"),
+        (["--max-page-bytes", "-1"], "a number of bytes"),
+        (["--max-page-bytes", "1.5M"], "a number of bytes"),
+        (["--max-page-bytes", "0"], "max_page_bytes must be at least 1, not 0"),
+        (["--timeout", "0"], "timeout must be a positive number of seconds, not 0.0"),
+        (["--timeout", "inf"], "timeout must be a positive number of seconds"),
+        (["--timeout", "soon"], "argument --timeout: invalid float value: 'soon'"),
+    ],
+)
+def test_timeout_and_max_page_bytes_out_of_range_are_usage_errors(
+    argv: list[str], message: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        parse_args(["https://example.com/", *argv])
+    assert exit_info.value.code == 2
+    assert message in capsys.readouterr().err
+
+
 def test_retries() -> None:
     assert parse_args(["https://example.com/", "--retries", "0"]).retries == 0
     assert parse_args(["https://example.com/", "--retries", "7"]).retries == 7
@@ -127,7 +163,8 @@ def test_help_exits_zero(capsys: pytest.CaptureFixture[str]) -> None:
     usage = " ".join(capsys.readouterr().out.split())  # however the terminal's width wraps it
     assert usage.startswith(
         "usage: crawl [-h] [--all-urls] [--max-pages N] [--max-concurrency N] [--max-rps R] "
-        "[--parse-workers N] [--retries N] [--no-skip-extensions] [--ignore-robots]"
+        "[--parse-workers N] [--timeout S] [--max-page-bytes N] [--retries N] "
+        "[--no-skip-extensions] [--ignore-robots]"
     )
 
 

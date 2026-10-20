@@ -341,6 +341,29 @@ async def wait_then_answer(request: web.Request) -> web.StreamResponse:
     return web.Response(body=b"<p>late", content_type="text/html")
 
 
+async def test_a_timeout_before_the_connection_is_ready_is_a_connect_timeout() -> None:
+    # The whole request's timeout, under the 10 s connect timeout, runs out while the host
+    # is resolved: it was never reached. One that runs out waiting for headers is a timeout.
+    resolver = SlowResolver()
+    async with Site({"/": page()}) as site:
+        resolver.ports["slow.test", 80] = site.port
+        cfg = Config(start_url="http://slow.test/", timeout=0.1)
+        async with AiohttpTransport(cfg, resolver=resolver) as transport:
+            with pytest.raises(TransportError) as error:
+                await fetch(transport, "http://slow.test/")
+    assert error.value.kind is ErrorKind.CONNECT_TIMEOUT
+
+
+async def test_a_timeout_after_an_earlier_requests_connection_is_a_timeout() -> None:
+    # The second request reuses the first's connection, so a timeout waiting for its
+    # headers came after it was connected.
+    async with Site({"/": page(), "/slow": slow}) as site, make_transport(0.2) as transport:
+        assert (await fetch(transport, site.url()))[0] == 200
+        with pytest.raises(TransportError) as error:
+            await fetch(transport, site.url("/slow"))
+    assert error.value.kind is ErrorKind.TIMEOUT
+
+
 async def test_time_to_first_byte_counts_from_when_the_connection_is_ready() -> None:
     # Connecting takes 0.3 s and the server 0.2 s more: only the server's time counts, so
     # that a new connection's set-up doesn't look like a slow server (DESIGN.md §5.2).

@@ -1002,6 +1002,22 @@ async def test_no_skip_extensions_crawls_every_link() -> None:
     assert not report.rejected
 
 
+async def test_a_page_over_the_size_cap_is_parsed_as_far_as_it_got() -> None:
+    # The cap falls after the first link: the page is printed with it, and counted.
+    body = b'<a href="/near">x</a>' + b" " * 1000 + b'<a href="/far">y</a>'
+    replies: dict[str, Answer | list[Answer]] = {
+        START: html("/big"),
+        "https://example.com/big": Reply(headers=HTML, body=body),
+        "https://example.com/near": html(),
+    }
+    transport, sink = FakeTransport(replies), MemorySink()
+    report = await crawl(Config(start_url=START, max_page_bytes=500), sink, transport=transport)
+    assert b"https://example.com/big\n  https://example.com/near\n\n" in sink.records
+    assert pages(transport) == [START, "https://example.com/big", "https://example.com/near"]
+    assert report.stats.truncated == 1
+    assert ", 1 cut short" in report.summary
+
+
 async def test_records_stream_in_the_order_pages_complete() -> None:
     # DESIGN.md §2.4: output isn't sorted. /slow is linked first, and printed last.
     replies: dict[str, Answer | list[Answer]] = {

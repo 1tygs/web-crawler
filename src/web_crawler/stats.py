@@ -20,6 +20,7 @@ class Stats:
     internal_errors: int = 0  # unexpected exceptions while processing an item
     body_bytes: int = 0  # pages' bodies as they arrived, compressed or not
     decoded_bytes: int = 0  # the bodies of the pages printed, decompressed
+    truncated: int = 0  # pages printed whose bodies were cut short
 
     def summary(
         self,
@@ -41,10 +42,13 @@ class Stats:
         if self.statuses:
             lines.append(f"statuses: {_counts(sorted(self.statuses.items()))}")
         if self.body_bytes:
-            lines.append(
+            line = (
                 f"page bodies: {_size(self.body_bytes)} received, "
                 f"{_size(self.decoded_bytes)} decompressed"
             )
+            if self.truncated:
+                line += f", {self.truncated:,} cut short"
+            lines.append(line)
         skipped = sorted(self.failures.items())
         if self.not_html:
             skipped.insert(0, ("not HTML", self.not_html))

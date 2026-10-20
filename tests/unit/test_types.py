@@ -24,6 +24,7 @@ def test_a_new_item_has_had_no_retries_and_followed_no_redirects() -> None:
         ParseJob("https://example.com/", b"<a href=/\xe9>", "latin1", True, "gzip, br"),
         ParseResult(record=b"r\n", links=[("k", "u")], links_found=1, decoded_bytes=2, error=None),
         ParseResult(b"", [], 0, 0, "bad content-encoding"),
+        ParseResult(b"r\n", [], 0, 5, None, truncated=True),
         WorkerContext(("https://example.com/", "http://example.com/"), max_bytes=1 << 20),
         WorkerContext(scope_prefixes=("http://127.0.0.1:8000/",), max_bytes=1, all_urls=True),
     ],

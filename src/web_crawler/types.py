@@ -57,6 +57,7 @@ class ParseResult(NamedTuple):
     links_found: int  # links printed on the page, for stats
     decoded_bytes: int  # the body's size once decompressed, for stats
     error: str | None  # why the page can't be printed, e.g. its body can't be decompressed
+    truncated: bool = False  # the body was cut at the size cap, or its stream ended early
 
 
 @dataclass(frozen=True, slots=True)

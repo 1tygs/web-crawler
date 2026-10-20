@@ -209,7 +209,7 @@ Few sites will serve one client thousands of pages per second. The crawler's cei
 - An aiohttp `ClientSession` with `TCPConnector(limit = limit_per_host = max_concurrency + 4, ttl_dns_cache = 300, keepalive_timeout = 30)`. The four extra connections serve requests the dispatcher doesn't count, such as robots.txt refetches and health probes. Happy eyeballs is on by default.
 - `auto_decompress=False`, with `Accept-Encoding: gzip, deflate, br, zstd`, exactly the encodings the workers can decode. zstd comes from the 3.14 standard library.
 - `Accept: text/html,application/xhtml+xml;q=0.9,*/*;q=0.8` and an honest User-Agent, e.g. `web-crawler/1.0 (+https://github.com/<you>/web-crawler)`.
-- Timeouts: connect 10 s, read 20 s, total 60 s.
+- Timeouts: connect 10 s, read 20 s, total 60 s (`--timeout`). A total under 10 s that runs out before the connection is ready counts as a connect timeout: the host wasn't reached, which the circuit breaker needs to know ([§5.3](#53-adaptive-concurrency-limiter)).
 - TLS verification on; `--insecure` turns it off for dev hosts.
 - Cookie jar on, so cookie-gated redirects resolve as they would in a browser.
 - Proxies are taken from the environment (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`) and read once. aiohttp's own `trust_env` re-reads them, and `~/.netrc`, on a thread for every request. That costs 162.5 µs of CPU per request against 26.9 µs (A.4), and it would send `~/.netrc` credentials to the crawled host.
@@ -219,7 +219,7 @@ Few sites will serve one client thousands of pages per second. The crawler's cei
 - **Cookie-gated redirects.** A redirect back to a URL already in the same chain is followed, rather than called a loop: a consent or login gate redirects to a page that sets a cookie, which redirects back, and with the cookie the page is served. The cookie jar is on for exactly this. A real loop ends at the 10-hop limit and is reported as a loop, with its chain; a chain of 10 distinct hops is reported as too many redirects.
 - **Headers-first triage:**
   - HTML: stream the body up to `--max-page-bytes` (default 32 MiB) and flag truncation.
-  - Non-HTML: don't read the body. If `Content-Length ≤ 64 KiB`, drain it so the connection can be reused; otherwise close it.
+  - Non-HTML, and error statuses: don't read the body. If `Content-Length ≤ 64 KiB`, drain it so the connection can be reused; otherwise close it. A body that fails while it's drained is no matter: its connection is closed instead.
   - Missing or unknown `Content-Type` (`*/*`, `unknown/unknown`, `application/unknown` or one that doesn't parse): decompress the start of the body, the 1,445 bytes MIME Sniffing reads, and sniff it for the standard's HTML patterns, unless `X-Content-Type-Options: nosniff` forbids it. The body is still compressed at this point, so the raw bytes can't be sniffed.
 - **Latency sample** is the time from when the request had its connection, from the pool at once or new once DNS, TCP and TLS are done, to its response headers. It tracks server queueing without being skewed by body size, or by connection set-up: the first rounds of a crawl are mostly new connections, and their handshakes would inflate the base. The transport's connector notes the moment it hands a request its connection, for 1.3 µs of CPU per request; aiohttp's `TraceConfig` reports the same moment, but costs 8.3 µs (A.4).
 
@@ -276,7 +276,7 @@ on 429 / 503 / timeout / connection reset or refused / body cut off:
 | Other 4xx/5xx (404, 410, 401, 403, …) | Final: counted, logged at `-v`, optional JSONL error record |
 | 20 consecutive 403s after successful pages | Likely a firewall block, not 20 forbidden pages. Pause dispatch and re-request the start URL with backoff, as the circuit breaker does. If it's served, requeue those URLs once; if it's still refused after 5 minutes, abort with exit code 4 and keep the partial results |
 | Redirect loop, more than 10 hops, off-host redirect | Final: recorded with the redirect chain. A redirect back into its own chain is followed first, for cookie gates; a loop ends at the 10-hop limit |
-| Body over the size cap | Parse the part received and flag `truncated` |
+| Body over the size cap | Parse the part received and flag `truncated`; the summary counts pages cut short |
 | Corrupt compression | Final ("bad content-encoding"); the result is deterministic, so retrying won't help. A compressed stream that ends early isn't corrupt: it's parsed as far as it got and flagged `truncated`, as a browser renders it |
 | Worker crash (`BrokenProcessPool`) | Every job in the pool fails, not just the one that crashed (A.9). Rebuild the pool and resubmit them all without using up retries. If it breaks again, rerun the survivors one at a time: the page that crashes on its own gets a parse error, and the rest go through |
 
@@ -414,7 +414,7 @@ crawl URL [options]
 | `--ignore-robots` | off | For crawling your own site; also ignores `Crawl-delay` |
 | `--strict-host` | off | Refuse a start URL that redirects to another host, even when only `www.` differs |
 | `--timeout S`, `--retries N` | 60, 3 | Total timeout per request; retry budget |
-| `--max-page-bytes N` | 32 MiB | Size cap per page |
+| `--max-page-bytes N` | 32M | Size cap per page, as sent and decompressed; K, M and G are binary suffixes |
 | `--user-agent UA` | `web-crawler/1.0 (+url)` | Also selects the robots.txt group |
 | `--insecure`, `--no-skip-extensions` | off | Escape hatches |
 | `-v`/`-vv`, `-q` | — | Observability; `-v` also logs the limiter's decisions |
@@ -561,7 +561,7 @@ Python 3.14 or later is required, because `compression.zstd` is in its standard 
   - status code histogram and errors by class;
   - policy rejections by rule (robots, traps, extension), with examples;
   - time-to-first-byte p50/p95/p99;
-  - bytes on the wire vs decoded;
+  - bytes on the wire vs decoded, and pages cut short;
   - duration, average and peak pages/s, limiter range, peak RSS.
 - `-v` logs failures, rejections and the limiter's decisions; `-vv` logs every request. After v1, `--stats-json FILE` writes the summary for scripts.
 - Policy decisions are always counted and sampled. An accurate crawl is one whose omissions you can audit.

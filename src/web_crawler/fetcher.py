@@ -8,6 +8,7 @@ by retry.classify().
 """
 
 import asyncio
+import contextlib
 import dataclasses
 import enum
 import random
@@ -274,7 +275,7 @@ class Fetcher:
         self._stats.statuses[status] += 1
         match triage(status, response.headers):
             case Triage.REDIRECT:
-                await response.read(DRAIN_LIMIT)  # so its connection can be reused
+                await _drain(response)
                 location = response.headers["Location"]
                 try:
                     target = strip_fragment(ada_url.join_url(response.url, location))
@@ -291,11 +292,14 @@ class Fetcher:
                 await _drain_if_small(response)
                 return NotPage(response.url, response.headers.get("Content-Type"))
             case Triage.FINAL:  # pragma: no branch  (the cases are exhaustive)
-                return self._failed(response, chain, item)
+                return await self._failed(response, chain, item)
 
-    def _failed(self, response: Response, chain: tuple[str, ...], item: CrawlItem) -> Retry | Final:
+    async def _failed(
+        self, response: Response, chain: tuple[str, ...], item: CrawlItem
+    ) -> Retry | Final:
         """An answer that isn't a page or a redirect: final, or worth another try. A 429 or
         503 says how long to wait in its Retry-After, if it says."""
+        await _drain_if_small(response)
         status = response.status
         final = Final(f"HTTP {status}", f"HTTP {status}", chain, status)
         if (cls := classify(status)) is not Class.THROTTLE:
@@ -430,7 +434,7 @@ class RobotsFetcher:
                     except ContentDecodeError as error:
                         return _Answer(status, undecodable=str(error))
                     return _Answer(status, text, more or cut)
-                await response.read(DRAIN_LIMIT)  # so its connection can be reused
+                await _drain(response)
                 if status in REDIRECT_STATUSES and "Location" in response.headers:
                     try:
                         location = ada_url.join_url(url, response.headers["Location"])
@@ -464,10 +468,19 @@ def _page(response: Response, body: bytes, truncated: bool) -> Page:
 
 
 async def _drain_if_small(response: Response) -> None:
-    """Read the rest of an unwanted body if it's small, so that its connection can be
-    reused; a bigger one is cheaper to drop with its connection."""
+    """Read the rest of an unwanted body if it says it's small, so that its connection can
+    be reused; a bigger one, or one of unknown size, is cheaper to drop with its
+    connection."""
     size = _content_length(response.headers)
     if size is not None and size <= DRAIN_LIMIT:
+        await _drain(response)
+
+
+async def _drain(response: Response) -> None:
+    """Read up to DRAIN_LIMIT more bytes of an unwanted body, so that its connection can be
+    reused if that was the rest of it. One that fails to arrive is no matter: its
+    connection is closed instead."""
+    with contextlib.suppress(TransportError):
         await response.read(DRAIN_LIMIT)
 
 
