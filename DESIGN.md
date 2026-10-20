@@ -278,7 +278,7 @@ on 429 / 503 / timeout / connection reset or refused / body cut off:
 | Corrupt compression | Final ("bad content-encoding"); the result is deterministic, so retrying won't help. A compressed stream that ends early isn't corrupt: it's parsed as far as it got and flagged `truncated`, as a browser renders it |
 | Worker crash (`BrokenProcessPool`) | Every job in the pool fails, not just the one that crashed (A.9). Rebuild the pool and resubmit them all without using up retries. If it breaks again, rerun the survivors one at a time: the page that crashes on its own gets a parse error, and the rest go through |
 
-Retries go back through the retry heap. Nothing sleeps while holding a permit.
+Retries go back through the retry heap. Nothing sleeps while holding a permit. A retry resumes where its item failed, after the redirects it had followed: those URLs were claimed for it, so starting again from the first would find them claimed, by no one who will print them. The start URL is retried in place, before the crawl begins, since nothing else is queued yet.
 
 ### 5.5 Parser workers
 
@@ -432,7 +432,9 @@ class CrawlItem:                 # an admitted URL
     url: str                     # display URL: what is requested and printed
     key: str                     # dedupe key
     depth: int
-    attempt: int = 0
+    attempt: int = 0             # retries after errors so far (--retries)
+    throttled: int = 0           # retries after a 429 or 503 so far: a budget of their own
+    redirected_from: tuple[str, ...] = ()  # redirects already followed: a retry resumes there
 
 class Response(Protocol):        # one HTTP exchange, no redirect handling
     url: str

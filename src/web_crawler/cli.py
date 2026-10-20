@@ -68,6 +68,14 @@ def build_parser() -> argparse.ArgumentParser:
         "quota, or a number; 0 parses in the crawler's own process (default: auto)",
     )
     parser.add_argument(
+        "--retries",
+        type=int,
+        metavar="N",
+        default=3,
+        help="how many times to try a page again after an error, such as a timeout, a "
+        "dropped connection or a server error, waiting longer each time (default: %(default)s)",
+    )
+    parser.add_argument(
         "--ignore-robots",
         action="store_true",
         help="don't fetch or obey robots.txt: for crawling your own site",
@@ -115,6 +123,7 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
             max_concurrency=args.max_concurrency,
             max_rps=args.max_rps,
             parse_workers=args.parse_workers,
+            retries=args.retries,
             ignore_robots=args.ignore_robots,
             strict_host=args.strict_host,
             insecure=args.insecure,

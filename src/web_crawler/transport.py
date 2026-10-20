@@ -5,7 +5,6 @@ Nothing above this module imports aiohttp: its exceptions arrive as TransportErr
 """
 
 import contextvars
-import enum
 import logging
 import ssl
 import time
@@ -24,6 +23,7 @@ from aiohttp.tracing import Trace
 from multidict import CIMultiDictProxy
 
 from web_crawler.config import Config
+from web_crawler.types import ErrorKind
 
 log = logging.getLogger(__name__)
 
@@ -33,18 +33,6 @@ KIB = 1024
 # (DESIGN.md §5.2).
 ACCEPT = "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8"
 ACCEPT_ENCODING = "gzip, deflate, br, zstd"
-
-
-class ErrorKind(enum.StrEnum):
-    DNS = "dns"
-    CONNECT = "connect"
-    TLS = "tls"
-    CONNECT_TIMEOUT = "connect_timeout"
-    TIMEOUT = "timeout"
-    RESET = "reset"  # the connection was closed or reset
-    PAYLOAD = "payload"  # the body ended early
-    PROTOCOL = "protocol"  # the response wasn't valid HTTP
-    INVALID_URL = "invalid_url"
 
 
 class TransportError(Exception):

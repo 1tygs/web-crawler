@@ -304,7 +304,9 @@ async def test_a_redirect_loop_ends_at_the_hop_limit(parse_workers: int) -> None
 
 
 START_FAILURES = {
-    "error status": (Resource(status=500), "{start}: HTTP 500"),
+    # Not a 500, which is tried again first, after random backoffs; tests/unit/test_engine.py
+    # has the start URL's retries.
+    "error status": (Resource(status=404), "{start}: HTTP 404"),
     "not html": (
         Resource(body=b"%PDF", headers=(("Content-Type", "application/pdf"),)),
         "{start} isn't an HTML page (Content-Type: application/pdf)",

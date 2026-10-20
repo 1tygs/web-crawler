@@ -21,6 +21,7 @@ from http import HTTPStatus
 from types import FrameType
 from typing import Any, NoReturn
 
+from web_crawler import retry
 from web_crawler.config import Config
 from web_crawler.fetcher import (
     AdmissionHops,
@@ -31,6 +32,7 @@ from web_crawler.fetcher import (
     HopPolicy,
     NotPage,
     Page,
+    Retry,
     RobotsFetcher,
 )
 from web_crawler.frontier import Admission, Frontier, Hop
@@ -40,8 +42,8 @@ from web_crawler.pool import ParseCrashed, Parser, worker_count
 from web_crawler.pool import start as start_parser
 from web_crawler.robots import Availability, RobotsPolicy, RobotsTxt, product_token
 from web_crawler.stats import Stats
-from web_crawler.transport import AiohttpTransport, ErrorKind, Transport
-from web_crawler.types import CrawlItem, ExitCode, WorkerContext
+from web_crawler.transport import AiohttpTransport, Transport
+from web_crawler.types import CrawlItem, ErrorKind, ExitCode, WorkerContext
 from web_crawler.urls import Scope, dedupe_key, normalize_start
 
 log = logging.getLogger(__name__)
@@ -107,7 +109,8 @@ async def crawl(  # noqa: PLR0913  (the collaborators that tests replace)
     owned = transport is None
     if transport is None:
         transport = AiohttpTransport(cfg)
-    robots = None if cfg.ignore_robots else RobotsFetcher(transport, rng=rng or random.Random())
+    rng = rng or random.Random()
+    robots = None if cfg.ignore_robots else RobotsFetcher(transport, rng=rng)
     law = ConcurrencyLaw(cfg.max_concurrency)
     fetcher = Fetcher(
         transport, cfg.max_page_bytes, stats, signals=_Limiter(law, clock), clock=clock
@@ -124,6 +127,9 @@ async def crawl(  # noqa: PLR0913  (the collaborators that tests replace)
         product=product,
         strict_host=cfg.strict_host,
         stats=stats,
+        retries=cfg.retries,
+        rng=rng,
+        clock=clock,
     )
     dispatcher = _Dispatcher(
         fetcher=fetcher,
@@ -143,6 +149,8 @@ async def crawl(  # noqa: PLR0913  (the collaborators that tests replace)
         robots=robots,
         product=product,
         robots_refresh=cfg.robots_refresh,
+        retries=cfg.retries,
+        rng=rng,
     )
     interrupts = _Interrupts(dispatcher)
     with interrupts:  # until the sink is closed, so a second Ctrl-C can cut closing short
@@ -275,6 +283,9 @@ class _Start:
     product: str  # the User-Agent's product token, which robots.txt groups name
     strict_host: bool
     stats: Stats
+    retries: int  # for errors, from --retries
+    rng: random.Random  # for retries' backoff
+    clock: Callable[[], float]
     _files: dict[str, RobotsTxt] = field(default_factory=dict, init=False)  # by origin
     _warned: set[str] = field(default_factory=set, init=False)  # unreachable, logged
     _problem: _CantStart | None = field(default=None, init=False)  # why a hop can't be followed
@@ -306,10 +317,18 @@ class _Start:
         if (problem := await self._read_robots(self.admission.scope, start_url)) is not None:
             return problem
         self.admission.admit([(dedupe_key(start_url), start_url)], depth=0)
-        item = self.frontier.pop()
+        item = self.frontier.pop(self.clock())
         assert item is not None
-        # The start URL is fetched on its own: if it isn't a page, there's no crawl.
+        # The start URL is fetched on its own: if it isn't a page, there's no crawl. Nothing
+        # else is queued, so its retries wait here.
         outcome = await self.fetcher.fetch(item, self)
+        while isinstance(outcome, Retry):
+            if (again := _next_attempt(outcome, self.retries, self.rng, self.stats)) is None:
+                outcome = outcome.final
+                break
+            item, delay = again
+            await asyncio.sleep(delay)
+            outcome = await self.fetcher.fetch(item, self)
         # Nothing but the start URL's own chain has claimed anything yet.
         assert not isinstance(outcome, Claimed)
         if isinstance(outcome, Page):
@@ -386,6 +405,18 @@ class _Start:
         return f"{final.url}: {final.detail}"
 
 
+def _next_attempt(
+    outcome: Retry, retries: int, rng: random.Random, stats: Stats
+) -> tuple[CrawlItem, float] | None:
+    """When to fetch outcome's item again, and as what; or None if it has no retries left."""
+    again = retry.next_attempt(outcome.item, outcome.cls, retries=retries, rng=rng)
+    if again is not None:
+        final = outcome.final
+        stats.retries[final.reason] += 1
+        log.info("%s: %s; trying again in %.2f s", final.url, final.detail, again[1])
+    return again
+
+
 def _count(stats: Stats, outcome: NotPage | Claimed | Final) -> None:
     """Count an item that ended without a page."""
     if isinstance(outcome, NotPage):
@@ -424,6 +455,8 @@ class _Dispatcher:
     robots: RobotsFetcher | None  # None under --ignore-robots
     product: str  # the User-Agent's product token, which robots.txt groups name
     robots_refresh: float  # seconds between fetches of robots.txt
+    retries: int  # for errors, from --retries
+    rng: random.Random  # for retries' backoff
     _parser: Parser | None = field(default=None, init=False)
     _gate: PauseGate = field(default_factory=PauseGate, init=False)
     _slots: int = field(default=0, init=False)
@@ -480,8 +513,10 @@ class _Dispatcher:
             if (wait := self._gate.delay(now)) > 0:
                 self._wake_in(wait)
                 break
-            item = self.frontier.pop()
+            item = self.frontier.pop(now)
             if item is None:
+                if (due := self.frontier.next_retry_at()) is not None:
+                    self._wake_in(due - now)
                 break
             self._gate.take(now)
             self._start(item)
@@ -499,7 +534,8 @@ class _Dispatcher:
         task.add_done_callback(self._parsing.discard)
 
     def _wake_in(self, delay: float) -> None:
-        """Pump after delay seconds, unless it's already due to run sooner."""
+        """Pump after delay seconds, unless it's already due to run sooner: when the rate
+        ceiling allows the next start, or the next retry is due."""
         loop = asyncio.get_running_loop()
         when = loop.time() + delay
         if self._wake is not None:
@@ -578,6 +614,7 @@ class _Dispatcher:
 
     async def _process(self, item: CrawlItem, page: Page | None) -> None:
         """Fetch item, unless its page is already here, and parse the page it leads to."""
+        finished = True
         try:
             outcome = page if page is not None else await self._fetch(item)
             if isinstance(outcome, Page):
@@ -588,6 +625,8 @@ class _Dispatcher:
                 self._fetching.discard(task)
                 self._parsing.add(task)
                 await self._page(item, outcome)
+            elif isinstance(outcome, Retry):
+                finished = not self._retry(outcome)
             else:
                 _count(self.stats, outcome)
         except Exception:
@@ -597,8 +636,21 @@ class _Dispatcher:
             log.exception("internal error while crawling %s", item.url)
         finally:
             self._in_pipeline -= 1
-            self.frontier.finish()
+            if finished:
+                self.frontier.finish()
             self.pump()
+
+    def _retry(self, outcome: Retry) -> bool:
+        """Put outcome's item in the retry heap, if it has retries left, and say whether it
+        did; otherwise the item's failure is final. Waiting there, the item holds no permit
+        and no pipeline slot (DESIGN.md §5.4)."""
+        again = _next_attempt(outcome, self.retries, self.rng, self.stats)
+        if again is None:
+            _count(self.stats, outcome.final)
+            return False
+        item, delay = again
+        self.frontier.schedule_retry(item, self.clock() + delay)
+        return True
 
     async def _fetch(self, item: CrawlItem) -> FetchOutcome:
         """item's fetch, which holds a permit of the concurrency limit until it's done."""

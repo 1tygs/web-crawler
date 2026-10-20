@@ -81,6 +81,19 @@ def test_speed_options_out_of_range_are_usage_errors(
     assert message in capsys.readouterr().err
 
 
+def test_retries() -> None:
+    assert parse_args(["https://example.com/", "--retries", "0"]).retries == 0
+    assert parse_args(["https://example.com/", "--retries", "7"]).retries == 7
+    assert parse_args(["https://example.com/"]).retries == 3
+
+
+def test_negative_retries_are_a_usage_error(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        parse_args(["https://example.com/", "--retries", "-1"])
+    assert exit_info.value.code == 2
+    assert "retries must be at least 0, not -1" in capsys.readouterr().err
+
+
 def test_start_url_options() -> None:
     cfg = parse_args(["https://example.com/", "--strict-host", "--insecure"])
     assert (cfg.strict_host, cfg.insecure) == (True, True)
@@ -109,7 +122,7 @@ def test_help_exits_zero(capsys: pytest.CaptureFixture[str]) -> None:
     usage = " ".join(capsys.readouterr().out.split())  # however the terminal's width wraps it
     assert usage.startswith(
         "usage: crawl [-h] [--all-urls] [--max-pages N] [--max-concurrency N] [--max-rps R] "
-        "[--parse-workers N] [--ignore-robots]"
+        "[--parse-workers N] [--retries N] [--ignore-robots]"
     )
 
 

@@ -12,6 +12,11 @@ def test_items_are_immutable() -> None:
         item.depth = 1  # type: ignore[misc]
 
 
+def test_a_new_item_has_had_no_retries_and_followed_no_redirects() -> None:
+    item = CrawlItem(url="https://example.com/", key="https://example.com/", depth=0)
+    assert (item.attempt, item.throttled, item.redirected_from) == (0, 0, ())
+
+
 @pytest.mark.parametrize(
     "value",
     [

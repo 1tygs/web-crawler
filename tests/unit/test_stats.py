@@ -7,12 +7,14 @@ def test_summary_of_a_crawl() -> None:
     stats = Stats(started=100.0, pages=1234, links_found=56789, not_html=3, internal_errors=1)
     stats.statuses.update({200: 1237, 404: 2, 301: 5})
     stats.failures.update({"HTTP 404": 2, "connect": 1})
+    stats.retries.update({"reset": 3, "HTTP 502": 1, "connect": 3})
     stats.body_bytes, stats.decoded_bytes = 23_456_789, 98_765_432
     assert stats.summary(unique_urls=2000, now=110.0).splitlines() == [
         "1,234 pages in 10.0 s (123.4 pages/s), 56,789 links found, 2,000 unique in-scope URLs",
         "statuses: 200 (1,237), 301 (5), 404 (2)",
         "page bodies: 23.5 MB received, 98.8 MB decompressed",
         "not printed: not HTML (3), HTTP 404 (2), connect (1)",
+        "retried: HTTP 502 (1), connect (3), reset (3)",
         "internal errors: 1, logged above",
     ]
 

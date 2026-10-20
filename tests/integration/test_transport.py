@@ -20,10 +20,10 @@ from web_crawler.transport import (
     ACCEPT,
     ACCEPT_ENCODING,
     AiohttpTransport,
-    ErrorKind,
     TransportError,
     transport_error,
 )
+from web_crawler.types import ErrorKind
 
 
 def make_transport(timeout: float = 60.0) -> AiohttpTransport:

@@ -5,7 +5,7 @@ changed, and the parse contracts cross a process boundary by pickle.
 """
 
 from dataclasses import dataclass
-from enum import IntEnum
+from enum import IntEnum, StrEnum
 from typing import NamedTuple
 
 
@@ -16,6 +16,26 @@ class CrawlItem:
     url: str  # display URL: what is requested and printed
     key: str  # dedupe key
     depth: int  # links from the start URL
+    attempt: int = 0  # retries after errors so far (--retries)
+    throttled: int = 0  # retries after a 429 or 503 so far, which have a budget of their own
+    # The redirects already followed to url, in order. A retry resumes where its chain got
+    # to: the URLs before it are this item's claims, which no other item will request.
+    redirected_from: tuple[str, ...] = ()
+
+
+class ErrorKind(StrEnum):
+    """Why a request got no response, or its body couldn't be read: the transport's
+    errors, which retry.classify() and the concurrency limiter read."""
+
+    DNS = "dns"
+    CONNECT = "connect"
+    TLS = "tls"
+    CONNECT_TIMEOUT = "connect_timeout"
+    TIMEOUT = "timeout"
+    RESET = "reset"  # the connection was closed or reset
+    PAYLOAD = "payload"  # the body ended early
+    PROTOCOL = "protocol"  # the response wasn't valid HTTP
+    INVALID_URL = "invalid_url"
 
 
 @dataclass(frozen=True, slots=True)

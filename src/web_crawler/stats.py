@@ -16,6 +16,7 @@ class Stats:
     not_html: int = 0  # 2xx responses that weren't pages
     statuses: Counter[int] = field(default_factory=Counter)  # every response, redirects too
     failures: Counter[str] = field(default_factory=Counter)  # items that ended without a page
+    retries: Counter[str] = field(default_factory=Counter)  # tries again, by what failed
     internal_errors: int = 0  # unexpected exceptions while processing an item
     body_bytes: int = 0  # pages' bodies as they arrived, compressed or not
     decoded_bytes: int = 0  # the bodies of the pages printed, decompressed
@@ -49,6 +50,8 @@ class Stats:
             skipped.insert(0, ("not HTML", self.not_html))
         if skipped:
             lines.append(f"not printed: {_counts(skipped)}")
+        if self.retries:
+            lines.append(f"retried: {_counts(sorted(self.retries.items()))}")
         if rejected:
             examples = examples or {}
             lines.append(

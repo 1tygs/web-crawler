@@ -18,16 +18,18 @@ from web_crawler.fetcher import (
     Final,
     NotPage,
     Page,
+    Retry,
     RobotsFetcher,
     Triage,
+    resume,
     triage,
 )
 from web_crawler.frontier import Admission, Frontier, Hop
+from web_crawler.retry import Class
 from web_crawler.robots import MAX_BYTES as MAX_ROBOTS_BYTES
 from web_crawler.robots import Availability, RobotsTxt
 from web_crawler.stats import Stats
-from web_crawler.transport import ErrorKind
-from web_crawler.types import CrawlItem, ParseJob
+from web_crawler.types import CrawlItem, ErrorKind, ParseJob
 from web_crawler.urls import Scope, dedupe_key
 
 START = "https://example.com/"
@@ -52,13 +54,16 @@ async def fetch(
     url: str = START,
     max_page_bytes: int = 1 << 20,
     admission: Admission | None = None,
+    start: CrawlItem | None = None,
 ) -> tuple[object, FakeTransport, Stats]:
     transport = FakeTransport(replies)
     stats = Stats(started=0.0)
     admission = admission or claiming()
-    admission.seen.add(dedupe_key(url))  # as the item's own admission did
+    start = start or item(url)
+    # As the item's own admission, and its redirects before, claimed them.
+    admission.seen.update(map(dedupe_key, [*start.redirected_from, start.url]))
     fetcher = Fetcher(transport, max_page_bytes, stats)
-    return await fetcher.fetch(item(url), AdmissionHops(admission)), transport, stats
+    return await fetcher.fetch(start, AdmissionHops(admission)), transport, stats
 
 
 @pytest.mark.parametrize(
@@ -355,26 +360,97 @@ async def test_drains_a_small_non_html_body_and_drops_a_large_one(
     assert transport.responses[0].position == read
 
 
-@pytest.mark.parametrize("status", [404, 410, 403, 500, 503])
+@pytest.mark.parametrize("status", [404, 410, 401, 403, 400, 501, 429, 503])
 async def test_an_error_status_is_final(status: int) -> None:
     outcome, _, stats = await fetch({START: Reply(status, HTML)})
     assert outcome == Final(f"HTTP {status}", f"HTTP {status}", (START,), status)
     assert stats.statuses == {status: 1}
 
 
-@pytest.mark.parametrize("kind", [ErrorKind.CONNECT, ErrorKind.DNS, ErrorKind.TIMEOUT])
-async def test_a_transport_error_is_final(kind: ErrorKind) -> None:
+@pytest.mark.parametrize("status", [408, 500, 502, 504])
+async def test_an_error_status_that_may_pass_is_a_retry(status: int) -> None:
+    outcome, transport, stats = await fetch({START: Reply(status, HTML)})
+    final = Final(f"HTTP {status}", f"HTTP {status}", (START,), status)
+    assert outcome == Retry(item(), Class.ERROR, final)
+    assert transport.requested == [START]  # whether to try again is the caller's choice
+    assert stats.statuses == {status: 1}
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        ErrorKind.DNS,
+        ErrorKind.CONNECT,
+        ErrorKind.TLS,
+        ErrorKind.CONNECT_TIMEOUT,
+        ErrorKind.TIMEOUT,
+        ErrorKind.RESET,
+    ],
+)
+async def test_a_request_that_got_no_response_is_a_retry(kind: ErrorKind) -> None:
     outcome, _, stats = await fetch({START: kind})
-    assert isinstance(outcome, Final)
-    assert outcome.reason == str(kind)
-    assert outcome.url == START
+    assert outcome == Retry(item(), Class.ERROR, Final(str(kind), f"{kind}: scripted", (START,)))
     assert not stats.statuses
 
 
-async def test_a_body_cut_off_is_final() -> None:
+@pytest.mark.parametrize("kind", [ErrorKind.PROTOCOL, ErrorKind.INVALID_URL])
+async def test_a_transport_error_that_would_recur_is_final(kind: ErrorKind) -> None:
+    outcome, _, _ = await fetch({START: kind})
+    assert outcome == Final(str(kind), f"{kind}: scripted", (START,))
+
+
+async def test_a_body_cut_off_is_a_retry() -> None:
     outcome, _, _ = await fetch({START: Reply(headers=HTML, read_error=ErrorKind.PAYLOAD)})
+    assert outcome == Retry(item(), Class.ERROR, Final("payload", "payload: scripted", (START,)))
+
+
+async def test_a_retry_resumes_where_the_chain_failed() -> None:
+    # The item's redirects claimed /a and /b for it: starting again from / would find /a
+    # claimed, and stop there.
+    replies: Replies = {
+        START: Reply(301, {"Location": "/a"}),
+        "https://example.com/a": Reply(302, {"Location": "/%7Eb"}),
+        "https://example.com/%7Eb": ErrorKind.RESET,
+    }
+    outcome, _, _ = await fetch(replies)
+    assert isinstance(outcome, Retry)
+    chain = (START, "https://example.com/a", "https://example.com/%7Eb")
+    assert outcome.final.chain == chain
+    assert outcome.item == CrawlItem(
+        "https://example.com/%7Eb", "https://example.com/~b", 0, redirected_from=chain[:2]
+    )
+
+
+async def test_a_resumed_item_carries_on_from_its_chain() -> None:
+    resumed = CrawlItem(
+        "https://example.com/b", "https://example.com/b", 0, 1, 0, (START, "https://example.com/a")
+    )
+    replies: Replies = {
+        # A cookie gate that leads back into the chain is still followed.
+        "https://example.com/b": Reply(302, {"Location": "/a"}),
+        "https://example.com/a": Reply(headers=HTML, body=b"page"),
+    }
+    outcome, transport, _ = await fetch(replies, start=resumed)
+    assert outcome == Page(ParseJob("https://example.com/a", b"page", "utf-8"))
+    assert transport.requested == ["https://example.com/b", "https://example.com/a"]
+
+
+async def test_the_hop_limit_counts_the_redirects_before_a_retry() -> None:
+    chain = tuple(f"https://example.com/{n}" for n in range(MAX_REDIRECTS))
+    resumed = CrawlItem(chain[-1], chain[-1], 0, 1, 0, chain[:-1])
+    replies: Replies = {
+        chain[-1]: Reply(307, {"Location": "/10"}),
+        "https://example.com/10": Reply(307, {"Location": "/11"}),
+    }
+    outcome, transport, _ = await fetch(replies, start=resumed)
     assert isinstance(outcome, Final)
-    assert outcome.reason == "payload"
+    assert outcome.reason == "too many redirects"
+    assert transport.requested == [chain[-1], "https://example.com/10"]
+
+
+def test_resume_is_the_item_itself_when_it_failed_where_it_began() -> None:
+    start = item()
+    assert resume(start, (START,)) is start
 
 
 class Sleeps:

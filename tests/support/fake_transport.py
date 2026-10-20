@@ -6,7 +6,8 @@ from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
-from web_crawler.transport import ErrorKind, TransportError
+from web_crawler.transport import TransportError
+from web_crawler.types import ErrorKind
 
 
 @dataclass(slots=True)
@@ -43,10 +44,11 @@ type Answer = Reply | ErrorKind
 class FakeTransport:
     """Answers each URL from replies: a Reply, or an ErrorKind to fail with, or a list of
     them for successive requests, the last repeating. Any other URL gets a 404. It records
-    every response it gave, and the most requests ever in flight."""
+    every URL asked for and every response it gave, and the most requests ever in flight."""
 
     replies: Mapping[str, Answer | list[Answer]]
     responses: list[FakeResponse] = field(default_factory=list)
+    opened: list[str] = field(default_factory=list)  # every request, answered or not
     in_flight: int = 0
     max_in_flight: int = 0
     closed: bool = False
@@ -60,6 +62,7 @@ class FakeTransport:
     async def open(self, url: str) -> AsyncIterator[FakeResponse]:
         self.in_flight += 1
         self.max_in_flight = max(self.max_in_flight, self.in_flight)
+        self.opened.append(url)
         try:
             reply = self.replies.get(url, Reply(status=404))
             if isinstance(reply, list):

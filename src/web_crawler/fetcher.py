@@ -3,10 +3,12 @@
 
 The fetcher follows redirects itself, so that each hop is checked and claimed before it's
 requested, and reads only the bodies worth reading. What to do with a response is decided
-by triage() from the status and headers alone.
+by triage() from the status and headers alone, and whether a failure is worth another try
+by retry.classify().
 """
 
 import asyncio
+import dataclasses
 import enum
 import random
 import time
@@ -29,10 +31,11 @@ from web_crawler.content import (
     sniff_html,
 )
 from web_crawler.frontier import Admission, Hop
+from web_crawler.retry import Class, classify
 from web_crawler.robots import Availability, RobotsTxt
 from web_crawler.stats import Stats
-from web_crawler.transport import ErrorKind, Response, Transport, TransportError
-from web_crawler.types import CrawlItem, ParseJob
+from web_crawler.transport import Response, Transport, TransportError
+from web_crawler.types import CrawlItem, ErrorKind, ParseJob
 from web_crawler.urls import dedupe_key, strip_fragment
 
 MAX_REDIRECTS = 10
@@ -84,7 +87,28 @@ class Final:
         return self.chain[-1]
 
 
-type FetchOutcome = Page | NotPage | Claimed | Final
+@dataclass(frozen=True, slots=True)
+class Retry:
+    """The item failed in a way that another try may not (DESIGN.md §5.4)."""
+
+    item: CrawlItem  # to request again: the item where it failed, as resume() makes it
+    cls: Class  # what kind of failure, which says what budget a retry uses
+    final: Final  # how the item ends if it isn't tried again
+
+
+type FetchOutcome = Page | NotPage | Claimed | Retry | Final
+
+
+def resume(item: CrawlItem, chain: Sequence[str]) -> CrawlItem:
+    """item, to request again where it got to: the last of chain, the URLs it requested,
+    after the redirects that led there. Starting again from its first URL would find the
+    redirects' targets claimed, by this item, and nothing would print the page."""
+    if len(chain) == len(item.redirected_from) + 1:
+        return item
+    url = chain[-1]
+    return dataclasses.replace(
+        item, url=url, key=dedupe_key(url), redirected_from=tuple(chain[:-1])
+    )
 
 
 class HopPolicy(Protocol):
@@ -190,10 +214,15 @@ class Fetcher:
         Each redirect target is claimed before it's requested (hops), so a page reached by
         redirect is fetched once, however many URLs lead to it. A target that comes back
         within the chain is followed again, as a cookie gate needs; a real loop ends after
-        MAX_REDIRECTS redirects, and is reported as one.
+        MAX_REDIRECTS redirects, and is reported as one. An item tried again carries the
+        redirects it followed before, and the chain goes on from them.
+
+        A failure that another try may not repeat is a Retry; whether there is one is the
+        caller's to decide.
         """
-        chain = [item.url]
-        keys = {item.key}
+        chain = [*item.redirected_from, item.url]
+        keys = {dedupe_key(url) for url in item.redirected_from}
+        keys.add(item.key)
         while True:
             issued = self._clock()
             try:
@@ -202,7 +231,10 @@ class Fetcher:
                     outcome = await self._handle(response, tuple(chain))
             except TransportError as error:
                 self._signals.failed(error.kind, issued)
-                return Final(str(error.kind), str(error), tuple(chain))
+                final = Final(str(error.kind), str(error), tuple(chain))
+                return _retry_or(final, classify(error.kind), item)
+            if isinstance(outcome, Final) and outcome.status is not None:
+                return _retry_or(outcome, classify(outcome.status), item)
             if not isinstance(outcome, _Redirect):
                 return outcome
             target, status = outcome.target, outcome.status
@@ -382,6 +414,13 @@ class RobotsFetcher:
                 return _Answer(status)
         except TransportError as error:
             return error
+
+
+def _retry_or(final: Final, cls: Class, item: CrawlItem) -> Retry | Final:
+    """A Retry of item where final ended it, if final is worth another try."""
+    if cls is Class.ERROR:
+        return Retry(resume(item, final.chain), cls, final)
+    return final
 
 
 def _too_many_redirects(chain: tuple[str, ...], looped: bool, target: str, status: int) -> Final:
