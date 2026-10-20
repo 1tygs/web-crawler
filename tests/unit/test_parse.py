@@ -3,6 +3,7 @@ import html
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
+from selectolax.lexbor import LexborHTMLParser
 
 from web_crawler.parse import parse_page
 from web_crawler.types import ParseJob, WorkerContext
@@ -135,6 +136,69 @@ def test_prints_each_spelling_but_crawls_each_resource_once() -> None:
         ("https://example.com/b%2Fc", "https://example.com/b%2fc"),
         ("https://example.com/b/c", "https://example.com/b/c"),
     ]
+
+
+@pytest.mark.parametrize(
+    ("body", "http_charset", "url"),
+    [
+        # Undeclared and not UTF-8: windows-1252, so 0xE9 is é.
+        (b'<a href="/caf\xe9">x</a>', None, "https://example.com/caf%C3%A9"),
+        (b'<a href="/caf\xc3\xa9">x</a>', None, "https://example.com/caf%C3%A9"),
+        # Declared by the header, which a <meta> can't overrule, or by a <meta>.
+        (b'<a href="/\xe0">x</a>', "windows-1251", "https://example.com/%D0%B0"),
+        (
+            b'<meta charset=koi8-r><a href="/\xe0">x</a>',
+            "windows-1251",
+            "https://example.com/%D0%B0",
+        ),
+        (b'<meta charset=koi8-r><a href="/\xc1">x</a>', None, "https://example.com/%D0%B0"),
+        (
+            b'<meta charset=shift_jis><a href="/\x93\xfa">x</a>',
+            None,
+            "https://example.com/%E6%97%A5",
+        ),
+        # A <meta> beyond the first 1,024 bytes: the parser reaches it and starts over.
+        (
+            b"<!--" + b"-" * 1024 + b'--><meta charset=windows-1251><a href="/\xe0">x</a>',
+            None,
+            "https://example.com/%D0%B0",
+        ),
+        # A byte order mark wins, and isn't text.
+        (
+            b"\xff\xfe<\x00a\x00 \x00h\x00r\x00e\x00f\x00=\x00/\x00\xe9\x00>\x00",
+            None,
+            "https://example.com/%C3%A9",
+        ),
+    ],
+)
+def test_decodes_a_page_as_a_browser_does(body: bytes, http_charset: str | None, url: str) -> None:
+    job = ParseJob(url=PAGE, body=body, http_charset=http_charset)
+    assert parse_page(job, CTX).record.decode().split("\n")[1:-2] == [f"  {url}"]
+
+
+def test_a_byte_order_mark_is_not_text() -> None:
+    body = b'\xef\xbb\xbf<!doctype html><frameset><frame src="/top"></frameset>'
+    # lexbor reads the mark as text, which ends <head> early and makes it ignore the
+    # <frameset>, so parse_page drops it first.
+    assert LexborHTMLParser(body).css("frame") == []
+    result = parse_page(ParseJob(url=PAGE, body=body), CTX)
+    assert result.links == [("https://example.com/top", "https://example.com/top")]
+
+
+def test_a_page_in_the_replacement_encoding_has_no_links() -> None:
+    # Some encodings aren't safe to decode; a browser shows such a page as one U+FFFD.
+    job = ParseJob(url=PAGE, body=b'<a href="/x">x</a>', http_charset="iso-2022-kr")
+    assert parse_page(job, CTX) == (b"https://example.com/dir/page.html\n\n", [], 0)
+
+
+def test_a_truncated_page_may_end_inside_a_utf8_character() -> None:
+    body = '<a href="/caf\u00e9">x</a><p>\u65e5'.encode()[:-1]
+    for truncated in (True, False):
+        result = parse_page(ParseJob(url=PAGE, body=body, truncated=truncated), CTX)
+        url = (
+            "https://example.com/caf%C3%A9" if truncated else "https://example.com/caf%C3%83%C2%A9"
+        )
+        assert result.links == [(url, url)]
 
 
 def test_skips_valueless_hrefs_and_svg_xlink() -> None:

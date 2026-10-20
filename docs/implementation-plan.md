@@ -43,6 +43,9 @@ Checked on 2026-10-20 against the versions pinned in Appendix A (Python 3.14.6, 
 | brotli's `output_buffer_limit` is a soft cap: 1 MiB asked, 2.06 MiB returned. zlib's and zstd's `max_length` are exact | The worker slices brotli output to the cap after decoding |
 | Raw deflate (no zlib header) fails with `wbits` 15 and 47 | `deflate` checks for a zlib header and falls back to raw deflate, as browsers do |
 | Python's codec names aren't WHATWG labels: `latin1` and `ascii` mean iso8859-1 and ascii to Python but windows-1252 to a browser; `x-mac-cyrillic`, `koi8-ru` and `unicode11utf8` don't exist in Python | A WHATWG label table (`encodings.py`) maps labels to Python codecs |
+| Found in PR 2: Python's single-byte codecs decode 89 bytes unlike the standard's indexes: windows-874 and windows-1250 to 1258 leave bytes in 0x80–0x9F undefined that WHATWG maps to C1 controls, and KOI8-U and windows-1255 differ on three. Its multi-byte codecs differ on a few hundred rare characters (DESIGN A.14) | Single-byte encodings decode through tables built from Python's codecs with those bytes filled in, tested byte for byte against the standard's indexes. Multi-byte encodings use Python's codecs |
+| Found in PR 2: lexbor reads a UTF-8 byte order mark in `bytes` as text, which ends `<head>` there and makes it ignore a `<frameset>` after it | `parse.py` drops the mark before parsing |
+| Found in PR 2: html5lib's encoding tests expect a `<meta>` after the first 1,024 bytes to count, as the HTML standard's "change the encoding" makes it when the parser reaches it | A charset from the prescan or the guess is tentative: `parse.py` checks the parsed page's first declaring `<meta>` and decodes again if it names another encoding. It costs about 1 µs a page (`css_first`) |
 | Python 3.14 has `ProcessPoolExecutor.kill_workers()`, `os.process_cpu_count()` and `asyncio.run(loop_factory=)`. `PYTHON_CPU_COUNT` and `-X cpu_count` override `process_cpu_count()`; isolated mode (`-I`) ignores the variable | The second Ctrl-C calls `kill_workers()`. uvloop comes in through `loop_factory`. The cgroup cap applies only when no override is set (§5.12) |
 | Protego has `can_fetch`, `crawl_delay`, `request_rate` and `sitemaps`, and matches percent-encoding equivalents (`/~j` against `/%7Ej`) | Paths need no normalization before `can_fetch` |
 | Found in PR 1: aiohttp's `trust_env=True` reads `~/.netrc` and looks up the proxy on a thread for every request, 162.5 µs of CPU per request against 26.9 µs (DESIGN A.4), and sends `~/.netrc` credentials to the crawled host | `trust_env=False`. The transport reads `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY` once |
@@ -67,7 +70,7 @@ web-crawler/
 │   ├── types.py              # shared frozen contracts (DESIGN §6.2)
 │   ├── urls.py               # scope, dedupe key, start-URL normalization, trap and extension rules
 │   ├── content.py            # Content-Type, capped decompression, HTML sniffing, charset detection
-│   ├── encodings.py          # WHATWG label → Python codec table (data)
+│   ├── encodings.py          # WHATWG labels → decoders: exact tables for single-byte, Python codecs for multi-byte
 │   ├── parse.py              # parse_page(), pure; runs in the workers
 │   ├── frontier.py           # Admission + Frontier: seen set, depth queues and window, retry heap, accounting
 │   ├── limiter.py            # ADR-001 law, pause and rate gate, circuit breaker, 403 guard
@@ -202,24 +205,27 @@ class WorkerContext:                      # sent once, through the pool initiali
 
   A stream that ends cleanly but early returns its partial output with `truncated=True`, which is what a browser renders. Corrupt data raises.
 - `sniff_html(prefix)`: the WHATWG MIME-sniffing HTML patterns for an unknown type over the first 512 decoded bytes: leading whitespace skipped, then `<!DOCTYPE HTML`, `<HTML`, `<HEAD`, `<SCRIPT`, … or `<!--`, each followed by a tag-terminating byte.
-- `pick_charset(body, http_charset) -> codec`, in this order:
+- `pick_charset(body, http_charset, *, truncated) -> Charset(encoding, source)`, in this order:
   1. BOM.
   2. HTTP label.
   3. `prescan(body[:1024])`, the HTML standard's prescan algorithm (UTF-16 → UTF-8, x-user-defined → windows-1252).
-  4. UTF-8, if `body.isascii()` or the body decodes as UTF-8.
+  4. UTF-8, if `body.isascii()` or the body decodes as UTF-8; a character cut off at the end counts only if the body was truncated.
   5. Otherwise windows-1252.
-- `encodings.py` holds all ~220 labels of the Encoding Standard, mapped through its encodings to Python codecs:
-  - gbk → gb18030, big5 → big5hkscs, shift_jis → cp932, euc-kr → cp949, x-mac-cyrillic → mac_cyrillic;
-  - `replacement` → no content.
 
-  A test checks it against a vendored copy of the standard's `encodings.json` (CC BY 4.0, credited in the fixture folder), so every label resolves.
+  Results 3–5 are tentative: `meta_encoding` and `change_encoding` implement the parser's `<meta>` rules and "change the encoding", which `parse.py` applies to the parsed page (§5.5).
+- `encodings.py` holds all 228 labels of the Encoding Standard, mapped to its encodings, and `decode(data, encoding)`, the standard's "decode":
+  - single-byte encodings and x-user-defined through `codecs.charmap_decode` tables, built from Python's codecs with the 89 bytes they get wrong filled in (DESIGN A.14);
+  - gbk → gb18030, big5 → big5hkscs, shift_jis → cp932, euc-kr → cp949, euc-jp → euc_jp, iso-2022-jp → iso2022_jp_ext;
+  - `replacement` → a single U+FFFD.
+
+  Tests check it against vendored copies of the standard's `encodings.json`, so every label resolves, and of its 27 single-byte indexes, so every byte decodes as the standard says (CC BY 4.0, credited in the fixture folder). html5lib's encoding tests (MIT) check BOM, prescan and late-`<meta>` handling.
 
 ### 5.5 `parse.py`: the worker
 
 `parse_page(job, ctx) -> ParseResult` takes the `WorkerContext` as an argument, so it stays pure and the inline path needs no global (a refinement made in PR 1). In the pool, `init_worker(ctx)` stores the context in a module global, sets SIGINT and SIGTERM to ignored, then unblocks them (DESIGN §4.3), and each job runs a module-level wrapper that calls `parse_page(job, ctx)`, so the context still crosses to a worker only once. `parse_page`:
 
 1. `decode_body(job.body, job.content_encoding, ctx.max_bytes)`. On `ContentDecodeError`, return `ParseResult(b"", [], 0, 0, "bad_encoding")`.
-2. `pick_charset`. UTF-8 goes to lexbor as bytes, with no copy; other charsets go as `bytes.decode(codec, "replace")`.
+2. `pick_charset`. UTF-8 goes to lexbor as bytes, with no copy and without a BOM; other charsets go as `encodings.decode(body, encoding)`. If the charset is tentative and the page's first declaring `<meta>` names another encoding, decode and parse again in that one.
 3. `LexborHTMLParser(html)`, with scripting off (the default).
 4. **Base URL:** the first `base[href]`, resolved against `job.url`. It's ignored if resolution fails or gives `data:` or `javascript:` (HTML standard).
 5. **Extract** in document order with one selector list.
@@ -520,6 +526,6 @@ Each lands in the PR that implements it:
 
 - **Trace overhead** is unmeasured. PR 3 measures it, and the fallback is already defined.
 - **Windows** has no CI: no uvloop, and signal handling is best effort.
-- **windows-1252 edge bytes.** WHATWG's windows-1252 maps 5 bytes that Python's cp1252 leaves undefined. Decoding with `replace` affects only hrefs that contain those raw bytes.
+- **Multi-byte legacy decoders.** Python's codecs for Big5, gb18030, EUC-JP and ISO-2022-JP differ from the standard's on a few hundred rare characters (DESIGN A.14). This affects only hrefs that contain those characters unescaped. Single-byte encodings, including windows-1252, decode exactly since PR 2.
 - **Legacy-encoded query strings** behave as described in DESIGN §13.
 - **Performance gates** depend on how fast CI runners are. They're calibrated in PR 3 and enforced relative to that baseline from PR 5.

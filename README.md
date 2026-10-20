@@ -89,10 +89,12 @@ curl --compressed -o bench/fixtures/python.html https://www.python.org/
 | `python bench/depth_sim.py`                     | `--max-depth` rules against breadth-first-search ground truth, in simulation           | A.10     |
 | `python bench/limiter_sim.py`                   | Concurrency laws on simulated servers                                                  | A.11     |
 | `python bench/ttfb_spread.py URL`               | How widely a real site's response times spread                                         | A.12     |
+| `uv run python bench/encoding_check.py INDEXES` | The crawler's legacy decoders against the Encoding Standard's indexes                  | A.14     |
 
 
 - `client_bench.py` needs `python bench/server.py PAGE.html` running in another shell; it serves that page on 127.0.0.1:8899. `CLIENT` is one of `aiohttp`, `aiohttp+uvloop`, `aiohttp+uvloop+raw` (no decompression), `curl_cffi`, `niquests` or `httpx`. Adding `+env` to an aiohttp client turns on `trust_env`.
 - `robots_bench.py` expects `wikipedia.html` and `wikipedia.robots.txt` from en.wikipedia.org, and `guardian.html` and `guardian.robots.txt` from [www.theguardian.com](http://www.theguardian.com).
 - `pool_check.py` takes a `MODE` of `ondemand`, `crash` or `sigint`, and `--method spawn` or `--method forkserver`. It and the two simulations use only the standard library.
 - `ttfb_spread.py` needs curl, and sends about 40 requests, one at a time, to the site you give it.
+- `encoding_check.py` imports the crawler, so it runs in the project's environment through `uv run`. `INDEXES` is the Encoding Standard's [`indexes.json`](https://github.com/whatwg/encoding/blob/main/indexes.json).
 

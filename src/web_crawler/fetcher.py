@@ -110,8 +110,9 @@ class Fetcher:
                 await response.read(DRAIN_LIMIT)
                 return target
             case Triage.PAGE:
-                body, _truncated = await response.read(self._max_page_bytes)
-                return Page(ParseJob(url=response.url, body=body))
+                body, truncated = await response.read(self._max_page_bytes)
+                _, charset = parse_content_type(response.headers.get("Content-Type"))
+                return Page(ParseJob(response.url, body, charset, truncated))
             case Triage.NOT_PAGE:
                 size = _content_length(response.headers)
                 if size is not None and size <= DRAIN_LIMIT:

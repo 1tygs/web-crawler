@@ -61,14 +61,33 @@ def test_triage(status: int, headers: dict[str, str], expected: Triage) -> None:
 
 async def test_a_page() -> None:
     outcome, transport, stats = await fetch({START: Reply(headers=HTML, body=b"<p>hi")})
-    assert outcome == Page(ParseJob(url=START, body=b"<p>hi"))
+    assert outcome == Page(ParseJob(url=START, body=b"<p>hi", http_charset="utf-8"))
     assert transport.requested == [START]
     assert stats.statuses == {200: 1}
 
 
 async def test_reads_a_page_up_to_the_cap() -> None:
     outcome, _, _ = await fetch({START: Reply(headers=HTML, body=b"x" * 100)}, max_page_bytes=10)
-    assert outcome == Page(ParseJob(url=START, body=b"x" * 10))
+    assert outcome == Page(ParseJob(START, b"x" * 10, "utf-8", truncated=True))
+    outcome, _, _ = await fetch({START: Reply(headers=HTML, body=b"x" * 10)}, max_page_bytes=10)
+    assert outcome == Page(ParseJob(START, b"x" * 10, "utf-8", truncated=False))
+
+
+@pytest.mark.parametrize(
+    ("content_type", "charset"),
+    [
+        ("text/html; charset=Shift_JIS", "Shift_JIS"),
+        ('text/html; charset="koi8-r"', "koi8-r"),
+        ("text/html", None),
+        ("text/html; charset=", None),
+    ],
+)
+async def test_passes_the_headers_charset_to_the_parser(
+    content_type: str, charset: str | None
+) -> None:
+    outcome, _, _ = await fetch({START: Reply(headers={"Content-Type": content_type})})
+    assert isinstance(outcome, Page)
+    assert outcome.job.http_charset == charset
 
 
 async def test_follows_redirects_and_reports_the_final_url() -> None:
@@ -78,7 +97,7 @@ async def test_follows_redirects_and_reports_the_final_url() -> None:
         "http://example.com/b": Reply(headers=HTML, body=b"page"),
     }
     outcome, transport, stats = await fetch(replies)
-    assert outcome == Page(ParseJob(url="http://example.com/b", body=b"page"))
+    assert outcome == Page(ParseJob("http://example.com/b", b"page", http_charset="utf-8"))
     assert transport.requested == [START, "https://example.com/a", "http://example.com/b"]
     assert stats.statuses == {301: 1, 302: 1, 200: 1}
 

@@ -284,10 +284,12 @@ The pipeline:
 2. **Pick the charset in WHATWG order:**
    - Byte-order mark.
    - HTTP `charset` parameter.
-   - `<meta charset>` in the first 1,024 bytes.
-   - UTF-8 if the bytes validate, else windows-1252.
+   - `<meta charset>`, or `http-equiv="Content-Type"` with a charset, in the first 1,024 bytes, found by the HTML standard's prescan.
+   - UTF-8 if the bytes validate, else windows-1252. A character cut off by the size cap doesn't count against UTF-8.
 
-   WHATWG label aliases apply, e.g. `latin1` and `ascii` map to windows-1252. UTF-8 pages, the vast majority, reach the parser as bytes with no decode copy. lexbor's own detection isn't used: it can't see the HTTP header and has no fallback (verified).
+   The last two are tentative, as in a browser: if the parser then reaches a `<meta>` that declares another encoding, the page is decoded again in that one. That is how a declaration beyond the first 1,024 bytes still counts; html5lib's encoding tests expect it.
+
+   Every label in the Encoding Standard is known, e.g. `latin1` and `ascii` map to windows-1252. Single-byte encodings decode exactly as the standard's indexes say, which Python's codecs alone don't (A.14). Multi-byte encodings go through Python's codecs, which differ from the standard on a few hundred rare characters. UTF-8 pages, the vast majority, reach the parser as bytes with no decode copy, and a byte-order mark is dropped first: lexbor would read it as text, end `<head>` there and ignore a `<frameset>` after it. lexbor's own detection isn't used: it can't see the HTTP header and has no fallback (verified).
 3. **Parse** with selectolax's lexbor engine. Tree construction follows HTML5. Scripting is off, so `<noscript>` content is parsed as markup, which is what a client without JavaScript sees.
 4. **Base URL.** Start from the response's final URL after redirects. The first `<base href>` overrides it, resolved against it, per the HTML standard. Resolving against the *requested* URL instead is a classic crawler bug.
 5. **Extract** with one CSS selector-list pass, plus recursion into **declarative shadow DOM** (`<template shadowrootmode>`), which browsers render. The content of an ordinary `<template>` is inert and is skipped.
@@ -604,7 +606,7 @@ Each commit is small and lands with its tests, so the history shows how the craw
 **Known limitations**
 - **No JavaScript.** Links created client-side aren't seen. Server-rendered and statically generated sites are unaffected; single-page apps are.
 - **Soft 404s.** A 200 response for a missing page looks like a real page. Trap rules limit the damage.
-- **Legacy-encoded pages.** Browsers percent-encode non-ASCII characters in the *query* using the document's encoding; ada-url always uses UTF-8. This only matters on non-UTF-8 pages with raw non-ASCII in query strings. If it comes up, the fix is to pre-encode the query in the document's charset.
+- **Legacy-encoded pages.** Browsers percent-encode non-ASCII characters in the *query* using the document's encoding; ada-url always uses UTF-8. This only matters on non-UTF-8 pages with raw non-ASCII in query strings. If it comes up, the fix is to pre-encode the query in the document's charset. Separately, Python's multi-byte decoders differ from the standard's on a few hundred rare characters (A.14).
 - **Trap thresholds.** The defaults give up a little completeness (e.g. listings with more than 1,000 query variants) in exchange for guaranteed termination. Every cut is reported in the summary.
 - **Printed depth.** Without `--max-depth`, the `depth` field is the shortest path known when the page was printed. With it, depths are exact.
 - **Limiter thresholds.** The law in [§5.3](#53-adaptive-concurrency-limiter) is validated in simulation only, and its thresholds are untuned. `-v` logs every decision so real crawls can check them.
@@ -889,3 +891,26 @@ The first draft of §5.3 read any ratio above 2 as congestion. On www.python.org
 | developer.mozilla.org | 302 → `https://developer.mozilla.org/en-US/` (same host) |
 
 5 of the 6 bare domains redirect to `www`.
+
+**A.14 Legacy decoders against the Encoding Standard** (`bench/encoding_check.py`)
+
+The standard's `indexes.json` at whatwg/encoding commit `be17ac5`, against Python 3.14.6's codecs. Single-byte encodings, bytes 0x80–0xFF decoded differently from the standard's index:
+
+| Encoding | Python's codec | The codec | The crawler |
+|---|---|---|---|
+| windows-874, windows-1250 to 1258 (not 1256) | cp874, cp1250, … | 87: bytes in 0x80–0x9F it leaves undefined, which the standard maps to the C1 control of the same value, and windows-1255 0xCA (U+05BA) | 0 |
+| KOI8-U | koi8_u | 2: the standard's KOI8-U is KOI8-RU, with ў and Ў at 0xAE and 0xBE | 0 |
+| The other 18 | | 0 | 0 |
+
+`encodings.py` fills those gaps, and a test checks all 28 single-byte encodings, byte by byte, against the standard's indexes. Multi-byte encodings, every sequence their lead and trail bytes allow:
+
+| Encoding | Python's codec | Sequences the standard decodes | Decoded alike | Differently | By the standard only |
+|---|---|---|---|---|---|
+| Shift_JIS | cp932 | 9,604 | 9,604 | 0 | 0 |
+| EUC-KR | cp949 | 17,048 | 17,048 | 0 | 0 |
+| Big5 | big5hkscs | 18,594 | 18,391 | 11 | 192 |
+| gb18030, GBK | gb18030 | 23,940 | 23,920 | 20 | 0 |
+| EUC-JP | euc_jp | 13,466 | 13,002 | 7 | 457 |
+| ISO-2022-JP | iso2022_jp_ext | 7,336 | 6,873 | 6 | 457 |
+
+The differences are rare symbols and vendor extensions, such as EUC-JP 0xA1C1, which Python decodes as U+301C WAVE DASH and the standard as U+FF5E FULLWIDTH TILDE. All 20 gb18030 differences are sequences Python decodes to private-use characters and the standard to real ones, most of them characters that GB18030's 2022 revision moved out of the private-use area. They change a link only when its href contains one of these characters unescaped. Each codec errs on a single bad byte without swallowing the ASCII byte after it, so the markup around it parses the same.

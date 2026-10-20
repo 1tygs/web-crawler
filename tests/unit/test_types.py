@@ -16,6 +16,7 @@ def test_items_are_immutable() -> None:
     "value",
     [
         ParseJob(url="https://example.com/", body=b"<a href=/x>"),
+        ParseJob("https://example.com/", b"<a href=/\xe9>", http_charset="latin1", truncated=True),
         ParseResult(record=b"r\n", links=[("k", "u")], links_found=1),
         WorkerContext(scope_prefixes=("https://example.com/", "http://example.com/")),
     ],
