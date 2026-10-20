@@ -19,11 +19,18 @@ updates:
         update-types: [minor, patch]
 
   # The Dockerfile's base images, pinned by digest: a new digest, or a newer patch or minor
-  # version of the same image.
+  # version of the same image. The python image is the exception: its minor version is the
+  # Python release, and moving to a new one is a runtime upgrade rather than a routine bump.
+  # Every C extension the crawler uses needs wheels for it (on 3.15.0, brotli had none and
+  # the build had no compiler), and CI's Python version and DESIGN.md §9 move with it. So
+  # only new digests and 3.14 patch releases come through here.
   - package-ecosystem: docker
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      - dependency-name: python
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
     groups:
       docker-minor-and-patch:
         update-types: [minor, patch]
