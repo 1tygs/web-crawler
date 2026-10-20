@@ -1,13 +1,22 @@
 # web-crawler
 
+[![CI](https://github.com/1tygs/web-crawler/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/1tygs/web-crawler/actions/workflows/ci.yml)
+[![Python 3.14+](https://img.shields.io/badge/python-3.14%2B-blue)](https://www.python.org/downloads/)
+[![mypy: strict](https://img.shields.io/badge/mypy-strict-blue)](https://mypy.readthedocs.io/en/stable/command_line.html#cmdoption-mypy-strict)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 A fast, accurate and polite web crawler for the command line, written in Python. Give it a start URL and it crawls that host, printing each page's URL followed by every link found on the page.
 
 > **Status: in development, step 2 of the 5 in [the v1 plan](docs/implementation-plan.md), plus `--max-pages` and a clean Ctrl-C.** `crawl URL` crawls the start URL's host breadth-first, eight requests at a time, and prints each page's links as a browser resolves them: in the page's charset, against its `<base href>`, from declarative shadow DOM and meta refresh too, and with `--all-urls` every URL-bearing attribute. It obeys robots.txt (RFC 9309), fetches each page once however many links and redirects lead to it, and follows a start URL's redirect to its `www.` host. `--max-pages` bounds a crawl, and Ctrl-C stops one cleanly. Speed, robustness, and the other limits and output options come in the next three steps; until then [DESIGN.md](DESIGN.md) describes more than the code does. The measurements behind the design can be reproduced with the scripts in [`bench/`](bench/).
 
 ## Usage
 
+With [uv](https://docs.astral.sh/uv/) installed (it fetches Python 3.14 itself if needed):
+
 ```bash
-crawl https://example.com/
+git clone https://github.com/1tygs/web-crawler.git
+cd web-crawler
+uv run crawl https://example.com/
 ```
 
 ```text
@@ -21,20 +30,22 @@ https://example.com/about
 ```
 
 - Only the start URL's exact host is crawled (after following a redirect that only adds or removes `www.`). Links to other domains and to subdomains are printed but never fetched.
-- Results stream to stdout as pages complete; progress and a final summary go to stderr.
+- Results stream to stdout as pages complete, and a short summary goes to stderr at the end.
 - `--max-pages N` stops once N pages are printed: exactly N records, or fewer if the site is smaller. A fetch starts only while pages printed plus fetches in flight is below N, so no page is fetched only to be thrown away.
 - Ctrl-C (SIGINT) or SIGTERM stops the crawl cleanly: no more fetches start, those in flight are cancelled, only whole records reach stdout, and the summary still goes to stderr. The exit code is 130 for SIGINT and 143 for SIGTERM. A second Ctrl-C exits at once.
 - Planned: `--format jsonl` gives machine-readable output, and `--max-depth` bounds the crawl by depth.
 
-Every option and exit code is listed in [DESIGN.md §6.1](DESIGN.md#61-command-line).
+`crawl --help` lists the options built so far: `--max-pages`, `--all-urls`, `--ignore-robots`, `--strict-host`, `--user-agent` and `--insecure`. [DESIGN.md §6.1](DESIGN.md#61-command-line) lists every v1 option and exit code, including those still to come.
 
 ## Design in brief
+
+This describes the full v1 design. The speed and robustness parts land in steps 3 and 4 of [the plan](docs/implementation-plan.md); until then the crawler parses inline at a fixed eight requests in flight and doesn't retry.
 
 - **Fast.** One asyncio (uvloop) coordinator owns all crawl state and does only cheap work. A process pool parses response bodies while they're still compressed. An adaptive concurrency limit runs close to what the server can sustain: it halves on 429/503 and timeouts, honours `Retry-After`, and stops growing when a probe confirms the server is queueing ([ADR-001](docs/adr/001-concurrency-control.md)).
 - **Accurate.** Links are resolved as a browser resolves them: HTML5 parsing (selectolax/lexbor), WHATWG URLs (ada-url), `<base href>`, the final URL after redirects, and declarative shadow DOM. Each page is fetched exactly once (redirect-aware dedupe against an exact set), transient failures are retried, and every skipped URL is counted.
 - **Polite.** robots.txt per RFC 9309, `Crawl-delay`, and an honest User-Agent.
 
-Measured on an Apple M5, the full parse pipeline costs 0.4–2.8 ms per real page and eight parser processes handle about 2,900 pages/s, so the target server, not the crawler, sets the pace.
+Measured on an Apple M5 with the prototypes in `bench/`, the full parse pipeline costs 0.4–2.8 ms per real page and eight parser processes handle about 2,900 pages/s, so the target server, not the crawler, sets the pace.
 
 Requires Python 3.14 or later. No JavaScript runs, so links created only by client-side rendering aren't seen; see [limitations](DESIGN.md#13-limitations-risks-and-what-to-revisit).
 
@@ -47,6 +58,7 @@ The brief asks which tools were used, including AI, and how the work was checked
 - **Editor.** Cursor for diff review and small manual changes without AI.
 - **AI tools.**
   - **Claude Code**, Anthropic's coding agent, in the Claude desktop app with Claude Opus 5.5. The first draft of the design came from a session that started from the brief through the `system-design` skill of Anthropic's engineering plugin. It installed candidate libraries in a scratch virtual environment, then wrote and ran the benchmarks for HTML parsers, URL resolution, HTTP clients, the parse pipeline, robots.txt matching and memory per URL on the development machine. It picked each technology from those results and wrote DESIGN.md with the scripts moved into `bench/`. Separate short sessions wrote the README and set up the public repository and licence. In a review session it reviewed the design against this brief, wrote and ran the checks and simulations in Appendix A.9–A.13, and applied the resulting changes to DESIGN.md, including [ADR-001](docs/adr/001-concurrency-control.md).
+  - **Implementation.** A planning session checked each library's behaviour against the pinned versions and wrote [docs/implementation-plan.md](docs/implementation-plan.md). Separate Claude Code sessions then built the steps from it, one pull request each ([#2](https://github.com/1tygs/web-crawler/pull/2), [#4](https://github.com/1tygs/web-crawler/pull/4), [#5](https://github.com/1tygs/web-crawler/pull/5)), each with its tests, and each merged only once CI passed: ruff, mypy --strict and the tests on Linux and macOS.
 - **Checking AI output.** Claims were tested rather than taken on trust, and the scripts that test them are kept in `bench/`. The review's simulations rejected the first draft's limiter law and its `--max-depth` rules, and caught a bug in the review's own first proposal for the limiter; re-running a real-site measurement changed one of its numbers (A.12).
 
 ## Development
