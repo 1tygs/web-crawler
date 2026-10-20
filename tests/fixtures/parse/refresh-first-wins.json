@@ -1,0 +1,5 @@
+{
+  "about": "Only the first meta refresh that works takes effect.",
+  "printed": ["https://example.com/first"],
+  "crawled": ["https://example.com/first"]
+}

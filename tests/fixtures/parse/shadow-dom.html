@@ -1,0 +1,26 @@
+<!doctype html>
+<html><head>
+<template shadowrootmode="open"><a href="/head-template">in head: not a valid host</a></template>
+</head><body>
+<a href="/first">first</a>
+<div>
+  <template shadowrootmode="open">
+    <a href="/open">open</a>
+    <span><template shadowrootmode="closed"><a href="/nested">nested root</a></template></span>
+    <template><a href="/inert-in-root">an ordinary template inside a root</a></template>
+  </template>
+  <a href="/light">the host's light DOM</a>
+</div>
+<my-widget><template shadowrootmode="CLOSED"><a href="/custom">custom element, any case</a></template></my-widget>
+<p><template shadowrootmode="bogus"><a href="/bogus">bogus mode</a></template></p>
+<p><template shadowrootmode=" open"><a href="/spaced">a mode with a space</a></template></p>
+<ul><template shadowrootmode="open"><a href="/ul">ul can't host</a></template></ul>
+<font-face><template shadowrootmode="open"><a href="/reserved">a reserved name</a></template></font-face>
+<section>
+  <template shadowrootmode="open"><a href="/replaced">replaced by the next one</a></template>
+  <template shadowrootmode="closed"><a href="/other-mode">the other mode: inert</a></template>
+  <template shadowrootmode="open"><a href="/replacement">the root's content</a></template>
+</section>
+<template><a href="/inert">an ordinary template</a></template>
+<a href="/last">last</a>
+</body></html>

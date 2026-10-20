@@ -63,7 +63,7 @@ async def crawl(
         admission=admission,
         sink=sink,
         stats=stats,
-        ctx=WorkerContext(scope_prefixes=scope.prefixes),
+        ctx=WorkerContext(scope_prefixes=scope.prefixes, all_urls=cfg.all_urls),
         concurrency=min(INITIAL_CONCURRENCY, cfg.max_concurrency),
     )
     try:

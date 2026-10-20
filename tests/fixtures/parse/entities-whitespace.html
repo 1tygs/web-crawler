@@ -1,0 +1,13 @@
+<!doctype html>
+<a href="/q?a=1&amp;b=2&#x26;c=3&#38;d">named and numeric entities</a>
+<a href="&#x2F;slash">an escaped slash</a>
+<a href="/caf&eacute;?q=&eacute;">a named entity outside ASCII</a>
+<a href="  /spaces  ">surrounding spaces</a>
+<a href="
+   /newlines
+">surrounding newlines</a>
+<a href="/in&#9;side/t&#10;ab">a tab and a newline inside, which the URL parser removes</a>
+<a href="/a b">an inner space, which is escaped</a>
+<a href="\back\slash">backslashes, which are slashes</a>
+<a href="/%7Euser/">an escape, kept as written</a>
+<a href="HTTP://EXAMPLE.COM:80/UPPER">case and a default port</a>

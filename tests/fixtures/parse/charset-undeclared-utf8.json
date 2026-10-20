@@ -1,0 +1,9 @@
+{
+  "about": "Undeclared but valid UTF-8: UTF-8.",
+  "printed": [
+    "https://example.com/caf%C3%A9"
+  ],
+  "crawled": [
+    "https://example.com/caf%C3%A9"
+  ]
+}

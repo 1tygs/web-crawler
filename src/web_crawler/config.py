@@ -26,6 +26,7 @@ class Config:
     max_concurrency: int = 64  # upper bound on requests in flight
     timeout: float = 60.0  # seconds, for one whole request
     max_page_bytes: int = 32 * MIB  # body bytes read from one page
+    all_urls: bool = False  # print every URL-bearing attribute; still crawl only links
 
     def __post_init__(self) -> None:
         try:

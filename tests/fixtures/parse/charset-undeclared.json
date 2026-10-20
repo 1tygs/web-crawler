@@ -1,0 +1,11 @@
+{
+  "about": "Undeclared and not UTF-8: windows-1252, where 0xE9 is \u00e9 and 0x80 is the euro sign.",
+  "printed": [
+    "https://example.com/caf%C3%A9",
+    "https://example.com/%E2%82%AC"
+  ],
+  "crawled": [
+    "https://example.com/caf%C3%A9",
+    "https://example.com/%E2%82%AC"
+  ]
+}

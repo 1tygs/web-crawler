@@ -41,6 +41,7 @@ class WorkerContext:
     """What every parse needs and never changes during a crawl, sent to each worker once."""
 
     scope_prefixes: tuple[str, ...]
+    all_urls: bool = False  # print every URL-bearing attribute, not only navigational links
 
 
 class ExitCode(IntEnum):

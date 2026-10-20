@@ -1,0 +1,9 @@
+{
+  "about": "An iframe's src is a link unless it's empty; one of spaces isn't empty, and resolves to the page itself. srcdoc is a document of its own.",
+  "printed": [
+    "https://example.com/embedded",
+    "https://example.com/dir/page.html",
+    "https://video.example.net/player"
+  ],
+  "crawled": ["https://example.com/embedded", "https://example.com/dir/page.html"]
+}

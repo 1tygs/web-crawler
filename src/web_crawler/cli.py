@@ -34,6 +34,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "url", metavar="URL", help="where to start; https:// is assumed if there's no scheme"
     )
+    parser.add_argument(
+        "--all-urls",
+        action="store_true",
+        help="print every URL on each page, from images, scripts, forms and the like too, in "
+        "every scheme; only links are crawled",
+    )
     parser.add_argument("--version", action="version", version=f"web-crawler {__version__}")
     return parser
 
@@ -43,7 +49,7 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        return Config(start_url=args.url)
+        return Config(start_url=args.url, all_urls=args.all_urls)
     except ConfigError as error:
         parser.error(str(error))
 

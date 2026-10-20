@@ -1,0 +1,12 @@
+{
+  "about": "The Content-Type charset decides: windows-1251, where 0xE0 0xE1 are Cyrillic a and b.",
+  "http_charset": "windows-1251",
+  "printed": [
+    "https://example.com/%D0%B0%D0%B1",
+    "https://example.com/caf%D0%B9"
+  ],
+  "crawled": [
+    "https://example.com/%D0%B0%D0%B1",
+    "https://example.com/caf%D0%B9"
+  ]
+}

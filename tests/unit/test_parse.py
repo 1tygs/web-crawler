@@ -5,7 +5,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 from selectolax.lexbor import LexborHTMLParser
 
-from web_crawler.parse import parse_page
+from web_crawler.parse import parse_page, parse_refresh, parse_srcset
 from web_crawler.types import ParseJob, WorkerContext
 
 PAGE = "https://example.com/dir/page.html"
@@ -201,11 +201,105 @@ def test_a_truncated_page_may_end_inside_a_utf8_character() -> None:
         assert result.links == [(url, url)]
 
 
-def test_skips_valueless_hrefs_and_svg_xlink() -> None:
+def test_reads_valueless_hrefs_and_svg_xlink() -> None:
     # lexbor reports both as None: `<a href>` has no value, and an SVG <a> matched by [href]
-    # has only xlink:href. Neither is read as "", which would be a link to the page itself.
+    # has only xlink:href. A valueless href is "", a link to the page itself.
     markup = '<a href>x</a><svg><a xlink:href="/svg">s</a></svg><a href="/ok">ok</a>'
-    assert links(markup) == ["https://example.com/ok"]
+    assert links(markup) == [PAGE, "https://example.com/svg", "https://example.com/ok"]
+
+
+@pytest.mark.parametrize(
+    ("content", "refresh"),
+    [
+        # A time, then optionally the URL, after ";" or "," or whitespace, and "url=".
+        ("0", (True, None)),
+        ("  30  ", (True, None)),
+        ("0;", (True, None)),
+        ("0; url=/next", (True, "/next")),
+        ("0;URL=/next", (True, "/next")),
+        ("0, url = /next", (True, "/next")),
+        ("0 url=/next", (True, "/next")),
+        ("0;/next", (True, "/next")),
+        ("1.5; url=/next", (True, "/next")),  # the fraction is ignored
+        (".5;url=/next", (True, "/next")),
+        ("5.;url=/next", (True, "/next")),
+        # Quotes around the URL are dropped, up to the matching one.
+        ("0; url='/next'", (True, "/next")),
+        ('0; url="/next"', (True, "/next")),
+        ("0; url='/next", (True, "/next")),
+        ("0;'/next' trailing", (True, "/next")),
+        ('0; url="/a\'b"', (True, "/a'b")),
+        # Without "url=", whatever follows is the URL, "ur" and all.
+        ("0; urn:x", (True, "urn:x")),
+        ("0; u", (True, "u")),
+        ("0; url /next", (True, "url /next")),
+        ("0; url=", (True, "")),
+        ("0; UrL\t=\t/next", (True, "/next")),
+        # Not a refresh at all: no time, or something else right after it.
+        ("", (False, None)),
+        ("; url=/next", (False, None)),
+        ("url=/next", (False, None)),
+        ("-1; url=/next", (False, None)),
+        ("5x; url=/next", (False, None)),
+        ("\u00a05; url=/next", (False, None)),  # NO-BREAK SPACE isn't ASCII whitespace
+    ],
+)
+def test_parse_refresh(content: str, refresh: tuple[bool, str | None]) -> None:
+    assert parse_refresh(content) == refresh
+
+
+@pytest.mark.parametrize(
+    ("srcset", "urls"),
+    [
+        ("a.png", ["a.png"]),
+        ("a.png 1x, b.png 2x", ["a.png", "b.png"]),
+        ("a.png 100w, b.png 200w 50h", ["a.png", "b.png"]),
+        (" a.png  1.5x ,b.png 2e0x", ["a.png", "b.png"]),
+        ("a.png,b.png 2x", ["a.png,b.png"]),  # a comma inside a URL stays in it
+        ("a.png, b.png,", ["a.png", "b.png"]),
+        ("a.png,, ,b.png", ["a.png", "b.png"]),
+        ("data:image/gif;base64,R0lG, b.png 2x", ["data:image/gif;base64,R0lG", "b.png"]),
+        ("a.png (x, y), b.png", ["b.png"]),  # a parenthesized descriptor is unknown
+        # Invalid descriptors drop their candidate.
+        ("a.png 2y, b.png", ["b.png"]),
+        ("a.png 1X", []),
+        ("a.png 0w", []),
+        ("a.png 100w 0h", []),
+        ("a.png 50h", []),  # a height needs a width
+        ("a.png 100w 2x", []),
+        ("a.png 2x 2x", []),
+        ("a.png 2x 50h", []),
+        ("a.png -1x", []),
+        ("a.png 1.x", []),
+        ("a.png -0x", ["a.png"]),
+        ("", []),
+        (" , ", []),
+    ],
+)
+def test_parse_srcset(srcset: str, urls: list[str]) -> None:
+    assert parse_srcset(srcset) == urls
+
+
+@pytest.mark.parametrize(
+    ("host", "can_host"),
+    [
+        *[(tag, True) for tag in ("article", "body", "div", "h1", "main", "p", "section", "span")],
+        *[(tag, False) for tag in ("a", "ul", "li", "table", "head", "button", "my_element")],
+        # A custom element name: a lowercase letter, then a "-" somewhere, from a set of
+        # characters that includes most non-ASCII ones, and not one of eight reserved names.
+        ("my-element", True),
+        ("x-\u00e9l\u00e8ve", True),
+        ("a-\U0001f600", True),
+        ("my:el-x", False),
+        ("x-\u00d7", False),
+        ("x-\u2000", False),
+        ("font-face", False),
+        ("annotation-xml", False),
+    ],
+)
+def test_declarative_shadow_roots_attach_only_to_valid_hosts(host: str, can_host: bool) -> None:
+    markup = f'<{host}><template shadowrootmode="open"><a href="/shadow">s</a></template></{host}>'
+    assert ("https://example.com/shadow" in links(markup)) is can_host
 
 
 def test_parses_noscript_as_markup_and_skips_inert_templates() -> None:

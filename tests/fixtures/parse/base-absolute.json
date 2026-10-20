@@ -1,0 +1,10 @@
+{
+  "about": "A base on another host moves relative links there: they're printed, and not crawled.",
+  "printed": [
+    "https://cdn.example.org/assets/logo.html",
+    "https://cdn.example.org/root",
+    "https://example.com/home",
+    "http://example.com/plain"
+  ],
+  "crawled": ["https://example.com/home", "http://example.com/plain"]
+}

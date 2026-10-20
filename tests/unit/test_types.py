@@ -19,6 +19,7 @@ def test_items_are_immutable() -> None:
         ParseJob("https://example.com/", b"<a href=/\xe9>", http_charset="latin1", truncated=True),
         ParseResult(record=b"r\n", links=[("k", "u")], links_found=1),
         WorkerContext(scope_prefixes=("https://example.com/", "http://example.com/")),
+        WorkerContext(scope_prefixes=("http://127.0.0.1:8000/",), all_urls=True),
     ],
 )
 def test_parse_contracts_survive_pickling(value: object) -> None:

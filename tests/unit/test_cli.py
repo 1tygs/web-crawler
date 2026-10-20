@@ -37,11 +37,15 @@ def test_builds_a_config_from_the_url() -> None:
     assert parse_args(["https://example.com/"]) == Config(start_url="https://example.com/")
 
 
+def test_all_urls() -> None:
+    assert parse_args(["--all-urls", "https://example.com/"]).all_urls
+
+
 def test_help_exits_zero(capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit) as exit_info:
         parse_args(["--help"])
     assert exit_info.value.code == 0
-    assert capsys.readouterr().out.startswith("usage: crawl [-h] [--version] URL")
+    assert capsys.readouterr().out.startswith("usage: crawl [-h] [--all-urls] [--version] URL")
 
 
 @pytest.mark.parametrize(

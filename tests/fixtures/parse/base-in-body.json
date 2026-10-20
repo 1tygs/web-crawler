@@ -1,0 +1,5 @@
+{
+  "about": "A base anywhere in the document is the base for every link, including those before it.",
+  "printed": ["https://example.com/late/before", "https://example.com/late/after"],
+  "crawled": ["https://example.com/late/before", "https://example.com/late/after"]
+}

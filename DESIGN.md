@@ -62,7 +62,7 @@ The target server will be the limit, not the crawler.
 | What is "the same domain"? | Exact host match after normalization (lowercase, IDNA/punycode). `example.com`, `www.example.com` and `blog.example.com` are three different hosts. The port must match the start URL's, where an omitted port means the scheme's default. On the default ports, `http` and `https` on that host are both in scope; a start URL with any other port keeps to its own scheme | Literal reading of "no subdomains". The scheme isn't part of a domain. Another port is another service |
 | The start URL redirects to another host (e.g. apex → `www`) | If the redirect only adds or removes `www.`, crawl the final host instead and say so on stderr. Any other cross-host redirect stops with exit code 3 and prints the URL to use. `--strict-host` treats the `www.` case like the others | The scope is still exactly one host, fixed before any page is fetched, so F3 holds. 5 of 6 bare domains tried redirect to `www` (A.13), so refusing would fail on the most obvious first command |
 | What counts as a page? | A 2xx response with HTML content: `text/html` or `application/xhtml+xml`, or sniffed as HTML when the type is missing. Redirects are transparent hops. Errors and non-HTML responses are counted but not printed (JSONL can include them) | A page is a document that can contain links |
-| Which URLs are "found on the page"? | Navigational links: `a[href]`, `area[href]`, `iframe[src]`, `frame[src]`, `link[href]` with rel `canonical`/`alternate`/`next`/`prev`, and `<meta http-equiv="refresh">` targets, including inside declarative shadow DOM. `--all-urls` reports every URL-bearing attribute (img/srcset, script, stylesheet, media, …) and every scheme | This is what people mean by "the links on a page". The flag gives the literal reading |
+| Which URLs are "found on the page"? | Navigational links: `a[href]`, `area[href]`, `iframe[src]`, `frame[src]`, `link[href]` with rel `canonical`/`alternate`/`next`/`prev`, and `<meta http-equiv="refresh">` targets, including inside declarative shadow DOM. `--all-urls` reports every URL-bearing attribute (img/srcset, script, stylesheet, media, …) and every scheme, but the crawl still follows navigational links only | This is what people mean by "the links on a page". The flag gives the literal reading; fetching every image and script, or a form's action, would only cost requests and find no pages |
 | In what form are found URLs printed? | Absolute and serialized as a browser would request them (WHATWG), fragment removed, de-duplicated within the page in document order, `http(s)` only | Unambiguous and faithful. Fragments never reach the server |
 | Output order | Streamed in completion order | Sorting needs the whole crawl in memory and kills live output. `--format jsonl` piped to `sort` gives determinism |
 
@@ -291,12 +291,13 @@ The pipeline:
 
    Every label in the Encoding Standard is known, e.g. `latin1` and `ascii` map to windows-1252. Single-byte encodings decode exactly as the standard's indexes say, which Python's codecs alone don't (A.14). Multi-byte encodings go through Python's codecs, which differ from the standard on a few hundred rare characters. UTF-8 pages, the vast majority, reach the parser as bytes with no decode copy, and a byte-order mark is dropped first: lexbor would read it as text, end `<head>` there and ignore a `<frameset>` after it. lexbor's own detection isn't used: it can't see the HTTP header and has no fallback (verified).
 3. **Parse** with selectolax's lexbor engine. Tree construction follows HTML5. Scripting is off, so `<noscript>` content is parsed as markup, which is what a client without JavaScript sees.
-4. **Base URL.** Start from the response's final URL after redirects. The first `<base href>` overrides it, resolved against it, per the HTML standard. Resolving against the *requested* URL instead is a classic crawler bug.
+4. **Base URL.** Start from the response's final URL after redirects. The first `<base href>` overrides it, resolved against it, per the HTML standard, unless it doesn't parse or is a `data:` or `javascript:` URL. Resolving against the *requested* URL instead is a classic crawler bug.
 5. **Extract** with one CSS selector-list pass, plus recursion into **declarative shadow DOM** (`<template shadowrootmode>`), which browsers render. The content of an ordinary `<template>` is inert and is skipped.
    - On MDN, 11 rendered links (the language switcher) exist only inside shadow roots. A plain lexbor query misses them.
    - lxml or a regex scan would find those, but would also pick up inert template placeholders on other sites.
+   - A template makes a shadow root as a browser's parser does: only with mode `open` or `closed`, only on a valid shadow host (a custom element, `div`, `span`, `section` and a dozen more), and once per host, so a later template of the same mode replaces the root's content and one of the other mode stays inert. A root's links are read where its template is, in document order.
 
-   Meta refresh `content` is parsed following the HTML standard's refresh steps.
+   Each element is read as a browser reads it. A valueless `href` is `""`, a link to the page itself, and an SVG `<a>` falls back to `xlink:href`. An empty frame or iframe `src` loads `about:blank`, so it isn't a link. A `<link>` is a link if its `rel` has `canonical`, `alternate`, `next` or `prev`, but not `alternate stylesheet`. Meta refresh `content` is parsed following the HTML standard's refresh steps, and only the first refresh that works counts, as in a browser; one without a URL just reloads the page. Under `--all-urls`, `srcset` goes through the standard's srcset parser, which drops candidates with invalid descriptors.
 6. **Resolve** each value with ada-url, which implements the WHATWG URL Standard and is the URL parser behind Node.js. It:
    - strips surrounding whitespace and inner tabs and newlines;
    - treats `\` as `/`;
@@ -390,7 +391,7 @@ crawl URL [options]
 | `--max-pages N`, `--max-depth N` | unlimited | Crawl limits, with exact semantics ([§5.1](#51-frontier-and-admission)) |
 | `--format text\|jsonl` | text | Output format |
 | `-o, --output FILE` | stdout | Output destination |
-| `--all-urls` | off | Report every URL-bearing attribute and every scheme |
+| `--all-urls` | off | Report every URL-bearing attribute and every scheme; only links are crawled |
 | `--include-errors` | off | JSONL records for URLs that failed |
 | `--ignore-robots` | off | For crawling your own site; also ignores `Crawl-delay` |
 | `--strict-host` | off | Refuse a start URL that redirects to another host, even when only `www.` differs |

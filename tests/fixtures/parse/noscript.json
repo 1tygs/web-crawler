@@ -1,0 +1,13 @@
+{
+  "about": "Scripting is off, as for a client without JavaScript: <noscript> is markup, in <head> or <body>. <noframes> and <script> are raw text.",
+  "printed": [
+    "https://example.com/canonical-in-noscript",
+    "https://example.com/a-in-head-noscript",
+    "https://example.com/no-js"
+  ],
+  "crawled": [
+    "https://example.com/canonical-in-noscript",
+    "https://example.com/a-in-head-noscript",
+    "https://example.com/no-js"
+  ]
+}

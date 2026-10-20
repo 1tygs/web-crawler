@@ -1,0 +1,5 @@
+{
+  "about": "A refresh that doesn't parse, names an invalid URL, or is empty takes no effect, so a later one can. http-equiv matches \"refresh\" in any case, exactly.",
+  "printed": ["https://example.com/works"],
+  "crawled": ["https://example.com/works"]
+}

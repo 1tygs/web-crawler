@@ -1,0 +1,43 @@
+{
+  "about": "--all-urls prints every URL-bearing attribute, in every scheme, but crawls only navigational links. An empty src or data is no URL; an empty action or formaction submits to the page's own URL, and an empty cite is the base.",
+  "all_urls": true,
+  "printed": [
+    "https://example.com/style.css",
+    "https://example.com/canonical",
+    "https://example.com/hero-1x.png",
+    "https://example.com/hero-2x.png",
+    "https://example.com/app.js",
+    "https://example.com/paper.png",
+    "https://example.com/page",
+    "https://example.com/ping-1",
+    "https://example.com/ping-2",
+    "https://example.com/ping-3",
+    "mailto:someone@example.com",
+    "javascript:void(0)",
+    "tel:+15551234567",
+    "https://example.com/photo.jpg",
+    "https://example.com/photo-2x.jpg",
+    "https://example.com/photo.webp",
+    "https://example.com/movie.mp4",
+    "https://example.com/poster.jpg",
+    "https://example.com/captions.vtt",
+    "https://example.com/movie.webm",
+    "https://example.com/sound.mp3",
+    "https://example.com/plugin.swf",
+    "https://example.com/doc.pdf",
+    "https://example.com/frame",
+    "https://example.com/search",
+    "https://example.com/go.png",
+    "https://example.com/alt",
+    "https://example.com/dir/page.html",
+    "https://example.com/source",
+    "https://example.com/why",
+    "https://example.com/why-not",
+    "data:image/gif;base64,R0lGODlhAQABAAAAACw="
+  ],
+  "crawled": [
+    "https://example.com/canonical",
+    "https://example.com/page",
+    "https://example.com/frame"
+  ]
+}

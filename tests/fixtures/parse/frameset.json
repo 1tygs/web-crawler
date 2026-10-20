@@ -1,0 +1,5 @@
+{
+  "about": "A frame's src is a link, unless it's empty: an empty src loads about:blank.",
+  "printed": ["https://example.com/nav", "https://example.com/dir/main.html"],
+  "crawled": ["https://example.com/nav", "https://example.com/dir/main.html"]
+}

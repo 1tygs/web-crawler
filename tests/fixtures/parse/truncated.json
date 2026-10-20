@@ -1,0 +1,6 @@
+{
+  "about": "A page cut off inside a tag, as at the size cap: the tag that never ends doesn't count, as in a browser.",
+  "truncated": true,
+  "printed": ["https://example.com/complete"],
+  "crawled": ["https://example.com/complete"]
+}

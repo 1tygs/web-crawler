@@ -1,0 +1,5 @@
+{
+  "about": "An SVG <a> links with href, or else xlink:href.",
+  "printed": ["https://example.com/xlink", "https://example.com/svg2", "https://example.com/href-wins"],
+  "crawled": ["https://example.com/xlink", "https://example.com/svg2", "https://example.com/href-wins"]
+}

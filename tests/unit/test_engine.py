@@ -117,6 +117,25 @@ async def test_an_internal_error_is_counted_and_the_crawl_continues(
     assert caplog.records[0].levelno == logging.ERROR
 
 
+async def test_all_urls_prints_every_url_but_crawls_only_links() -> None:
+    replies: dict[str, Reply | ErrorKind] = {
+        START: Reply(
+            headers=HTML,
+            body=b'<img src="/photo.jpg"><a href="/page">p</a><form action="/search"></form>',
+        ),
+        "https://example.com/page": html(),
+    }
+    transport, sink = FakeTransport(replies), MemorySink()
+    report = await crawl(Config(start_url=START, all_urls=True), sink, transport=transport)
+    assert sorted(sink.records) == [
+        b"https://example.com/\n  https://example.com/photo.jpg\n  https://example.com/page\n"
+        b"  https://example.com/search\n\n",
+        b"https://example.com/page\n\n",
+    ]
+    assert transport.requested == [START, "https://example.com/page"]
+    assert report.stats.links_found == 3
+
+
 async def test_failures_are_counted_not_printed() -> None:
     replies: dict[str, Reply | ErrorKind] = {
         START: html("/missing", "/image", "/down", "/off"),

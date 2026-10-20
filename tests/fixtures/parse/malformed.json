@@ -1,0 +1,29 @@
+{
+  "about": "Malformed markup builds the tree a browser builds: duplicate attributes, nested and misnested links, links fostered out of tables and after </html>, and comments.",
+  "printed": [
+    "https://example.com/first",
+    "https://example.com/unquoted",
+    "https://example.com/single",
+    "https://example.com/outer",
+    "https://example.com/inner",
+    "https://example.com/in-table",
+    "https://example.com/cell",
+    "https://example.com/misnested",
+    "https://example.com/after-html",
+    "https://example.com/after-end",
+    "https://example.com/dir/%3E"
+  ],
+  "crawled": [
+    "https://example.com/first",
+    "https://example.com/unquoted",
+    "https://example.com/single",
+    "https://example.com/outer",
+    "https://example.com/inner",
+    "https://example.com/in-table",
+    "https://example.com/cell",
+    "https://example.com/misnested",
+    "https://example.com/after-html",
+    "https://example.com/after-end",
+    "https://example.com/dir/%3E"
+  ]
+}

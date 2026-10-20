@@ -13,6 +13,7 @@ def test_defaults_follow_the_design() -> None:
     assert cfg.max_concurrency == 64
     assert cfg.timeout == 60.0
     assert cfg.max_page_bytes == 32 * MIB
+    assert not cfg.all_urls
 
 
 def test_is_immutable() -> None:
