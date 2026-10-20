@@ -11,7 +11,7 @@ import enum
 import heapq
 import itertools
 from collections import Counter, deque
-from collections.abc import Collection, Iterable
+from collections.abc import Callable, Collection, Iterable
 
 from web_crawler.robots import RobotsPolicy
 from web_crawler.types import CrawlItem
@@ -30,6 +30,10 @@ from web_crawler.urls import (
 ROBOTS = "robots.txt"  # the rule that rejects what robots.txt disallows
 DEPTH_LIMIT = "depth limit"  # URLs found only beyond --max-depth
 EXAMPLES = 3  # rejected URLs kept per rule, to show in the summary
+
+# Told of each URL a rule keeps from being crawled: the rule, the URL, and whether it's one of
+# the rule's examples, the first few, which the summary shows.
+type OnRejected = Callable[[str, str, bool], object]
 
 
 class Frontier:
@@ -186,6 +190,8 @@ class Admission:
     The depth limit is the exception. A URL found beyond it isn't claimed, since a shorter
     path found later can still admit it, and the other rules don't see it until then: they
     would count it again each time it's found. beyond keeps it until then, for the summary.
+
+    on_rejected hears of each URL rejected, as it is, for the -v log.
     """
 
     def __init__(  # noqa: PLR0913  (the rules' settings, which have defaults)
@@ -198,6 +204,7 @@ class Admission:
         max_segment_repeats: int = MAX_SEGMENT_REPEATS,
         max_query_variants: int = MAX_QUERY_VARIANTS,
         skip_extensions: bool = True,
+        on_rejected: OnRejected | None = None,
     ) -> None:
         self.seen: set[str] = set()
         self.scope = scope  # links arrive checked; redirect targets are checked here
@@ -211,6 +218,7 @@ class Admission:
         self._max_segment_repeats = max_segment_repeats
         self._max_query_variants = max_query_variants
         self._skip_extensions = skip_extensions
+        self._on_rejected: OnRejected = on_rejected or _ignore
 
     def admit(self, links: Iterable[tuple[str, str]], depth: int) -> int:
         """Claim each (key, url) not seen before and, unless a rule rejects it, queue it at
@@ -222,6 +230,7 @@ class Admission:
             for key, url in links:
                 if key not in seen and key not in beyond:
                     beyond[key] = url
+                    self._on_rejected(DEPTH_LIMIT, url, len(beyond) <= EXAMPLES)
             return 0
         lowerable = frontier.lowerable  # None, unless under --max-depth
         push = frontier.push
@@ -285,8 +294,9 @@ class Admission:
     def _reject(self, rule: str, url: str) -> None:
         self.rejected[rule] += 1
         examples = self.examples.setdefault(rule, [])
-        if len(examples) < EXAMPLES:
+        if sampled := len(examples) < EXAMPLES:
             examples.append(url)
+        self._on_rejected(rule, url, sampled)
 
     @property
     def unique_urls(self) -> int:
@@ -301,3 +311,7 @@ class Admission:
             rejected[DEPTH_LIMIT] = len(self.beyond)
             examples[DEPTH_LIMIT] = list(itertools.islice(self.beyond.values(), EXAMPLES))
         return rejected, examples
+
+
+def _ignore(rule: str, url: str, sampled: bool) -> None:
+    pass

@@ -2,10 +2,13 @@
 
 import argparse
 import asyncio
+import contextlib
 import logging
+import os
 import re
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from typing import BinaryIO, TextIO
 
 from web_crawler import __version__
 from web_crawler.config import MIB, USER_AGENT, Config, ConfigError
@@ -155,6 +158,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="the User-Agent header; its product token, the leading letters, hyphens and "
         "underscores, also selects the robots.txt group to obey (default: %(default)s)",
     )
+    noise = parser.add_mutually_exclusive_group()
+    noise.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="log the URLs that fail, the first few that each rule keeps from being crawled, "
+        "and the concurrency limit's decisions; -vv logs every request and every URL not "
+        "crawled too",
+    )
+    noise.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="print errors only on stderr: no progress line and no summary",
+    )
     parser.add_argument("--version", action="version", version=f"web-crawler {__version__}")
     return parser
 
@@ -223,22 +242,109 @@ def main(argv: Sequence[str] | None = None) -> int:
         output = open(args.output, "wb") if args.output is not None else None  # noqa: SIM115
     except OSError as error:
         parser.error(f"can't write to {args.output}: {error.strerror}")
-    logging.basicConfig(format="crawl: %(message)s", level=logging.WARNING, stream=sys.stderr)
     try:
-        sink = ThreadedSink(output or sys.stdout.buffer)
-        report = asyncio.run(crawl(cfg, sink), loop_factory=_loop_factory)
-    except KeyboardInterrupt:
-        return ExitCode.INTERRUPTED
-    except Exception:
-        log.exception("internal error")
-        return ExitCode.INTERNAL_ERROR
+        return _run(cfg, output, verbose=args.verbose, quiet=args.quiet)
     finally:
         if output is not None:
             output.close()
-    if report.exit_code is not ExitCode.CANNOT_START:
+
+
+# The tip for a crawl whose records went to the terminal (DESIGN.md §5.8).
+TIP = "tip: -o FILE, or > FILE, is faster than printing to the terminal, and shows progress"
+
+
+def _run(cfg: Config, output: BinaryIO | None, *, verbose: int, quiet: bool) -> int:
+    """Crawl, with records going to output, or to stdout, and logs, the progress line and
+    the summary to stderr. The progress line shows only when stderr is a terminal and the
+    records go elsewhere: drawn between records on the same terminal, it would garble them.
+    Records that went to the terminal get a tip instead, after the summary."""
+    stderr_shown = sys.stderr.isatty() and not quiet
+    records_shown = output is None and sys.stdout.isatty()
+    progress = _ProgressLine(sys.stderr) if stderr_shown and not records_shown else None
+    level = logging.ERROR if quiet else max(logging.DEBUG, logging.WARNING - 10 * verbose)
+    with _logging(progress or logging.StreamHandler(sys.stderr), level):
         try:
-            print(report.summary, file=sys.stderr, flush=True)
+            sink = ThreadedSink(output or sys.stdout.buffer)
+            report = asyncio.run(crawl(cfg, sink, progress=progress), loop_factory=_loop_factory)
+        except KeyboardInterrupt:
+            return ExitCode.INTERRUPTED
+        except Exception:
+            log.exception("internal error")
+            return ExitCode.INTERNAL_ERROR
+    if report.exit_code is not ExitCode.CANNOT_START and not quiet:
+        lines = [report.summary] + ([TIP] if stderr_shown and records_shown else [])
+        try:
+            print("\n".join(lines), file=sys.stderr, flush=True)
         except BrokenPipeError:
             # stderr went where stdout did, e.g. `2>&1 | head`, whose reader has gone.
             to_devnull(sys.stderr)
     return report.exit_code
+
+
+@contextlib.contextmanager
+def _logging(handler: logging.Handler, level: int) -> Iterator[None]:
+    """Log through handler: the crawler's records from level up, and other libraries' from
+    WARNING up, or ERROR under -q. As it was before, after."""
+    handler.setFormatter(logging.Formatter("crawl: %(message)s"))
+    root, crawler = logging.getLogger(), logging.getLogger("web_crawler")
+    before = root.level, crawler.level
+    root.addHandler(handler)
+    root.setLevel(max(level, logging.WARNING))
+    crawler.setLevel(level)
+    try:
+        yield
+    finally:
+        root.removeHandler(handler)
+        root.setLevel(before[0])
+        crawler.setLevel(before[1])
+
+
+class _ProgressLine(logging.StreamHandler[TextIO]):
+    """The progress line, on a terminal (DESIGN.md §10), with the log above it. A record
+    logged takes the line away, is written, and the line is drawn again below it, so that
+    neither tears the other. The line is cut to the terminal's width, so that a carriage
+    return goes back to its start."""
+
+    def __init__(self, stream: TextIO) -> None:
+        super().__init__(stream)
+        self._line = ""  # on the terminal now
+        self._cleared = False  # for good: the crawl is over
+
+    def show(self, line: str) -> None:
+        self.acquire()
+        try:
+            if not self._cleared:
+                self._line = line[: self._width() - 1]
+                self.stream.write(f"\r{self._line}\x1b[K")
+                self.stream.flush()
+        finally:
+            self.release()
+
+    def clear(self) -> None:
+        self.acquire()
+        try:
+            self._erase()
+            self._cleared = True
+        finally:
+            self.release()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        # handle() holds the lock.
+        line = self._line
+        self._erase()
+        super().emit(record)
+        if line:
+            self.show(line)
+
+    def _erase(self) -> None:
+        if self._line:
+            self.stream.write("\r\x1b[K")
+            self.stream.flush()
+            self._line = ""
+
+    def _width(self) -> int:
+        """The terminal's width, or 80 columns if it doesn't say."""
+        try:
+            return os.get_terminal_size(self.stream.fileno()).columns or 80
+        except OSError, ValueError:
+            return 80

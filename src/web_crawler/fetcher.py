@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import dataclasses
 import enum
+import logging
 import random
 import time
 from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
@@ -39,6 +40,8 @@ from web_crawler.stats import Stats
 from web_crawler.transport import Response, Transport, TransportError
 from web_crawler.types import CrawlItem, ErrorKind, ParseJob
 from web_crawler.urls import dedupe_key, strip_fragment
+
+log = logging.getLogger(__name__)
 
 MAX_REDIRECTS = 10
 # A response that isn't wanted is read to the end, so that its connection can be reused,
@@ -242,6 +245,7 @@ class Fetcher:
                     self._signals.answered(response.status, response.ttfb, issued)
                     outcome = await self._handle(response, tuple(chain), item)
             except TransportError as error:
+                log.debug("%s: %s", chain[-1], error)  # -vv: every request
                 self._signals.failed(error.kind, issued)
                 final = Final(str(error.kind), str(error), tuple(chain))
                 return _retry_or(final, classify(error.kind), item)
@@ -268,9 +272,12 @@ class Fetcher:
         concurrency limit doesn't count (DESIGN.md §5.3)."""
         try:
             async with self._transport.open(url) as response:
-                return response.status
-        except TransportError:
+                status = response.status
+        except TransportError as error:
+            log.debug("%s, a probe: %s", url, error)
             return None
+        log.debug("%s, a probe: HTTP %d", url, status)
+        return status
 
     async def _handle(
         self, response: Response, chain: tuple[str, ...], item: CrawlItem
@@ -279,6 +286,9 @@ class Fetcher:
         makes."""
         status = response.status
         self._stats.statuses[status] += 1
+        self._stats.ttfb.add(response.ttfb)
+        # -vv: every request.
+        log.debug("%s: HTTP %d, %.1f ms to first byte", response.url, status, response.ttfb * 1000)
         match triage(status, response.headers):
             case Triage.REDIRECT:
                 await _drain(response)
@@ -432,6 +442,7 @@ class RobotsFetcher:
         try:
             async with self._transport.open(url) as response:
                 status = response.status
+                log.debug("%s: HTTP %d", url, status)
                 if status in SUCCESSFUL:
                     # RFC 9309's limit is on the file decompressed. As many compressed bytes
                     # hold at least that much of any file that compresses at all.
@@ -451,6 +462,7 @@ class RobotsFetcher:
                     return _Answer(status, location=strip_fragment(location))
                 return _Answer(status)
         except TransportError as error:
+            log.debug("%s: %s", url, error)
             return error
 
 

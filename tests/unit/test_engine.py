@@ -2,6 +2,7 @@ import asyncio
 import itertools
 import json
 import logging
+import re
 import time
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
@@ -14,12 +15,22 @@ from tests.support.jitter import Fixed, Lowest
 from web_crawler import engine
 from web_crawler.config import Config
 from web_crawler.engine import CrawlReport
-from web_crawler.limiter import BLOCKED_AFTER, OPENS_AFTER, CircuitBreaker, ConcurrencyLaw
+from web_crawler.fetcher import AdmissionHops, Fetcher
+from web_crawler.frontier import Admission, Frontier
+from web_crawler.limiter import (
+    BLOCKED_AFTER,
+    OPENS_AFTER,
+    BlockGuard,
+    CircuitBreaker,
+    ConcurrencyLaw,
+)
 from web_crawler.limiter import START as INITIAL_LIMIT
 from web_crawler.output import MemorySink, Sink
 from web_crawler.pool import InlineParser, ParseCrashed
+from web_crawler.stats import Stats
 from web_crawler.transport import TransportError
-from web_crawler.types import ErrorKind, ExitCode, ParseJob, ParseResult, WorkerContext
+from web_crawler.types import CrawlItem, ErrorKind, ExitCode, ParseJob, ParseResult, WorkerContext
+from web_crawler.urls import Scope
 
 START = "https://example.com/"
 
@@ -161,13 +172,182 @@ def test_samples_are_responses_below_500_other_than_429(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     caplog.set_level(logging.INFO, "web_crawler.engine")
-    limiter = engine._Limiter(ConcurrencyLaw(64), CircuitBreaker(), clock=lambda: 1.0)
+    limiter = engine._Limiter(ConcurrencyLaw(64), CircuitBreaker(), lambda: 1.0, Stats(0.0))
     for status in (500, 502, 504):  # not samples, slow as they are
         limiter.answered(status, 9.0, issued_at=0.0)
     for status in (200, 301, 404, 410, 499, 200, 200, 200):
         limiter.answered(status, 0.1, issued_at=0.0)
     # The eight samples made the first round, which measured the server at low load.
     assert caplog.messages == ["concurrency limit: base: 8 -> 8, median 100.0 ms, base 100.0 ms"]
+
+
+def test_v_logs_the_decisions_that_change_something(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # -v shows each decision that changes the limit or the law's state; a round that grows
+    # nothing at the ceiling, and holds after the first in a run, are for -vv.
+    caplog.set_level(logging.DEBUG, "web_crawler.engine")
+    stats = Stats(0.0)
+    limiter = engine._Limiter(ConcurrencyLaw(8), CircuitBreaker(), lambda: 1.0, stats)
+
+    def round_of(ttfb: float) -> None:
+        for _ in range(limiter._law.limit):
+            limiter.answered(200, ttfb, issued_at=0.0)
+
+    for ttfb in [0.1, 0.1, 0.2, 0.1, *[0.2] * 10]:
+        round_of(ttfb)
+    logged = [(r.levelname, r.getMessage().split(", ")[0]) for r in caplog.records]
+    assert logged == [
+        ("INFO", "concurrency limit: base: 8 -> 8"),
+        ("DEBUG", "concurrency limit: grow: 8 -> 8"),  # slow start, at the ceiling
+        ("INFO", "concurrency limit: slow start exit: 8 -> 4"),
+        ("INFO", "concurrency limit: grow: 4 -> 5"),
+        ("INFO", "concurrency limit: hold: 5 -> 5"),
+        *[("DEBUG", "concurrency limit: hold: 5 -> 5")] * 8,
+        ("INFO", "concurrency limit: probe: 5 -> 2"),  # the tenth held round
+    ]
+    assert stats.limits == (2, 8, 2)
+
+
+async def test_v_logs_what_isnt_printed_and_the_first_urls_each_rule_skips(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG, "web_crawler.engine")
+    private = [f"/private/{n}" for n in range(4)]
+    replies = {
+        ROBOTS: robots("User-agent: *\nDisallow: /private\n"),
+        START: html("/page", "/old", "/missing", "/image", *private),
+    } | chain(
+        ("/page", html()),
+        ("/old", Reply(301, {"Location": "/page"}, delay=0.01)),
+        ("/missing", Reply(404, HTML)),
+        ("/image", Reply(headers={"Content-Type": "image/png"})),
+    )
+    await crawl(Config(start_url=START), MemorySink(), transport=FakeTransport(replies))
+    logged = {(r.levelname, r.getMessage()) for r in caplog.records}
+    o = "https://example.com"
+    assert {
+        ("INFO", f"{o}/missing isn't printed: HTTP 404"),
+        ("DEBUG", f"{o}/image isn't printed: it isn't HTML (image/png)"),
+        ("DEBUG", f"{o}/old isn't printed: it redirects to {o}/page, printed for another link"),
+        *(("INFO", f"not crawling {o}/private/{n}: robots.txt") for n in range(3)),
+        ("DEBUG", f"not crawling {o}/private/3: robots.txt"),
+    } <= logged
+
+
+class Lines:
+    """A progress line's destination that keeps every line shown."""
+
+    def __init__(self) -> None:
+        self.shown: list[str] = []
+        self.cleared = False
+
+    def show(self, line: str) -> None:
+        assert not self.cleared
+        self.shown.append(line)
+
+    def clear(self) -> None:
+        self.cleared = True
+
+
+async def test_the_progress_line_is_redrawn_four_times_a_second() -> None:
+    lines = Lines()
+    transport = FakeTransport(fan_out(pages=24, delay=0.5))
+    report = await crawl(Config(start_url=START), MemorySink(), transport=transport, progress=lines)
+    assert report.stats.pages == 25
+    assert lines.cleared
+    # 24 pages, 8 then 16 at a time, of 0.5 s each: about a second, with a line each 0.25 s.
+    assert 3 <= len(lines.shown) <= 7
+    # The first as the start page goes to be parsed, the next 0.25 s later.
+    assert lines.shown[0] == (
+        "pages 0 · 0/s · in-flight 0/8 · queued 0 · retrying 0 · errors 0 · 0 B/s"
+    )
+    assert re.fullmatch(
+        r"pages 1 · \d+/s · in-flight 8/8 · queued 16 · retrying 0 · errors 0 · [\d.]+ k?B/s",
+        lines.shown[1],
+    )
+    assert all(line.startswith("pages ") for line in lines.shown)
+
+
+async def test_the_progress_line_says_why_the_crawl_is_paused() -> None:
+    lines = Lines()
+    transport = Outage(fan_out(pages=40, delay=0.0), failing=1)
+    cfg = Config(start_url=START, first_probe=0.6)
+    await crawl(cfg, MemorySink(), transport=transport, rng=Lowest(), progress=lines)
+    assert any(line.endswith(" · paused: the host isn't answering") for line in lines.shown)
+
+
+def dispatcher(clock: Callable[[], float]) -> engine._Dispatcher:
+    """A dispatcher, before it runs, with a parse gateway of two workers."""
+    stats, frontier = Stats(0.0), Frontier()
+    admission = Admission(frontier, Scope.for_url(START))
+    made = engine._Dispatcher(
+        fetcher=Fetcher(FakeTransport({}), 1 << 20, stats),
+        hops=AdmissionHops(admission),
+        frontier=frontier,
+        admission=admission,
+        sink=MemorySink(),
+        stats=stats,
+        not_printed=engine._NotPrinted(stats, None),
+        all_urls=False,
+        format="text",
+        max_bytes=1 << 20,
+        make_parser=Stalled,
+        law=ConcurrencyLaw(64),
+        breaker=CircuitBreaker(),
+        guard=BlockGuard(),
+        max_concurrency=64,
+        max_rps=None,
+        clock=clock,
+        max_pages=None,
+        robots=None,
+        product="web-crawler",
+        robots_refresh=3600.0,
+        retries=3,
+        rng=Lowest(),
+    )
+    made._parser = Stalled(WorkerContext((START,), 1 << 20))
+    return made
+
+
+async def test_the_progress_line_counts_failures_and_workers_at_work() -> None:
+    # Its rates are over the snapshots of the last second; a redirect to a URL another item
+    # prints isn't an error; workers at work are parses in progress, as far as there are
+    # workers.
+    times = iter([10.0, 10.5])
+    made = dispatcher(lambda: next(times))
+    made.stats.pages, made.stats.body_bytes = 7, 1000
+    made.stats.failures.update({"HTTP 404": 2, "redirect to a URL already claimed": 5})
+    made._requests = 3
+    parses = [asyncio.create_task(asyncio.sleep(1)) for _ in range(3)]
+    made._parsing.update(parses)
+    assert made.snapshot().line() == (
+        "pages 7 · 0/s · in-flight 3/8 · queued 0 · retrying 0 · errors 2 · 0 B/s · workers 2/2"
+    )
+    made.stats.pages, made.stats.body_bytes = 17, 6000
+    made._gate.pause(12.5)
+    assert made.snapshot().line() == (
+        "pages 17 · 20/s · in-flight 3/8 · queued 0 · retrying 0 · errors 2 · 10.0 kB/s · "
+        "workers 2/2 · paused: Retry-After, 2 s to go"
+    )
+    for parse in parses:
+        parse.cancel()
+
+
+def test_the_progress_line_says_when_the_crawl_waits_out_a_block() -> None:
+    made = dispatcher(lambda: 0.0)
+    for n in range(BLOCKED_AFTER):
+        made.guard.forbidden(CrawlItem(f"{START}{n}", f"{START}{n}", 1), 0.0, 0.0)
+    assert made.snapshot().paused == "refused with 403s, as a block would be"
+
+
+async def test_the_report_has_the_crawlers_peak_rss_and_the_limits_range() -> None:
+    transport = FakeTransport(fan_out(pages=40, delay=0.01))
+    report = await crawl(Config(start_url=START), MemorySink(), transport=transport)
+    assert report.peak_rss is not None
+    assert report.peak_rss > 10 << 20
+    assert "\npeak RSS: " in report.summary
+    assert "\nconcurrency limit: 8 to " in report.summary
 
 
 class Times(FakeTransport):

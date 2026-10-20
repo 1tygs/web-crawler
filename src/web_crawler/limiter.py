@@ -193,6 +193,10 @@ class PauseGate:
         """Start no request before until, the clock's reading when a Retry-After ends."""
         self._paused_until = max(self._paused_until, until)
 
+    def paused_for(self, now: float) -> float:
+        """Seconds until a Retry-After's pause ends: 0 if there's none."""
+        return max(0.0, self._paused_until - now)
+
 
 def parse_retry_after(value: str | None, now_wall: float) -> float | None:
     """The seconds a Retry-After header asks a client to wait (RFC 9110 §10.2.3), at most

@@ -8,18 +8,20 @@ processes, or the event loop itself. The first SIGINT or SIGTERM stops it cleanl
 """
 
 import asyncio
+import collections
 import functools
 import logging
 import os
 import random
 import signal
+import sys
 import time
 from collections import Counter
 from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from types import FrameType
-from typing import Any, NoReturn
+from typing import Any, NoReturn, Protocol
 
 from web_crawler import retry
 from web_crawler.config import Config
@@ -44,6 +46,7 @@ from web_crawler.limiter import (
     CircuitBreaker,
     ConcurrencyLaw,
     Decision,
+    Kind,
     PauseGate,
     Probes,
     Verdict,
@@ -55,7 +58,7 @@ from web_crawler.pool import start as start_parser
 from web_crawler.records import error_record
 from web_crawler.retry import Class
 from web_crawler.robots import Availability, RobotsPolicy, RobotsTxt, product_token
-from web_crawler.stats import Stats
+from web_crawler.stats import Snapshot, Stats
 from web_crawler.transport import AiohttpTransport, Transport
 from web_crawler.types import CrawlItem, ErrorKind, ExitCode, Format, ParseJob, WorkerContext
 from web_crawler.urls import Scope, dedupe_key, normalize_start
@@ -82,6 +85,10 @@ _CONGESTED = frozenset(
     }
 )
 
+# Decisions that, leaving the limit as it was, change nothing else either, but for the first
+# hold of a run.
+_ROUTINE = frozenset({Kind.GROW, Kind.HOLD})
+
 # Failures to reach a start URL given without a scheme after which http:// might work.
 _HTTPS_FAILURES = frozenset({ErrorKind.CONNECT, ErrorKind.CONNECT_TIMEOUT, ErrorKind.TLS})
 _ROBOTS_HINT = "if the site is yours, --ignore-robots skips robots.txt"
@@ -89,7 +96,26 @@ _ROBOTS_HINT = "if the site is yours, --ignore-robots skips robots.txt"
 # The signals that stop a crawl cleanly, and the exit code each gives (DESIGN.md §5.9).
 _STOP_SIGNALS = {signal.SIGINT: ExitCode.INTERRUPTED, signal.SIGTERM: ExitCode.TERMINATED}
 
+PROGRESS_EVERY = 0.25  # seconds between redraws of the progress line (DESIGN.md §10)
+# The progress line's rates are over this many redraws: a second's worth.
+_RATE_SAMPLES = round(1 / PROGRESS_EVERY) + 1
+
+if sys.platform != "win32":  # pragma: no branch
+    import resource
+
 type _SignalHandler = Callable[[int, FrameType | None], Any] | int | None
+
+
+class Progress(Protocol):
+    """Where the progress line goes: stderr, if it's a terminal (DESIGN.md §10)."""
+
+    def show(self, line: str) -> None:
+        """Replace the line shown with line."""
+        ...
+
+    def clear(self) -> None:
+        """Take the line away, for good."""
+        ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,10 +126,13 @@ class CrawlReport:
     finished: float  # the clock's reading at the end
     rejected: Counter[str] = field(default_factory=Counter)  # URLs not crawled, by rule
     examples: dict[str, list[str]] = field(default_factory=dict)  # a few for each rule
+    peak_rss: int | None = None  # bytes: the crawler's own process's, where it's known
 
     @property
     def summary(self) -> str:
-        return self.stats.summary(self.unique_urls, self.finished, self.rejected, self.examples)
+        return self.stats.summary(
+            self.unique_urls, self.finished, self.rejected, self.examples, self.peak_rss
+        )
 
 
 async def crawl(  # noqa: PLR0913  (the collaborators that tests replace)
@@ -114,11 +143,13 @@ async def crawl(  # noqa: PLR0913  (the collaborators that tests replace)
     clock: Callable[[], float] = time.monotonic,
     rng: random.Random | None = None,
     parser: Callable[[WorkerContext], Parser] | None = None,
+    progress: Progress | None = None,
 ) -> CrawlReport:
     """Crawl the start URL's host, writing a record per page to sink. A transport passed
     in stays open; sink is always closed. rng draws the jitter of retries' backoff. parser
     makes the parse gateway, once the scope is known; by default it's a pool of
-    cfg.parse_workers processes."""
+    cfg.parse_workers processes. progress, if given, shows the progress line while pages
+    are crawled."""
     start_url, scheme_was_implicit = normalize_start(cfg.start_url)
     stats = Stats(started=clock())
     frontier = Frontier(cfg.max_depth)
@@ -129,6 +160,7 @@ async def crawl(  # noqa: PLR0913  (the collaborators that tests replace)
         max_segment_repeats=cfg.max_segment_repeats,
         max_query_variants=cfg.max_query_variants,
         skip_extensions=cfg.skip_extensions,
+        on_rejected=_rejected,
     )
     owned = transport is None
     if transport is None:
@@ -138,7 +170,7 @@ async def crawl(  # noqa: PLR0913  (the collaborators that tests replace)
     law = ConcurrencyLaw(cfg.max_concurrency)
     breaker = CircuitBreaker(first_probe=cfg.first_probe, give_up_after=cfg.give_up_after)
     guard = BlockGuard(first_probe=cfg.first_probe, give_up_after=cfg.give_up_after)
-    signals = _Limiter(law, breaker, clock)
+    signals = _Limiter(law, breaker, clock, stats)
     fetcher = Fetcher(transport, cfg.max_page_bytes, stats, signals=signals, clock=clock)
     product = product_token(cfg.user_agent)
     if parser is None:
@@ -182,6 +214,7 @@ async def crawl(  # noqa: PLR0913  (the collaborators that tests replace)
         robots_refresh=cfg.robots_refresh,
         retries=cfg.retries,
         rng=rng,
+        progress=progress,
     )
     interrupts = _Interrupts(dispatcher)
     with interrupts:  # until the sink is closed, so a second Ctrl-C can cut closing short
@@ -197,20 +230,48 @@ async def crawl(  # noqa: PLR0913  (the collaborators that tests replace)
             finally:
                 sink.close()
     rejected, examples = admission.rejections()
-    return CrawlReport(exit_code, stats, admission.unique_urls, clock(), rejected, examples)
+    return CrawlReport(
+        exit_code, stats, admission.unique_urls, clock(), rejected, examples, _peak_rss()
+    )
+
+
+def _peak_rss() -> int | None:
+    """The peak resident set size of this process, the crawler's, in bytes: ru_maxrss is in
+    bytes on macOS and in KiB on Linux. None where it isn't known."""
+    if sys.platform == "win32":  # pragma: no cover
+        return None
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return peak if sys.platform == "darwin" else peak * 1024
+
+
+def _rejected(rule: str, url: str, sampled: bool) -> None:
+    """-v logs the first few URLs each rule keeps from being crawled; -vv, all of them."""
+    log.log(logging.INFO if sampled else logging.DEBUG, "not crawling %s: %s", url, rule)
 
 
 class _Limiter:
     """Feeds the concurrency law and the circuit breaker what the fetcher hears (DESIGN.md
     §5.3), and logs what the law decides. Responses below 500, but for 429, are samples of
-    the server's latency."""
+    the server's latency.
+
+    -v logs each decision that changes the limit, or the law's state: a round held after
+    rounds that weren't, a probe, a cut. At the ceiling the law decides to grow each round,
+    17 times a second at 57 ms (DESIGN.md A.15); those, and holds after the first, are for
+    -vv."""
 
     def __init__(
-        self, law: ConcurrencyLaw, breaker: CircuitBreaker, clock: Callable[[], float]
+        self,
+        law: ConcurrencyLaw,
+        breaker: CircuitBreaker,
+        clock: Callable[[], float],
+        stats: Stats,
     ) -> None:
         self._law = law
         self._breaker = breaker
         self._clock = clock
+        self._stats = stats
+        self._holding = False  # the last decision held the limit
+        stats.limit(law.limit)
 
     def answered(self, status: int, ttfb: float, issued_at: float) -> None:
         self._breaker.answered(issued_at)
@@ -225,8 +286,15 @@ class _Limiter:
             self._decided(self._law.on_congestion(issued_at, self._clock()))
 
     def _decided(self, decision: Decision | None) -> None:
-        if decision is not None:
+        if decision is None:
+            return
+        self._stats.limit(decision.limit)
+        news = decision.limit != decision.previous or decision.kind not in _ROUTINE
+        holding, self._holding = self._holding, decision.kind is Kind.HOLD
+        if news or (self._holding and not holding):
             log.info("concurrency limit: %s", decision)
+        else:
+            log.debug("concurrency limit: %s", decision)
 
 
 async def _run(
@@ -479,7 +547,10 @@ def _answered(outcome: FetchOutcome) -> bool:
 @dataclass(frozen=True, slots=True)
 class _NotPrinted:
     """Counts each item that ends without a page, by why; under --include-errors, it writes
-    a JSONL record for each as well, so that every item has one (DESIGN.md §5.8)."""
+    a JSONL record for each as well, so that every item has one (DESIGN.md §5.8).
+
+    -v logs the items that failed; -vv also those that ended in a response that isn't HTML,
+    or in a redirect to a URL that another item prints."""
 
     stats: Stats
     sink: Sink | None  # for the records; None without --include-errors
@@ -488,6 +559,7 @@ class _NotPrinted:
         """item's fetch ended with outcome."""
         if isinstance(outcome, NotPage):
             self.stats.not_html += 1
+            log.debug("%s isn't printed: it isn't HTML (%s)", outcome.url, outcome.content_type)
             if self.sink is not None:
                 self.sink.write(
                     error_record(
@@ -502,8 +574,11 @@ class _NotPrinted:
         elif isinstance(outcome, Claimed):
             # The page it leads to is printed once, by the item that claimed it.
             self.stats.failures[CLAIMED] += 1
+            *redirected_from, url = outcome.chain
+            log.debug(
+                "%s isn't printed: it redirects to %s, printed for another link", url, outcome.url
+            )
             if self.sink is not None:
-                *redirected_from, url = outcome.chain
                 self.sink.write(
                     error_record(
                         url,
@@ -516,6 +591,7 @@ class _NotPrinted:
                 )
         else:
             self.stats.failures[outcome.reason] += 1
+            log.info("%s isn't printed: %s", outcome.url, outcome.detail)
             if self.sink is not None:
                 self.sink.write(
                     error_record(
@@ -532,6 +608,7 @@ class _NotPrinted:
     def forbidden(self, item: CrawlItem) -> None:
         """item, as the block guard held it, is forbidden: its 403 is final."""
         self.stats.failures[FORBIDDEN] += 1
+        log.info("%s isn't printed: %s", item.url, FORBIDDEN)
         if self.sink is not None:
             self.sink.write(
                 error_record(
@@ -544,7 +621,7 @@ class _NotPrinted:
             )
 
     def unparsed(self, item: CrawlItem, job: ParseJob, reason: str) -> None:
-        """item's page, job, can't be printed, for reason."""
+        """item's page, job, can't be printed, for reason, which the caller logs."""
         self.stats.failures[reason] += 1
         if self.sink is not None:
             self.sink.write(
@@ -591,6 +668,7 @@ class _Dispatcher:
     robots_refresh: float  # seconds between fetches of robots.txt
     retries: int  # for errors, from --retries
     rng: random.Random  # for retries' backoff
+    progress: Progress | None = None
     _parser: Parser | None = field(default=None, init=False)
     _gate: PauseGate = field(default_factory=PauseGate, init=False)
     _slots: int = field(default=0, init=False)
@@ -608,6 +686,11 @@ class _Dispatcher:
     _breaker_probes: asyncio.Task[None] | None = field(default=None, init=False)
     _guard_probes: asyncio.Task[None] | None = field(default=None, init=False)
     _aborted: bool = field(default=False, init=False)
+    _ticker: asyncio.TimerHandle | None = field(default=None, init=False)
+    # (when, pages, page bodies' bytes) at the last few redraws of the progress line
+    _samples: collections.deque[tuple[float, int, int]] = field(
+        default_factory=lambda: collections.deque(maxlen=_RATE_SAMPLES), init=False
+    )
 
     async def run(self, start: CrawlItem, page: Page) -> ExitCode:
         """Crawl from the start page until nothing is outstanding, or until the crawl gives
@@ -629,6 +712,8 @@ class _Dispatcher:
         self._home = page.job.url
         self._start(start, page)
         self.pump()
+        if self.progress is not None:
+            self._tick()
         await self._done.wait()
         if self._aborted:
             return ExitCode.ABORTED
@@ -795,6 +880,45 @@ class _Dispatcher:
             )
         self._gate.rate = rate
 
+    def _tick(self) -> None:
+        """Redraw the progress line, and again in PROGRESS_EVERY seconds."""
+        assert self.progress is not None
+        self.progress.show(self.snapshot().line())
+        self._ticker = asyncio.get_running_loop().call_later(PROGRESS_EVERY, self._tick)
+
+    def snapshot(self) -> Snapshot:
+        """The crawl now, for the progress line. Its rates are over the last second, as
+        far as the snapshots taken in it go."""
+        now = self.clock()
+        stats = self.stats
+        self._samples.append((now, stats.pages, stats.body_bytes))
+        then, pages, received = self._samples[0]
+        elapsed = now - then
+        workers = self._parser.workers if self._parser is not None else 0
+        return Snapshot(
+            pages=stats.pages,
+            rate=(stats.pages - pages) / elapsed if elapsed > 0 else 0.0,
+            in_flight=self._requests,
+            limit=self.law.limit,
+            queued=self.frontier.queued,
+            retrying=self.frontier.retrying,
+            errors=stats.failures.total() - stats.failures[CLAIMED],
+            byte_rate=(stats.body_bytes - received) / elapsed if elapsed > 0 else 0.0,
+            busy=min(len(self._parsing), workers),
+            workers=workers,
+            paused=self._paused(now),
+        )
+
+    def _paused(self, now: float) -> str | None:
+        """Why no request may start now, if one may not."""
+        if self.breaker.open:
+            return "the host isn't answering"
+        if self.guard.tripped:
+            return "refused with 403s, as a block would be"
+        if (wait := self._gate.paused_for(now)) > 0:
+            return f"Retry-After, {wait:.0f} s to go"
+        return None
+
     def halt(self) -> None:
         """Start no more fetches."""
         self._stopping = True
@@ -803,9 +927,11 @@ class _Dispatcher:
         """Cancel the fetches still running; let the parses already submitted finish, so
         that their records are printed; then stop the parse gateway (DESIGN.md §5.9)."""
         self.halt()
-        for timer in (self._wake, self._refresh):
+        for timer in (self._wake, self._refresh, self._ticker):
             if timer is not None:
                 timer.cancel()
+        if self.progress is not None:
+            self.progress.clear()
         others = (self._refreshing, self._breaker_probes, self._guard_probes)
         cancelled = [*self._fetching, *(task for task in others if task is not None)]
         for task in cancelled:
@@ -958,13 +1084,11 @@ class _Dispatcher:
             return
         self.stats.body_bytes += len(page.job.body)
         if result.error is not None:
+            log.info("%s isn't printed: %s", page.job.url, result.error)
             self.not_printed.unparsed(item, page.job, result.error)
             return
         self.sink.write(result.record)
         # The links are admitted before the page finishes, so that outstanding reaches 0
         # only when the crawl is complete (DESIGN.md §4.2).
         self.admission.admit(result.links, item.depth + 1)
-        self.stats.pages += 1
-        self.stats.links_found += result.links_found
-        self.stats.decoded_bytes += result.decoded_bytes
-        self.stats.truncated += result.truncated
+        self.stats.printed(self.clock(), result.links_found, result.decoded_bytes, result.truncated)

@@ -106,7 +106,7 @@ class Limits(logging.Handler):
     """The concurrency law's decisions, from the engine's log: when, which and the new limit."""
 
     def __init__(self):
-        super().__init__(logging.INFO)
+        super().__init__(logging.DEBUG)
         self.decisions = []
 
     def emit(self, record):
@@ -140,7 +140,7 @@ def crawl(args, port):
     limits = Limits()
     engine_log = logging.getLogger("web_crawler.engine")
     engine_log.addHandler(limits)
-    engine_log.setLevel(logging.INFO)
+    engine_log.setLevel(logging.DEBUG)  # -vv: every decision, those that change nothing too
     workers = None if args.parse_workers == "auto" else int(args.parse_workers)
     cfg = Config(start_url=f"http://127.0.0.1:{port}/p/0", max_concurrency=args.max_concurrency,
                  parse_workers=workers)

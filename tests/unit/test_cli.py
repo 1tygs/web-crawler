@@ -1,4 +1,6 @@
 import importlib.metadata
+import io
+import logging
 import subprocess
 import sys
 from pathlib import Path
@@ -7,7 +9,7 @@ from typing import NoReturn
 import pytest
 
 import web_crawler
-from web_crawler.cli import main, parse_args
+from web_crawler.cli import TIP, _ProgressLine, build_parser, main, parse_args
 from web_crawler.config import Config
 from web_crawler.engine import CrawlReport
 from web_crawler.output import Sink
@@ -305,3 +307,122 @@ def test_ctrl_c_before_the_crawl_handles_it_exits_130(monkeypatch: pytest.Monkey
 
     monkeypatch.setattr("web_crawler.cli.crawl", interrupted)
     assert main(["https://example.com/"]) == ExitCode.INTERRUPTED
+
+
+@pytest.mark.parametrize(
+    ("argv", "verbose", "quiet"),
+    [([], 0, False), (["-v"], 1, False), (["-vv"], 2, False), (["-q"], 0, True)],
+)
+def test_verbosity(argv: list[str], verbose: int, quiet: bool) -> None:
+    args = build_parser().parse_args(["https://example.com/", *argv])
+    assert (args.verbose, args.quiet) == (verbose, quiet)
+
+
+def test_verbose_and_quiet_together_are_a_usage_error(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        parse_args(["https://example.com/", "-v", "-q"])
+    assert exit_info.value.code == 2
+    assert "argument -q/--quiet: not allowed with argument -v/--verbose" in capsys.readouterr().err
+
+
+class Terminal(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
+def logging_crawl(seen: dict[str, object]) -> object:
+    async def crawl(cfg: Config, sink: Sink, **kwargs: object) -> CrawlReport:
+        seen.update(kwargs)
+        log = logging.getLogger("web_crawler.engine")
+        log.info("an info")
+        log.debug("a debug")
+        log.warning("a warning")
+        logging.getLogger("aiohttp").info("another library's info")
+        sink.start(lambda: None, lambda: None)
+        sink.close()
+        return CrawlReport(ExitCode.OK, Stats(started=0.0, pages=1), unique_urls=1, finished=1.0)
+
+    return crawl
+
+
+@pytest.mark.parametrize(
+    ("argv", "logged"),
+    [
+        ([], ["a warning"]),
+        (["-v"], ["an info", "a warning"]),
+        (["-vv"], ["an info", "a debug", "a warning"]),
+        (["-q"], []),
+    ],
+)
+def test_verbosity_sets_what_is_logged(
+    argv: list[str], logged: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stderr = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", stderr)
+    monkeypatch.setattr("web_crawler.cli.crawl", logging_crawl({}))
+    before = logging.getLogger().level, logging.getLogger("web_crawler").level
+    assert main(["https://example.com/", *argv]) == ExitCode.OK
+    lines = stderr.getvalue().splitlines()
+    assert [line.removeprefix("crawl: ") for line in lines if line.startswith("crawl: ")] == logged
+    assert lines[-1].startswith("1 page in") if "-q" not in argv else lines == []
+    # As it was, after.
+    assert (logging.getLogger().level, logging.getLogger("web_crawler").level) == before
+
+
+def test_a_terminal_shows_the_progress_line_when_records_go_elsewhere(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(sys, "stderr", Terminal())
+    monkeypatch.setattr("web_crawler.cli.crawl", logging_crawl(seen))
+    main(["https://example.com/", "-o", str(tmp_path / "out")])
+    assert isinstance(seen["progress"], _ProgressLine)
+    main(["https://example.com/", "-q", "-o", str(tmp_path / "out")])
+    assert seen["progress"] is None
+
+
+def test_records_on_the_terminal_get_a_tip_instead_of_the_progress_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, object] = {}
+    stderr = Terminal()
+    monkeypatch.setattr(sys, "stderr", stderr)
+    monkeypatch.setattr(sys, "stdout", Terminal())
+    monkeypatch.setattr(sys.stdout, "buffer", io.BytesIO(), raising=False)
+    monkeypatch.setattr("web_crawler.cli.crawl", logging_crawl(seen))
+    main(["https://example.com/"])
+    assert seen["progress"] is None
+    assert stderr.getvalue().endswith(f"1 unique in-scope URL\n{TIP}\n")
+
+
+def test_the_progress_line_is_redrawn_in_place() -> None:
+    stream = io.StringIO()
+    line = _ProgressLine(stream)
+    line.show("pages 1")
+    line.show("pages 2")
+    assert stream.getvalue() == "\rpages 1\x1b[K\rpages 2\x1b[K"
+
+
+def test_a_log_record_takes_the_progress_line_away_and_it_comes_back_below() -> None:
+    stream = io.StringIO()
+    line = _ProgressLine(stream)
+    line.setFormatter(logging.Formatter("crawl: %(message)s"))
+    line.show("pages 1")
+    line.handle(logging.makeLogRecord({"msg": "a warning", "levelno": logging.WARNING}))
+    assert stream.getvalue() == "\rpages 1\x1b[K\r\x1b[Kcrawl: a warning\n\rpages 1\x1b[K"
+
+
+def test_once_cleared_the_progress_line_stays_away() -> None:
+    stream = io.StringIO()
+    line = _ProgressLine(stream)
+    line.show("pages 1")
+    line.clear()
+    line.show("pages 2")
+    line.handle(logging.makeLogRecord({"msg": "a warning", "levelno": logging.WARNING}))
+    assert stream.getvalue() == "\rpages 1\x1b[K\r\x1b[Ka warning\n"
+
+
+def test_the_progress_line_fits_the_terminal() -> None:
+    stream = io.StringIO()  # with no terminal behind it, 80 columns
+    _ProgressLine(stream).show("x" * 100)
+    assert stream.getvalue() == "\r" + "x" * 79 + "\x1b[K"
