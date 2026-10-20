@@ -180,7 +180,7 @@ async def test_a_body_without_a_type_that_isnt_html_is_not_a_page(
     headers: dict[str, str], body: bytes, read: int
 ) -> None:
     outcome, transport, _ = await fetch({START: Reply(headers=headers, body=body)})
-    assert outcome == NotPage(START, headers.get("Content-Type"))
+    assert outcome == NotPage(headers.get("Content-Type"), (START,), 200)
     assert transport.responses[0].position == (0 if "X-Content-Type-Options" in headers else read)
 
 
@@ -199,7 +199,14 @@ async def test_follows_redirects_and_reports_the_final_url() -> None:
         "http://example.com/b": Reply(headers=HTML, body=b"page"),
     }
     outcome, transport, stats = await fetch(replies)
-    assert outcome == Page(ParseJob("http://example.com/b", b"page", http_charset="utf-8"))
+    assert outcome == Page(
+        ParseJob(
+            "http://example.com/b",
+            b"page",
+            http_charset="utf-8",
+            redirected_from=(START, "https://example.com/a"),
+        )
+    )
     assert transport.requested == [START, "https://example.com/a", "http://example.com/b"]
     assert stats.statuses == {301: 1, 302: 1, 200: 1}
 
@@ -260,7 +267,7 @@ async def test_stops_at_a_redirect_to_a_url_another_item_claimed(
     # That item prints the page; following the redirect would fetch and print it twice.
     replies: Replies = {START: Reply(301, {"Location": location}, body=b"moved")}
     outcome, transport, _ = await fetch(replies, admission=claiming("https://example.com/b"))
-    assert outcome == Claimed(target, (START,))
+    assert outcome == Claimed(target, (START,), 301)
     assert transport.requested == [START]
     assert transport.responses[0].position == len(b"moved")  # drained
 
@@ -273,7 +280,7 @@ async def test_follows_a_cookie_gate_back_to_where_it_started() -> None:
         gate: Reply(302, {"Location": "/"}),
     }
     outcome, transport, _ = await fetch(replies)
-    assert outcome == Page(ParseJob(START, b"page", "utf-8"))
+    assert outcome == Page(ParseJob(START, b"page", "utf-8", redirected_from=(START, gate)))
     assert transport.requested == [START, gate, START]
 
 
@@ -370,7 +377,7 @@ async def test_drains_a_small_non_html_body_and_drops_a_large_one(
     headers = {"Content-Type": "image/png"} | ({"Content-Length": length} if length else {})
     body = b"x" * (DRAIN_LIMIT + 1 if length == str(DRAIN_LIMIT + 1) else DRAIN_LIMIT)
     outcome, transport, _ = await fetch({START: Reply(headers=headers, body=body)})
-    assert outcome == NotPage(START, "image/png")
+    assert outcome == NotPage("image/png", (START,), 200)
     assert transport.responses[0].position == read
 
 
@@ -396,10 +403,13 @@ async def test_drains_a_small_error_body_and_drops_a_large_one(
 @pytest.mark.parametrize(
     ("reply", "outcome"),
     [
-        (Reply(301, {"Location": "/a"}), Page(ParseJob("https://example.com/a", b"page", "utf-8"))),
+        (
+            Reply(301, {"Location": "/a"}),
+            Page(ParseJob("https://example.com/a", b"page", "utf-8", redirected_from=(START,))),
+        ),
         (
             Reply(200, {"Content-Type": "image/png", "Content-Length": "10"}),
-            NotPage(START, "image/png"),
+            NotPage("image/png", (START,), 200),
         ),
         (Reply(404, HTML | {"Content-Length": "10"}), Final("HTTP 404", "HTTP 404", (START,), 404)),
     ],
@@ -504,7 +514,14 @@ async def test_a_resumed_item_carries_on_from_its_chain() -> None:
         "https://example.com/a": Reply(headers=HTML, body=b"page"),
     }
     outcome, transport, _ = await fetch(replies, start=resumed)
-    assert outcome == Page(ParseJob("https://example.com/a", b"page", "utf-8"))
+    assert outcome == Page(
+        ParseJob(
+            "https://example.com/a",
+            b"page",
+            "utf-8",
+            redirected_from=(START, "https://example.com/a", "https://example.com/b"),
+        )
+    )
     assert transport.requested == ["https://example.com/b", "https://example.com/a"]
 
 

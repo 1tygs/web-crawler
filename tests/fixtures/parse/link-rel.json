@@ -15,5 +15,6 @@
     "https://example.com/page/2",
     "https://example.com/page/0",
     "https://example.com/both.css"
-  ]
+  ],
+  "canonical": "https://example.com/canonical"
 }

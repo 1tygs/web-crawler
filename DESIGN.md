@@ -1,6 +1,6 @@
 # Web Crawler: System Design
 
-**Status:** Proposed · **Date:** 2026-10-19, revised 2026-10-20 after an architecture review · **Runtime:** CPython 3.14 · **Scope:** single-host crawler, command line
+**Status:** Implemented: v1 is built ([§15](#15-delivery-plan)) · **Date:** 2026-10-19, revised 2026-10-20 after an architecture review, and as v1 was built · **Runtime:** CPython 3.14 · **Scope:** single-host crawler, command line
 
 One asyncio coordinator owns all crawl state and does only cheap work. An adaptive concurrency limit grows until the server shows it is queueing, and halves when the server signals distress. A pool of parser processes does all CPU-heavy work on response bodies that are still compressed.
 
@@ -24,7 +24,7 @@ Accuracy comes from matching browser semantics: HTML5 parsing, WHATWG URL resolu
 - The full parse pipeline costs 0.4–2.7 ms per real page.
 - Parsing inline on one core tops out around 610 pages/s.
 - Eight parser processes reach about 2,800 pages/s.
-- The coordinator's own cost is about 150–250 µs per page (A.3's 120–220 µs plus A.4's 27 µs of HTTP), and 250–275 µs in a whole crawl, its bookkeeping included (A.15), so it saturates only at roughly 3,500–6,500 pages/s.
+- The coordinator's own cost is about 150–250 µs per page (A.3's 120–220 µs plus A.4's 27 µs of HTTP), and 250–280 µs in a whole crawl, its bookkeeping included (A.15), so it saturates only at roughly 3,500–6,500 pages/s.
 
 The target server will be the limit, not the crawler.
 
@@ -97,7 +97,7 @@ Parsing inline on the event loop caps one core at about 610 pages/s on this mix.
 
 | Component | Cost | Saturates at |
 |---|---|---|
-| Coordinator (fetch + IPC + dedupe + write) | ~150–275 µs per page | ~3,500–6,500 pages/s |
+| Coordinator (fetch + IPC + dedupe + write) | ~150–280 µs per page | ~3,500–6,500 pages/s |
 | One parser process | ~1.6 ms per page (mix above) | ~600 pages/s |
 | Eight parser processes (measured) | — | ~2,800 pages/s |
 
@@ -150,7 +150,7 @@ Few sites will serve one client thousands of pages per second. The crawler's cei
 ### 4.2 Lifecycle of a URL
 
 1. **Discovered.** A parse result lists the page's in-scope links as `(dedupe key, URL)` pairs.
-2. **Admitted.** The coordinator checks `key in seen` (~50 ns). If the key is new, it applies the trap rules, the extension filter, robots.txt (Protego, ~3 µs) and the depth limit. If all pass, the key goes into `seen` and the URL into the frontier. This is *claim on discovery*: from now on, no other page, redirect or retry can cause a second fetch.
+2. **Admitted.** The coordinator checks `key in seen` (~50 ns). If the key is new, and within the depth limit, it applies the trap rules, the extension filter and robots.txt (Protego, ~3 µs). If all pass, the key goes into `seen` and the URL into the frontier. This is *claim on discovery*: from now on, no other page, redirect or retry can cause a second fetch.
 3. **Dispatched.** The dispatcher takes a *pipeline slot*, which bounds memory (fetches plus the parse queue). It then takes a *limiter permit*, which bounds load on the server, and starts a fetch task. Under `--max-depth` it dispatches only inside the depth window, and under `--max-pages` only while pages printed plus fetches in flight is below the limit ([§5.1](#51-frontier-and-admission)).
 4. **Fetched.** A GET is sent with compression enabled and auto-decompression off. When the headers arrive, the limiter records the time to first byte, counted from when the request had its connection, and the status is triaged ([§5.4](#54-errors-and-retries)). Non-HTML responses are never parsed, and their bodies are only read when small enough to drain for connection reuse. HTML bodies are streamed up to the size cap. The limiter permit is then released, so parse time never throttles fetching.
 5. **Redirected** (on 3xx). `Location` is resolved, scope-checked and admitted as a hop, which claims it. If another item has already claimed it, this task stops; that page is fetched by its own task. A target already in this task's own chain is followed again ([§5.2](#52-fetcher-and-transport)).
@@ -182,17 +182,17 @@ Few sites will serve one client thousands of pages per second. The crawler's cei
 
 - **Order: breadth-first by depth.** The frontier is a list of FIFO queues indexed by depth, and dispatch takes from the shallowest non-empty one. A page links to around 100 others, so BFS keeps the frontier wide and concurrency saturates within two levels. It also reaches important shallow pages first and makes `--max-pages` return a sensible subset.
 - **Retry heap.** A `heapq` of `(ready_at, seq, item)`. Items waiting out a backoff hold no permit or slot. The dispatcher wakes at the earliest `ready_at`.
-- **Admission checks**, cheapest first. Every rejection is counted and sampled to the log, so nothing is dropped silently.
+- **Admission checks**, cheapest first. Every rejection is counted, and the first few of each rule are logged at `-v`, so nothing is dropped silently.
   1. `key in seen` → drop.
-  2. Trap rules (configurable):
+  2. `--max-depth`, once per page, since a page's links all have the same depth.
+  3. Trap rules (configurable):
      - The URL is longer than 2,048 characters (the sitemap protocol's limit).
      - A path segment is repeated more than three times, as in `/a/b/a/b/a/b/…` from broken relative links on soft-404 sites.
      - A single path has more than 1,000 distinct query strings (calendars, faceted search).
-  3. Extension filter (on by default; `--no-skip-extensions` turns it off). It covers images, audio and video, archives, fonts, PDFs, office documents, CSS and JS. Those responses would almost always be discarded unparsed, so skipping them saves a request. The rare exception is a URL such as `/old.pdf` that redirects to an HTML page, which the flag is there for. The link is still printed on the page that contains it.
-  4. robots.txt ([§5.7](#57-robotstxt)).
-  5. `--max-depth`.
+  4. Extension filter (on by default; `--no-skip-extensions` turns it off). It covers images, audio and video, archives, fonts, PDFs, office documents, CSS and JS. Those responses would almost always be discarded unparsed, so skipping them saves a request. The rare exception is a URL such as `/old.pdf` that redirects to an HTML page, which the flag is there for. The link is still printed on the page that contains it.
+  5. robots.txt ([§5.7](#57-robotstxt)).
 
-  Rejected keys also go into `seen`, so they aren't re-checked every time they're found. Depth rejections are the exception, so a later, shorter path can still admit them. A redirect's target goes through the trap rules and robots.txt, but not the extension filter: it's followed, and its response says what it is. The checks cost about 0.6 µs per new URL on top of robots.txt's, and run once per URL, not per link (A.16).
+  Rejected keys also go into `seen`, so they aren't re-checked every time they're found. Depth rejections are the exception: a later, shorter path can still admit them, and until one does, the other rules don't see them, since the query-variant count would count a URL again each time it's found beyond the limit. The summary counts the URLs found only beyond the limit, each once. A redirect's target goes through the trap rules and robots.txt, but not the extension filter: it's followed, and its response says what it is. The checks cost about 0.6 µs per new URL on top of robots.txt's, and run once per URL, not per link (A.16).
 - **`--max-pages N`** is enforced when dispatching: a fetch starts only while pages printed plus fetches in flight is below N, so no page is fetched only to be thrown away. A fetch that ends without a page (an error, a non-HTML response, a redirect to a URL already claimed) frees its place. Exactly N records are printed, or fewer if the site is smaller.
 - **HSTS upgrade (RFC 6797), after v1.** Once an HTTPS response carries `Strict-Transport-Security`, in-scope `http://` links are upgraded to `https://` before the dedupe check, as browsers do. Legacy `http://` links then cost no redirect round-trip. Until then, redirect-aware dedupe ([§5.6](#56-url-normalization-and-dedupe)) collapses them for one extra request each.
 - **Exact depth under `--max-depth`.** Because of concurrency, a page can be reached by a longer path first. A two-level dispatch window makes the result independent of timing:
@@ -201,7 +201,11 @@ Few sites will serve one client thousands of pages per second. The crawler's cei
 
   A page at depth *d* can only become shallower through a page at depth *d*−2 or less. Once all of those have finished, its depth can no longer change, so it's final by the time the page is dispatched. The crawled set is then exactly the set of pages within N links of the start, and nothing extra is stored.
 
-  In simulation over 600 random sites the window was exact every time, and never had to lower an item already in flight. The first draft's rules (lowering queued items, and keeping the links of pages whose children were cut off) missed pages in 27–34% of runs, because they can't repair a page already fetched at a depth short of the limit: its links weren't kept (A.10). The window adds a median 3–7% to crawl time, and applies only when `--max-depth` is set.
+  Unfinished includes an item waiting to be tried again, and a 403 held until its run is settled ([§5.4](#54-errors-and-retries)): either can still turn out to be a page whose links are a shorter path.
+
+  In simulation over 600 random sites the window was exact every time, and never had to lower an item already in flight; so was the crawler's own frontier, run in the same simulation (A.10). The first draft's rules (lowering queued items, and keeping the links of pages whose children were cut off) missed pages in 27–34% of runs, because they can't repair a page already fetched at a depth short of the limit: its links weren't kept (A.10). The window adds a median 3–7% to crawl time.
+
+  Both rules apply only when `--max-depth` is set. Lowering looks up, for every link already seen, whether its item is still queued: 86 ns a link rather than 42, or 10.3 µs a page of 120 links rather than 5.0 (A.16). Without a limit, nothing depends on a depth being the shortest.
 
 ### 5.2 Fetcher and transport
 
@@ -256,7 +260,7 @@ on 429 / 503 / timeout / connection reset or refused / body cut off:
 - **Why the probe.** Queueing caused by our own load disappears when we halve it; a slowdown caused by slower pages or other users doesn't. The idea is borrowed from BBR's ProbeRTT phase, which drains its own queue to re-measure the path's base delay. Comparing each round's median with the median at low load, rather than with a low percentile, keeps a wide but steady spread of response times from reading as congestion.
 - **Evidence (A.11).** In simulation this law stays within about 10% of the ceiling's crawl time when the server has spare capacity. On a small origin that saturates at ~22 requests in flight, it cuts the time each request waits in the server's queue from 137 ms to 37–40 ms, for 1–2% more crawl time. The first draft's law, which cut the limit when the recent median passed 2× a p10 baseline, mistook spread for congestion: it held healthy sites to a mean of 1.4–2.9 requests in flight, 20–43× slower. Its baseline also drifted up once every sample came from a queue, so it never protected the small origin.
 - **One cut per congestion event.** A burst of 429s answers requests that were all in flight at once, and one halving answers all of them: a congestion signal cuts only if its request was sent after the last cut, which is "once per round trip" made exact. On a simulated origin that answers 429 to a request arriving while 20 others are being served, slow start's overshoot to 32 draws a dozen 429s and one cut; the limit then cycles between 10 and 23 and averages 16, AIMD's sawtooth. Cutting for every 429 sends it as low as 2 (A.11).
-- **Untuned.** The thresholds (1.5×, 10 rounds, 20%) are validated in simulation only. Every decision is logged at `-v`, so real crawls can check them.
+- **Untuned.** The thresholds (1.5×, 10 rounds, 20%) are validated in simulation only. `-v` logs every decision that changes something, and `-vv` the rest, so real crawls can check them. The first two are in [ADR-001](docs/adr/001-concurrency-control.md#first-real-crawls): on docs.python.org, whose cached and uncached pages answer about ten times apart, the law read the cache's misses as queueing, and held the limit between 4 and 11.
 - A new limit takes effect as permits are released. In-flight requests are never cancelled to shrink it.
 - **The ceiling.** It stays at 64 by default. It only binds on servers with spare capacity, and the error signals and the 403 rule ([§5.4](#54-errors-and-retries)) catch a server that objects. It's still about ten times the six connections a browser opens per host, so `--max-concurrency` is the first setting to turn down.
 - Optional hard ceilings:
@@ -375,15 +379,23 @@ https://example.com/about
   https://example.com/
 ```
 
-JSONL (`--format jsonl`) has one object per page:
+JSONL (`--format jsonl`) has one object per page: its `url`, the final response's `status`, its `depth` and its `links`, then `redirected_from`, `truncated` and `canonical` when there's something to say. The canonical URL is the first `<link rel=canonical>` that resolves to an `http(s)` URL, reported, never merged ([§5.6](#56-url-normalization-and-dedupe)).
 
 ```json
 {"url":"https://example.com/blog/","status":200,"depth":1,"links":["https://example.com/","https://example.com/blog/post-1"],"redirected_from":["https://example.com/blog"]}
 ```
 
-- stdout carries only results. Logs, progress and the summary go to stderr, so `crawl … > out.txt` stays clean.
+`--include-errors` adds a record for every item that ends without a page, so that each URL crawled has exactly one. It names the last URL requested, its `status` if it had a response, its `depth`, and `error`: the reason the summary counts it under. Then, when there's something to say, `detail` (what happened, if `error` doesn't say it all), `redirected_from`, `location` (where a redirect that wasn't followed, or that led to a URL already claimed, pointed) and `content_type` (for a response that isn't HTML). Text has no place for an error, so `--include-errors` needs `--format jsonl`.
+
+```json
+{"url":"https://example.com/missing","status":404,"depth":2,"error":"HTTP 404"}
+{"url":"https://example.com/down","depth":1,"error":"connect","detail":"connect: Cannot connect to host example.com:443 ssl:default [Connection refused]"}
+{"url":"https://example.com/old","status":301,"depth":1,"error":"redirect out of scope","detail":"HTTP 301 to https://elsewhere.org/, outside the crawl's scope","location":"https://elsewhere.org/"}
+```
+
+- stdout carries only results, or `-o FILE` does. Logs, progress and the summary go to stderr, so `crawl … > out.txt` stays clean. The workers render each page's record, text or JSONL alike, so the coordinator only writes it.
 - Each record is written with one `write()` and is never interleaved. The writer thread flushes every 100 ms and at exit, so `| head`, `tee` and `tail -f` behave as expected. A closed pipe (e.g. `| head`) ends the crawl quietly, with exit code 141 ([§5.9](#59-shutdown)).
-- At thousands of lines per second, the terminal itself becomes the bottleneck. When stdout is a terminal, the progress line suggests redirecting to a file.
+- At thousands of lines per second, the terminal itself becomes the bottleneck. A progress line redrawn between records on the same terminal would garble them, so when records go to the terminal there's none, as curl shows no meter then; a tip after the summary suggests redirecting them to a file instead ([§10](#10-observability)).
 
 ### 5.9 Shutdown
 
@@ -409,17 +421,17 @@ crawl URL [options]
 | `--max-rps R` | off | Hard ceiling on requests per second |
 | `--parse-workers N\|auto` | auto = CPUs − 1, within any container quota | Cap on parser processes (0 = parse inline) |
 | `--max-pages N`, `--max-depth N` | unlimited | Crawl limits, with exact semantics ([§5.1](#51-frontier-and-admission)) |
-| `--format text\|jsonl` | text | Output format |
-| `-o, --output FILE` | stdout | Output destination |
+| `--format text\|jsonl` | text | Output format ([§5.8](#58-output)) |
+| `-o, --output FILE` | stdout | Output destination, replaced; opened before the crawl starts, so a path that can't be written to is a usage error |
 | `--all-urls` | off | Report every URL-bearing attribute and every scheme; only links are crawled |
-| `--include-errors` | off | JSONL records for URLs that failed |
+| `--include-errors` | off | JSONL records for URLs that ended without a page; needs `--format jsonl` |
 | `--ignore-robots` | off | For crawling your own site; also ignores `Crawl-delay` |
 | `--strict-host` | off | Refuse a start URL that redirects to another host, even when only `www.` differs |
 | `--timeout S`, `--retries N` | 60, 3 | Total timeout per request; retry budget |
 | `--max-page-bytes N` | 32M | Size cap per page, as sent and decompressed; K, M and G are binary suffixes |
 | `--user-agent UA` | `web-crawler/1.0 (+url)` | Also selects the robots.txt group |
 | `--insecure`, `--no-skip-extensions` | off | Escape hatches |
-| `-v`/`-vv`, `-q` | — | Observability; `-v` also logs the limiter's decisions |
+| `-v`/`-vv`, `-q` | — | Observability ([§10](#10-observability)); `-v` also logs the limiter's decisions |
 
 Designed but after v1 ([§15](#15-delivery-plan)): `--strip-params LIST` (query parameters to drop before dedupe, e.g. `utm_*,gclid`), `--respect-nofollow` (don't follow `rel=nofollow` or meta-`nofollow` links, though they're still printed), `--sitemaps` (also seed from the sitemaps listed in robots.txt), `--stats-json FILE` and `--no-cookies`.
 
@@ -463,13 +475,13 @@ class Transport(Protocol):       # aiohttp today; an HTTP/2 transport can follow
 @dataclass(slots=True, frozen=True)
 class ParseJob:                  # coordinator -> worker (pickled)
     url: str                     # final URL after redirects, i.e. the base URL
-    depth: int
-    status: int
-    content_encoding: str | None
-    http_charset: str | None
     body: bytes                  # still compressed
-    redirected_from: tuple[str, ...]
+    http_charset: str | None
     truncated: bool
+    content_encoding: str | None
+    depth: int                   # for the JSONL record, with the next two
+    status: int
+    redirected_from: tuple[str, ...]
 
 class ParseResult(NamedTuple):   # worker -> coordinator
     record: bytes                # rendered output, written verbatim; b"" on an error
@@ -515,7 +527,7 @@ On this machine the client becomes the bottleneck only above about 2,800 pages/s
 | D4 | selectolax (lexbor) | lxml, BeautifulSoup, html.parser, regex | Measured 2.6–3.2× faster than lxml, 12–16× faster than html.parser and 16–45× faster than BeautifulSoup. lexbor implements the full HTML5 parsing algorithm, including tree construction; libxml2's HTML parser doesn't. Regex is simply wrong: entities like `&amp;`, comments, scripts and quoting all break it |
 | D5 | ada-url (WHATWG) | urllib.parse, yarl | Matches browsers exactly and was the fastest measured: 0.67 µs per link, against 1.86 µs (urljoin) and 1.20 µs (yarl). urllib.parse differs from browsers on 10 of 16 tricky inputs. yarl follows RFC 3986: it maps `\` to `%5C` and decodes `%2F` in queries |
 | D6 | Process pool for parsing, fed compressed bytes | Inline parsing; free-threaded threads; subinterpreters; sharding the whole crawl across processes | Inline parsing caps at about 610 pages/s per core. Free-threading is blocked today because ada-url and brotli publish no cp314t wheels. Subinterpreters need C-extension support that isn't established. Sharding needs distributed dedupe and rate control, and almost every link found would have to cross to the process that owns it |
-| D7 | `ProcessPoolExecutor`, with submits under a blocked signal mask and crash isolation around it | A custom pipe-based pool with batching | The measured coordinator overhead of 120–220 µs per page (150–250 µs with HTTP, 250–275 µs in a whole crawl) puts its ceiling at roughly 3,500–6,500 pages/s, far above realistic server rates. Its two sharp edges, a Ctrl-C while a worker starts and one crash failing every job, are handled around it (A.9). Revisit only if profiling shows the coordinator saturating |
+| D7 | `ProcessPoolExecutor`, with submits under a blocked signal mask and crash isolation around it | A custom pipe-based pool with batching | The measured coordinator overhead of 120–220 µs per page (150–250 µs with HTTP, 250–280 µs in a whole crawl) puts its ceiling at roughly 3,500–6,500 pages/s, far above realistic server rates. Its two sharp edges, a Ctrl-C while a worker starts and one crash failing every job, are handled around it (A.9). Revisit only if profiling shows the coordinator saturating |
 | D8 | Decompress in the workers | aiohttp auto-decompress | Halves coordinator CPU per request (51.7 → 26.5 µs). Lets the zip-bomb cap apply to decoded size |
 | D9 | An exact in-memory `set` | Bloom or cuckoo filter; an on-disk key-value store | False positives silently drop pages. 130 MiB per million URLs is affordable; disk only pays off beyond about 10M URLs |
 | D10 | BFS by depth, with a two-level dispatch window under `--max-depth` | DFS; heuristic priority; lowering depths and keeping cut-off pages' links | Wide frontier, predictable `--max-pages` subsets, exact depth semantics. DFS dives into traps first. The window was exact on 600 of 600 simulated sites; keeping links missed pages on 27–34% of them (A.10) |
@@ -559,16 +571,21 @@ Python 3.14 or later is required, because `compression.zstd` is in its standard 
 
 ## 10. Observability
 
-- **Progress line** on stderr, only when it's a terminal, refreshed four times a second:
+- **Progress line** on stderr, refreshed four times a second, when stderr is a terminal and the records go elsewhere:
   `pages 48,210 · 431/s · in-flight 64/64 · queued 12,904 · retrying 3 · errors 17 · 7.6 MB/s · workers 2/9`
+  - The rates are over the last second. `in-flight` is requests against the concurrency limit, and `workers` is parser processes at work against the most there may be.
+  - `paused: …` says why no request starts, when none does: the host isn't answering, it refuses with 403s as a block would, or a `Retry-After` has some seconds to go.
+  - The line is cut to the terminal's width, so that a carriage return redraws it. A log line takes it away, is written, and the line comes back below it.
+  - Drawn between records on the same terminal it would garble them, so a crawl printing records to the terminal has none, and gets a tip after its summary instead.
 - **Final summary** on stderr:
-  - pages printed, links found, unique URLs;
-  - status code histogram and errors by class;
-  - policy rejections by rule (robots, traps, extension), with examples;
-  - time-to-first-byte p50/p95/p99;
+  - pages printed, with the duration and average pages/s; links found; unique URLs;
+  - status code histogram;
+  - time-to-first-byte p50/p95/p99, from a histogram of buckets 1% wide on a log scale: fixed memory, and within 0.5% of the exact quantile;
   - bytes on the wire vs decoded, and pages cut short;
-  - duration, average and peak pages/s, limiter range, peak RSS.
-- `-v` logs failures, rejections and the limiter's decisions; `-vv` logs every request. After v1, `--stats-json FILE` writes the summary for scripts.
+  - what wasn't printed, by why (errors by class, responses that weren't HTML, redirects to URLs already claimed), and what was tried again;
+  - policy rejections by rule (robots, traps, extension, depth limit), with an example of each;
+  - the busiest second's pages, the limiter's range and where it ended, and the coordinator's peak RSS.
+- `-v` logs the URLs that fail, the first three each rule rejects, retries and pauses, and the limiter's decisions that change something: the limit, the end of slow start, a probe, a cut, the first of a run of held rounds. `-vv` adds every request, every URL rejected, and the decisions that change nothing: at the ceiling the law grows each round, about 17 times a second in A.15's crawl. `-q` prints errors only. After v1, `--stats-json FILE` writes the summary for scripts.
 - Policy decisions are always counted and sampled. An accurate crawl is one whose omissions you can audit.
 
 ---
@@ -584,7 +601,7 @@ Python 3.14 or later is required, because `compression.zstd` is in its standard 
 | Unit: robots | The crawler's own handling: fetching every origin up front, each status class including 429, redirects, re-fetching after 24 hours | Table tests, plus a few pinned Protego behaviours (longest match, wildcards, group selection). Google's test suite isn't run against Protego, which matches groups more loosely ([§5.7](#57-robotstxt)) |
 | Integration | Output matches ground truth exactly; each URL is fetched at most once | An in-process aiohttp server, over http and https, serving sites with known link graphs; a test resolver serves `*.test` hosts on their default ports: the scenarios below, plus seeded random graphs with random latencies, compared against a breadth-first search with and without `--max-depth`. The server's request log proves there are no double fetches |
 | Fault injection | Recovery without losing pages | Connection resets mid-body, truncated gzip, 429 and 503 with and without `Retry-After`, `kill -9` on one worker of a busy pool (no page lost), a page that crashes its worker every time (only it fails), Ctrl-C mid-crawl and while workers are starting (no partial records; summary printed), a run of 403s mid-crawl that ends and one that doesn't (exit 4), a host that goes away (exit 4), a decompression bomb, `\| head` (exit 141, no traceback) |
-| Performance | No regressions | A local server with 50 ms of injected latency and 50k pages, tracking pages/s, coordinator CPU per page and peak RSS in CI. `bench/` holds the scripts behind this document |
+| Performance | No regressions | A local server with 50 ms of injected latency and 50k pages (`bench/e2e.py`), run on each push to main, which fails if a page is lost or pages/s, coordinator CPU per page or peak RSS crosses its gate (A.15). `bench/` holds the scripts behind this document |
 
 The integration test sites cover:
 - cycles, redirect chains and loops, off-host redirects, a start URL on the apex that redirects to `www` (followed) or to another host (exit 3), and a start URL without a scheme on `localhost`;
@@ -619,8 +636,9 @@ web-crawler/
 │   ├── robots.py             # RFC 9309 fetching and Protego policy, per origin
 │   ├── parse.py              # pure parse_page(); runs in the workers
 │   ├── urls.py               # dedupe key, scope prefixes, trap rules, extension filter
-│   ├── output.py             # writer thread, text/JSONL, broken-pipe handling
-│   └── stats.py              # counters, progress line, summary
+│   ├── records.py            # the output records: text and JSONL pages, JSONL errors
+│   ├── output.py             # writer thread, broken-pipe handling
+│   └── stats.py              # counters, TTFB histogram, progress line, summary
 ├── tests/{unit,integration,fixtures}/
 └── bench/                    # the measurement and simulation scripts behind Appendix A
 ```
@@ -636,8 +654,8 @@ Each commit is small and lands with its tests, so the history shows how the craw
 - **Soft 404s.** A 200 response for a missing page looks like a real page. Trap rules limit the damage.
 - **Legacy-encoded pages.** Browsers percent-encode non-ASCII characters in the *query* using the document's encoding; ada-url always uses UTF-8. This only matters on non-UTF-8 pages with raw non-ASCII in query strings. If it comes up, the fix is to pre-encode the query in the document's charset. Separately, Python's multi-byte decoders differ from the standard's on a few hundred rare characters (A.14).
 - **Trap thresholds.** The defaults give up a little completeness (e.g. listings with more than 1,000 query variants) in exchange for guaranteed termination. Every cut is reported in the summary.
-- **Printed depth.** Without `--max-depth`, the `depth` field is the shortest path known when the page was printed. With it, depths are exact.
-- **Limiter thresholds.** The law in [§5.3](#53-adaptive-concurrency-limiter) is validated in simulation only, and its thresholds are untuned. `-v` logs every decision so real crawls can check them.
+- **Printed depth.** Without `--max-depth`, the `depth` field is the length of the path the page was first found by, which breadth-first order makes the shortest nearly always. With it, depths are exact.
+- **Limiter thresholds.** The law in [§5.3](#53-adaptive-concurrency-limiter) is validated in simulation only, and its thresholds are untuned. `-v` logs the decisions that change something, so real crawls can check them; the first, on docs.python.org, ran at 4–11 requests in flight, the law reading cache misses as queueing (ADR-001).
 - **Firewall challenges.** A block served as 403s is caught by the rule in [§5.4](#54-errors-and-retries). A challenge page served with status 200 looks like an ordinary page with few links.
 
 **What to revisit as it grows**
@@ -707,7 +725,7 @@ The command line stays, both as today's local single-site tool and as a thin cli
 
 ## 15. Delivery plan
 
-v1 ships the core and the differentiators, each with its tests, so the code a reviewer reads is all built and all tested. The build order keeps the repository passing CI and doing something useful after every step:
+v1 ships the core and the differentiators, each with its tests, so the code a reviewer reads is all built and all tested. The build order kept the repository passing CI and doing something useful after every step, and all five steps are built, one pull request each ([docs/implementation-plan.md](docs/implementation-plan.md) §7):
 
 1. **Walking skeleton.** CLI → frontier → fetcher → inline parse → text output, against the in-process test server.
 2. **Accuracy.** WHATWG resolution, `<base href>`, charsets, declarative shadow DOM, redirect-aware dedupe, robots.txt.
@@ -751,6 +769,8 @@ The crawler's `parse_page` (`bench/pipeline_bench.py`), on pages fetched on 2026
 | docs.python.org (249 KB) | 58 | 1.71 | 1.78 | 1.73 | 1.65 |
 | python.org (52 KB) | 133 | 0.45 | 0.46 | 0.45 | 0.43 |
 
+Rechecked with step 5's code on 2026-10-20, which renders records through `records.py` and finds each page's canonical URL: in eight interleaved pairs of runs with step 4's code, gzipped, the two were within 0.3% at the median on every page, at A.2's times.
+
 These numbers first came from a prototype of the worker (`git show fe39313:bench/pipeline_bench.py`), which skipped charset detection and several of the standards' finer rules. The crawler's code had to stay within 10% of it. Run on the same pages, in alternating rounds:
 
 | Page | Crawler ÷ prototype, over the four encodings |
@@ -776,7 +796,7 @@ A.2's pages with gzip bodies, round robin, through the crawler's parse gateway (
 | 4 | 1,970 | 197 µs |
 | 8 | 2,812 | 220 µs |
 
-On the same pages, the prototype's coordinator, which passed its arguments to the executor directly, with no signal mask, reached pages/s within 4% of these for 12–17 µs less CPU per page with parser processes.
+On the same pages, the prototype's coordinator, which passed its arguments to the executor directly, with no signal mask, reached pages/s within 4% of these for 12–17 µs less CPU per page with parser processes. Step 5's code, rerun on 2026-10-20 alternating with step 4's, gave the same CPU per page within 10 µs with parser processes, and within 1% inline; pages/s with eight processes fell from run to run of either code, 2,746 to 2,555, as the machine warmed.
 
 **A.4 HTTP client cost**
 
@@ -896,8 +916,9 @@ An event-driven simulation of a shallowest-first crawl with 32 requests in fligh
 | Depth fixed at first discovery (Scrapy's `DEPTH_LIMIT`) | 295 / 300 | 56.5 (877) | 299 / 300 | 75.2 (417) |
 | First draft: lower queued and in-flight items; keep and re-admit cut-off pages' links, recursively | 82 / 300 | 12.4 (858) | 102 / 300 | 6.4 (167) |
 | Two-level window ([§5.1](#51-frontier-and-admission)) | 0 / 300 | 0 | 0 / 300 | 0 |
+| The crawler's own `Frontier` and `Admission`, step 5 | 0 / 300 | 0 | 0 / 300 | 0 |
 
-The window never had to lower an item already in flight. Its crawl time relative to the first draft: median 1.065 and p95 1.255 on sparse sites; median 1.028 and p95 1.162 on denser ones.
+The window never had to lower an item already in flight. Its crawl time relative to the first draft: median 1.065 and p95 1.255 on sparse sites; median 1.028 and p95 1.162 on denser ones. The crawler's frontier, driven by the same event loop, took exactly the window's crawl time on all 600 sites; rerun on 2026-10-20 with it, the other rows were unchanged. `tests/unit/test_frontier.py` runs the simulation on 20 sites of 1,000 pages, and a hypothesis test checks the same property with retries and held 403s besides.
 
 **A.11 Concurrency laws** (`bench/limiter_sim.py`)
 
@@ -910,7 +931,7 @@ An event-driven simulation of 20,000 requests with a 20 ms round trip, over 3 se
 - **Small origin:** 16 workers at 50 ms per page, saturating at ~22 requests in flight.
 - **Throttling origin:** steady narrow pages, but a request that arrives while 20 others are being served is answered 429 at once, and sent again as soon as the limit allows.
 
-The guard + probe rows run the crawler's own class, `web_crawler.limiter.ConcurrencyLaw`. Its integer limit gives the float prototype's numbers but on the small origin, where the prototype's were 32.3–34.1 and 37–42.
+The guard + probe rows run the crawler's own class, `web_crawler.limiter.ConcurrencyLaw`. Its integer limit gives the float prototype's numbers but on the small origin, where the prototype's were 32.3–34.1 and 37–42. Rerun with step 5's code on 2026-10-20, every cell was the same.
 
 | Scenario | Law | Crawl time | × errors only | Mean limit | Queued in the server, 2nd half (ms/request) |
 |---|---|---|---|---|---|
@@ -1014,6 +1035,21 @@ The differences are rare symbols and vendor extensions, such as EUC-JP 0xA1C1, w
 - Over repeated runs of the same code, pages/s varied by about 5% and CPU per page by about 15 µs.
 - The coordinator's memory stays far below §7's 300 MB.
 - Step 4's robustness, measured the same way on 2026-10-20 in twelve 50,000-page crawls, six each, alternating with the code before it, three in each order: 1,048–1,113 pages/s against 994–1,095, 269–280 µs of coordinator CPU per page against 262–272 (medians 272 and 268), and 67–68 MiB against 66–67. The difference is within the runs' own spread. The rules admission adds cost 0.6 µs per new URL (A.16), and the retry, breaker and block-guard bookkeeping a few calls per page.
+- Step 5's limits and output, measured the same way on 2026-10-20 in six 50,000-page crawls, three each, alternating with step 4's code (main, this step, this step, main, main, this step): 1,071–1,114 pages/s against 1,085–1,110, 267–281 µs of coordinator CPU per page against 254–276 (medians 276 and 271), and 67.5–68.3 MiB against 68.0–68.2. The difference is within the runs' spread again. The engine alone, 20,000 tiny pages through the tests' fake transport, parsed inline, puts it at 0.7 µs per page: 40.1–40.8 µs against 39.3–39.9, medians of five in three alternating rounds. That is the time-to-first-byte histogram, the busiest second's count, the frontier's count of each depth's unfinished items, and the calls that log every request at `-vv`.
+
+**On GitHub's runners.** CI's performance job runs this crawl on each push to main, on `ubuntu-latest` runners of 4 vCPUs. Before its gates were set, ten runs on 2026-10-20, six of step 5's code and four of step 4's, and one more of the job itself:
+
+| Runner's processor | Runs | Pages/s | Coordinator CPU per page | Coordinator peak RSS |
+|---|---|---|---|---|
+| AMD EPYC 9V45 | 3 | 950–987 | 400–435 µs | 62–91 MiB |
+| AMD EPYC 7763 | 4 | 647–684 | 641–702 µs | 89–92 MiB |
+| Intel Xeon Platinum 8370C | 1 | 747 | 605 µs | 87 MiB |
+| Intel Xeon Platinum 8573C | 1 | 714 | 625 µs | 95 MiB |
+| AMD EPYC 9V74 | 2 | 626, 816 | 629, 476 µs | 63, 62 MiB |
+
+- The runner's processor makes the most difference, and two runs on the same model differed by 30%. Step 4's code and step 5's were within each other's spread on each processor. The server shares the runner's 4 vCPUs with the crawl, so the rounds' median time to first byte was 63–86 ms rather than the M5's 57.
+- Peak RSS fell in two groups, 62–64 MiB and 87–95 MiB, that don't follow the processor or the code.
+- The job fails if a page is lost, or below 470 pages/s, above 880 µs per page or above 120 MiB: a quarter beyond the worst of these runs. It flags a regression of a quarter or more on the slowest runners, and the runners themselves not at all; on the fastest, pages/s would have to halve, or CPU per page more than double. It isn't a required check, so a runner slower than any of these can't block a merge.
 
 **A.16 Admission's rules** (`bench/admission_bench.py`)
 
@@ -1023,5 +1059,8 @@ Admission checks a URL it hasn't seen against its rules once, however many pages
 |---|---|---|
 | robots.txt only, before step 4 | 0.51 µs per URL | 1.54 µs |
 | Trap rules, extension filter and robots.txt | 1.13 µs | 2.16 µs |
+| The same, with step 5's count of each depth's unfinished items | 1.17–1.18 µs | 2.20–2.21 µs |
 
 A first version cost 0.95 µs more rather than 0.6: it built a `Counter` of every path's segments, and read each path twice. The segment rule now counts them only for a path with more than three segments some of which repeat, and the extension filter reads the last segment straight from the URL.
+
+Most of the links a page hands over have been seen already, and admission drops each with a set lookup: 41–42 ns a link, 4.9–5.0 µs a page of 120. Under `--max-depth` it also looks up whether the link's item is still queued, at a greater depth, to lower it ([§5.1](#51-frontier-and-admission)): 86 ns a link, 10.3 µs a page, with half the items still queued, as in the middle of a crawl. Exactness needs it only under `--max-depth`, so only then is it done. The numbers are step 5's code, run twice, alternating with step 4's for the first table's rows.

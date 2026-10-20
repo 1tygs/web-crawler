@@ -67,11 +67,40 @@ jobs:
       - name: Add the coverage report to the job summary
         run: uv run coverage report --format=markdown >> "$GITHUB_STEP_SUMMARY"
 
+  # The image builds, and crawls a site, so that a Dependabot update of its base images is
+  # tested like any other change.
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: docker build --tag web-crawler:ci .
+      - name: Crawl a site from the image
+        run: |
+          mkdir site
+          printf '<!doctype html><a href="/a.html">a</a> <a href="/b.html">b</a>' > site/index.html
+          printf '<!doctype html><a href="/">home</a> <a href="/gone.html">gone</a>' > site/a.html
+          printf '<!doctype html><a href="/a.html">a</a>' > site/b.html
+          python3 -m http.server 8000 --bind 127.0.0.1 --directory site &
+          until curl --silent --output /dev/null http://127.0.0.1:8000/; do sleep 0.1; done
+          docker run --rm web-crawler:ci --version
+          docker run --rm --network host web-crawler:ci --format jsonl --include-errors \
+            http://127.0.0.1:8000/ > records.jsonl
+          cat records.jsonl
+          test "$(grep -c '"links"' records.jsonl)" = 3
+          grep -q '"url":"http://127.0.0.1:8000/gone.html","status":404' records.jsonl
+          # As any other user too: each parser process enters the working directory first.
+          docker run --rm --network host --user 4242 web-crawler:ci http://127.0.0.1:8000/ \
+            > records.txt
+          test "$(grep -c '^http' records.txt)" = 3
+
   # The one required status check. It fails unless every job above succeeded, including a
   # job that was skipped or cancelled, and its name stays the same when the jobs change.
   ci-ok:
     if: always()
-    needs: [lint, typecheck, test]
+    needs: [lint, typecheck, test, docker]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

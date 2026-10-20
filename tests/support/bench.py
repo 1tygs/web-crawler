@@ -38,6 +38,20 @@ def bfs(site: list[list[int]]) -> dict[int, int]:
     return cast(dict[int, int], _depth_sim.bfs(site))
 
 
+class DepthRun(NamedTuple):
+    fetched: set[int]  # the pages the crawl fetched
+    truth: set[int]  # the pages within --max-depth links of the home page
+
+
+def simulate_depth(seed: int, pages: int, branching: float, cross_links: int) -> DepthRun:
+    """One site of A.10's simulation (bench/depth_sim.py), crawled by the crawler's own
+    frontier with 32 fetches in flight, --max-depth through the middle of the site, and
+    heavy-tailed latencies."""
+    site, latencies, max_depth, truth = _depth_sim.scenario(seed, pages, branching, cross_links)
+    fetched, _, _ = _depth_sim.crawl(site, latencies, max_depth, 32, "crawler")
+    return DepthRun(fetched, truth)
+
+
 _limiter_sim = load("limiter_sim")
 
 LAWS = {

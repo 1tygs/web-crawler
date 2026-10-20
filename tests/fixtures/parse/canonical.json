@@ -1,0 +1,14 @@
+{
+  "about": "The canonical URL, for JSONL, is the first <link rel=canonical>, its rel in any case, that resolves: one that isn't a valid URL is skipped, and a fragment is stripped.",
+  "printed": [
+    "https://example.com/first",
+    "https://example.com/second",
+    "https://example.com/a"
+  ],
+  "crawled": [
+    "https://example.com/first",
+    "https://example.com/second",
+    "https://example.com/a"
+  ],
+  "canonical": "https://example.com/first"
+}

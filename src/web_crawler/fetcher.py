@@ -11,6 +11,7 @@ import asyncio
 import contextlib
 import dataclasses
 import enum
+import logging
 import random
 import time
 from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
@@ -40,6 +41,8 @@ from web_crawler.transport import Response, Transport, TransportError
 from web_crawler.types import CrawlItem, ErrorKind, ParseJob
 from web_crawler.urls import dedupe_key, strip_fragment
 
+log = logging.getLogger(__name__)
+
 MAX_REDIRECTS = 10
 # A response that isn't wanted is read to the end, so that its connection can be reused,
 # only when it's this small. A bigger one is cheaper to drop with its connection.
@@ -62,8 +65,13 @@ class Page:
 class NotPage:
     """A 2xx response that isn't HTML: counted, never parsed."""
 
-    url: str
     content_type: str | None
+    chain: tuple[str, ...]  # the URLs requested, in order; the last one's answer is this
+    status: int
+
+    @property
+    def url(self) -> str:
+        return self.chain[-1]
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +80,7 @@ class Claimed:
 
     url: str  # where the redirect led
     chain: tuple[str, ...]  # the URLs the item requested, in order
+    status: int  # the redirect's
 
 
 @dataclass(frozen=True, slots=True)
@@ -236,6 +245,7 @@ class Fetcher:
                     self._signals.answered(response.status, response.ttfb, issued)
                     outcome = await self._handle(response, tuple(chain), item)
             except TransportError as error:
+                log.debug("%s: %s", chain[-1], error)  # -vv: every request
                 self._signals.failed(error.kind, issued)
                 final = Final(str(error.kind), str(error), tuple(chain))
                 return _retry_or(final, classify(error.kind), item)
@@ -250,7 +260,7 @@ class Fetcher:
                 chain.append(target)
                 keys.add(key)
             elif hop is Hop.CLAIMED:
-                return Claimed(target, tuple(chain))
+                return Claimed(target, tuple(chain), status)
             else:
                 reason, why = _STOPPED[hop]
                 detail = f"HTTP {status} to {target}, {why}"
@@ -262,9 +272,12 @@ class Fetcher:
         concurrency limit doesn't count (DESIGN.md §5.3)."""
         try:
             async with self._transport.open(url) as response:
-                return response.status
-        except TransportError:
+                status = response.status
+        except TransportError as error:
+            log.debug("%s, a probe: %s", url, error)
             return None
+        log.debug("%s, a probe: HTTP %d", url, status)
+        return status
 
     async def _handle(
         self, response: Response, chain: tuple[str, ...], item: CrawlItem
@@ -273,6 +286,9 @@ class Fetcher:
         makes."""
         status = response.status
         self._stats.statuses[status] += 1
+        self._stats.ttfb.add(response.ttfb)
+        # -vv: every request.
+        log.debug("%s: HTTP %d, %.1f ms to first byte", response.url, status, response.ttfb * 1000)
         match triage(status, response.headers):
             case Triage.REDIRECT:
                 await _drain(response)
@@ -285,12 +301,12 @@ class Fetcher:
                 return _Redirect(status, target)
             case Triage.PAGE:
                 body, truncated = await response.read(self._max_page_bytes)
-                return _page(response, body, truncated)
+                return _page(response, body, truncated, chain, item.depth)
             case Triage.SNIFF:
-                return await self._sniff(response, chain)
+                return await self._sniff(response, chain, item.depth)
             case Triage.NOT_PAGE:
                 await _drain_if_small(response)
-                return NotPage(response.url, response.headers.get("Content-Type"))
+                return NotPage(response.headers.get("Content-Type"), chain, status)
             case Triage.FINAL:  # pragma: no branch  (the cases are exhaustive)
                 return await self._failed(response, chain, item)
 
@@ -307,7 +323,9 @@ class Fetcher:
         value = response.headers.get("Retry-After")
         return Retry(resume(item, chain), cls, final, parse_retry_after(value, self._wall_clock()))
 
-    async def _sniff(self, response: Response, chain: tuple[str, ...]) -> Page | NotPage | Final:
+    async def _sniff(
+        self, response: Response, chain: tuple[str, ...], depth: int
+    ) -> Page | NotPage | Final:
         """A 2xx response without a usable type: a page if its body starts as HTML does. The
         body is still compressed, so the start of it is decompressed to sniff."""
         start, more = await response.read(min(SNIFF_READ, self._max_page_bytes))
@@ -318,11 +336,11 @@ class Fetcher:
         if not sniff_html(header):
             if more:
                 await _drain_if_small(response)
-            return NotPage(response.url, response.headers.get("Content-Type"))
+            return NotPage(response.headers.get("Content-Type"), chain, response.status)
         rest, truncated = b"", False
         if more:
             rest, truncated = await response.read(self._max_page_bytes - len(start))
-        return _page(response, start + rest, truncated)
+        return _page(response, start + rest, truncated, chain, depth)
 
 
 @dataclass(frozen=True, slots=True)
@@ -424,6 +442,7 @@ class RobotsFetcher:
         try:
             async with self._transport.open(url) as response:
                 status = response.status
+                log.debug("%s: HTTP %d", url, status)
                 if status in SUCCESSFUL:
                     # RFC 9309's limit is on the file decompressed. As many compressed bytes
                     # hold at least that much of any file that compresses at all.
@@ -443,6 +462,7 @@ class RobotsFetcher:
                     return _Answer(status, location=strip_fragment(location))
                 return _Answer(status)
         except TransportError as error:
+            log.debug("%s: %s", url, error)
             return error
 
 
@@ -459,12 +479,19 @@ def _too_many_redirects(chain: tuple[str, ...], looped: bool, target: str, statu
     return Final("too many redirects", detail, chain, status)
 
 
-def _page(response: Response, body: bytes, truncated: bool) -> Page:
-    """The page in response, whose body, still compressed, has been read."""
+def _page(
+    response: Response, body: bytes, truncated: bool, chain: tuple[str, ...], depth: int
+) -> Page:
+    """The page in response, the answer to the last URL of chain, whose body, still
+    compressed, has been read."""
     headers = response.headers
     _, charset = parse_content_type(headers.get("Content-Type"))
     encoding = headers.get("Content-Encoding")
-    return Page(ParseJob(response.url, body, charset, truncated, encoding))
+    return Page(
+        ParseJob(
+            response.url, body, charset, truncated, encoding, depth, response.status, chain[:-1]
+        )
+    )
 
 
 async def _drain_if_small(response: Response) -> None:

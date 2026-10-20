@@ -2,7 +2,9 @@
 
 import asyncio
 import gzip
+import json
 import os
+import random
 import signal
 import sys
 import time
@@ -16,7 +18,7 @@ import brotli
 import pytest
 from aiohttp import web
 
-from tests.support.bench import make_site
+from tests.support.bench import bfs, make_site
 from tests.support.command import CRAWL, run, split_records
 from tests.support.graphs import expected_records, graph_site, href
 from tests.support.site import HTML, Handler, Resource, Site, page, redirect, unused_port
@@ -242,6 +244,27 @@ async def test_random_sites_match_breadth_first_ground_truth(
     assert max(Counter(site.targets()).values()) == 1  # no URL requested twice
 
 
+@pytest.mark.parametrize("seed", range(4))
+async def test_max_depth_matches_breadth_first_ground_truth(seed: int, parse_workers: int) -> None:
+    # Pages answer after random delays, so fetches complete in an order unlike the
+    # breadth-first one, and a page is often found first by a longer path: the crawl still
+    # prints exactly the pages within --max-depth links of the start.
+    graph = make_site(seed, pages=300, branching=3.0, cross_links=2)
+    depths = sorted(bfs(graph).values())
+    max_depth = depths[len(depths) // 2]  # through the middle of the site
+    rng = random.Random(seed)
+    delays = {node: rng.choice([0.0, 0.0, 0.002, 0.02]) for node in range(len(graph))}
+    async with Site({}) as site:
+        site.resources = graph_site(site.origin, graph, delays=delays)
+        sink = MemorySink()
+        cfg = Config(start_url=site.url(), max_depth=max_depth, parse_workers=parse_workers)
+        report = await crawl(cfg, sink)
+    assert report.exit_code is ExitCode.OK
+    assert sorted(sink.records) == expected_records(site.origin, graph, max_depth=max_depth)
+    assert max(Counter(site.targets()).values()) == 1  # no URL requested twice
+    assert report.rejected["depth limit"] > 0
+
+
 async def test_the_crawl_command_prints_the_ground_truth(parse_workers: int) -> None:
     graph = make_site(7, pages=200, branching=3.0, cross_links=2)
     async with Site({}) as site:
@@ -266,6 +289,71 @@ async def test_python_dash_m_crawls_the_hand_built_site(parse_workers: int) -> N
     assert (
         "not printed: not HTML (1), HTTP 404 (1), redirect to a URL already claimed (1)" in stderr
     )
+
+
+async def test_the_crawl_command_writes_jsonl_with_errors_to_a_file(
+    tmp_path: Path, parse_workers: int
+) -> None:
+    other_port = unused_port()
+    out = tmp_path / "crawl.jsonl"
+    async with Site({}) as site:
+        site.resources = hand_built(site.port, other_port)
+        code, stdout, stderr = await run(
+            CRAWL,
+            "--format",
+            "jsonl",
+            "--include-errors",
+            "-o",
+            str(out),
+            "--parse-workers",
+            str(parse_workers),
+            site.url(),
+        )
+    assert code == 0
+    assert stdout == b""
+    assert "Traceback" not in stderr
+    records = {r["url"]: r for r in map(json.loads, out.read_bytes().splitlines())}
+    o = site.origin
+    # The same pages as in text, with the same links, and their depths.
+    expected = {}
+    for record in hand_built_records(site.port, other_port):
+        url, *links = record.decode().split("\n")[:-2]
+        expected[url] = [link.removeprefix("  ") for link in links]
+    pages = {url: r for url, r in records.items() if "links" in r}
+    assert {url: r["links"] for url, r in pages.items()} == expected
+    assert {url: r["depth"] for url, r in pages.items()} == {
+        f"{o}/": 0,
+        f"{o}/a": 1,
+        f"{o}/b": 1,
+        f"{o}/c?x=%2f": 1,
+        f"{o}/new": 1,
+        f"{o}/~user/": 1,
+        f"{o}/a/deeper/": 2,
+        f"{o}/cycle": 3,
+    }
+    # /new was reached by redirect, from /old or /also-old, whichever answered first; the
+    # other's redirect found it claimed.
+    [first] = pages[f"{o}/new"]["redirected_from"]
+    [second] = {f"{o}/old", f"{o}/also-old"} - {first}
+    errors = {url: r for url, r in records.items() if "error" in r}
+    assert errors == {
+        f"{o}/download": {
+            "url": f"{o}/download",
+            "status": 200,
+            "depth": 1,
+            "error": "not HTML",
+            "content_type": "application/octet-stream",
+        },
+        f"{o}/missing": {"url": f"{o}/missing", "status": 404, "depth": 1, "error": "HTTP 404"},
+        second: {
+            "url": second,
+            "status": 302 if second.endswith("also-old") else 301,
+            "depth": 1,
+            "error": "redirect to a URL already claimed",
+            "location": f"{o}/new",
+        },
+    }
+    assert len(records) == len(out.read_bytes().splitlines())  # one record a URL
 
 
 async def test_follows_a_cookie_gate_back_to_the_page(parse_workers: int) -> None:

@@ -1,6 +1,8 @@
 import asyncio
 import itertools
+import json
 import logging
+import re
 import time
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
@@ -13,12 +15,22 @@ from tests.support.jitter import Fixed, Lowest
 from web_crawler import engine
 from web_crawler.config import Config
 from web_crawler.engine import CrawlReport
-from web_crawler.limiter import BLOCKED_AFTER, OPENS_AFTER, CircuitBreaker, ConcurrencyLaw
+from web_crawler.fetcher import AdmissionHops, Fetcher
+from web_crawler.frontier import Admission, Frontier
+from web_crawler.limiter import (
+    BLOCKED_AFTER,
+    OPENS_AFTER,
+    BlockGuard,
+    CircuitBreaker,
+    ConcurrencyLaw,
+)
 from web_crawler.limiter import START as INITIAL_LIMIT
 from web_crawler.output import MemorySink, Sink
-from web_crawler.pool import InlineParser
+from web_crawler.pool import InlineParser, ParseCrashed
+from web_crawler.stats import Stats
 from web_crawler.transport import TransportError
-from web_crawler.types import ErrorKind, ExitCode, ParseJob, ParseResult, WorkerContext
+from web_crawler.types import CrawlItem, ErrorKind, ExitCode, ParseJob, ParseResult, WorkerContext
+from web_crawler.urls import Scope
 
 START = "https://example.com/"
 
@@ -160,13 +172,182 @@ def test_samples_are_responses_below_500_other_than_429(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     caplog.set_level(logging.INFO, "web_crawler.engine")
-    limiter = engine._Limiter(ConcurrencyLaw(64), CircuitBreaker(), clock=lambda: 1.0)
+    limiter = engine._Limiter(ConcurrencyLaw(64), CircuitBreaker(), lambda: 1.0, Stats(0.0))
     for status in (500, 502, 504):  # not samples, slow as they are
         limiter.answered(status, 9.0, issued_at=0.0)
     for status in (200, 301, 404, 410, 499, 200, 200, 200):
         limiter.answered(status, 0.1, issued_at=0.0)
     # The eight samples made the first round, which measured the server at low load.
     assert caplog.messages == ["concurrency limit: base: 8 -> 8, median 100.0 ms, base 100.0 ms"]
+
+
+def test_v_logs_the_decisions_that_change_something(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # -v shows each decision that changes the limit or the law's state; a round that grows
+    # nothing at the ceiling, and holds after the first in a run, are for -vv.
+    caplog.set_level(logging.DEBUG, "web_crawler.engine")
+    stats = Stats(0.0)
+    limiter = engine._Limiter(ConcurrencyLaw(8), CircuitBreaker(), lambda: 1.0, stats)
+
+    def round_of(ttfb: float) -> None:
+        for _ in range(limiter._law.limit):
+            limiter.answered(200, ttfb, issued_at=0.0)
+
+    for ttfb in [0.1, 0.1, 0.2, 0.1, *[0.2] * 10]:
+        round_of(ttfb)
+    logged = [(r.levelname, r.getMessage().split(", ")[0]) for r in caplog.records]
+    assert logged == [
+        ("INFO", "concurrency limit: base: 8 -> 8"),
+        ("DEBUG", "concurrency limit: grow: 8 -> 8"),  # slow start, at the ceiling
+        ("INFO", "concurrency limit: slow start exit: 8 -> 4"),
+        ("INFO", "concurrency limit: grow: 4 -> 5"),
+        ("INFO", "concurrency limit: hold: 5 -> 5"),
+        *[("DEBUG", "concurrency limit: hold: 5 -> 5")] * 8,
+        ("INFO", "concurrency limit: probe: 5 -> 2"),  # the tenth held round
+    ]
+    assert stats.limits == (2, 8, 2)
+
+
+async def test_v_logs_what_isnt_printed_and_the_first_urls_each_rule_skips(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG, "web_crawler.engine")
+    private = [f"/private/{n}" for n in range(4)]
+    replies = {
+        ROBOTS: robots("User-agent: *\nDisallow: /private\n"),
+        START: html("/page", "/old", "/missing", "/image", *private),
+    } | chain(
+        ("/page", html()),
+        ("/old", Reply(301, {"Location": "/page"}, delay=0.01)),
+        ("/missing", Reply(404, HTML)),
+        ("/image", Reply(headers={"Content-Type": "image/png"})),
+    )
+    await crawl(Config(start_url=START), MemorySink(), transport=FakeTransport(replies))
+    logged = {(r.levelname, r.getMessage()) for r in caplog.records}
+    o = "https://example.com"
+    assert {
+        ("INFO", f"{o}/missing isn't printed: HTTP 404"),
+        ("DEBUG", f"{o}/image isn't printed: it isn't HTML (image/png)"),
+        ("DEBUG", f"{o}/old isn't printed: it redirects to {o}/page, printed for another link"),
+        *(("INFO", f"not crawling {o}/private/{n}: robots.txt") for n in range(3)),
+        ("DEBUG", f"not crawling {o}/private/3: robots.txt"),
+    } <= logged
+
+
+class Lines:
+    """A progress line's destination that keeps every line shown."""
+
+    def __init__(self) -> None:
+        self.shown: list[str] = []
+        self.cleared = False
+
+    def show(self, line: str) -> None:
+        assert not self.cleared
+        self.shown.append(line)
+
+    def clear(self) -> None:
+        self.cleared = True
+
+
+async def test_the_progress_line_is_redrawn_four_times_a_second() -> None:
+    lines = Lines()
+    transport = FakeTransport(fan_out(pages=24, delay=0.5))
+    report = await crawl(Config(start_url=START), MemorySink(), transport=transport, progress=lines)
+    assert report.stats.pages == 25
+    assert lines.cleared
+    # 24 pages, 8 then 16 at a time, of 0.5 s each: about a second, with a line each 0.25 s.
+    assert 3 <= len(lines.shown) <= 7
+    # The first as the start page goes to be parsed, the next 0.25 s later.
+    assert lines.shown[0] == (
+        "pages 0 · 0/s · in-flight 0/8 · queued 0 · retrying 0 · errors 0 · 0 B/s"
+    )
+    assert re.fullmatch(
+        r"pages 1 · \d+/s · in-flight 8/8 · queued 16 · retrying 0 · errors 0 · [\d.]+ k?B/s",
+        lines.shown[1],
+    )
+    assert all(line.startswith("pages ") for line in lines.shown)
+
+
+async def test_the_progress_line_says_why_the_crawl_is_paused() -> None:
+    lines = Lines()
+    transport = Outage(fan_out(pages=40, delay=0.0), failing=1)
+    cfg = Config(start_url=START, first_probe=0.6)
+    await crawl(cfg, MemorySink(), transport=transport, rng=Lowest(), progress=lines)
+    assert any(line.endswith(" · paused: the host isn't answering") for line in lines.shown)
+
+
+def dispatcher(clock: Callable[[], float]) -> engine._Dispatcher:
+    """A dispatcher, before it runs, with a parse gateway of two workers."""
+    stats, frontier = Stats(0.0), Frontier()
+    admission = Admission(frontier, Scope.for_url(START))
+    made = engine._Dispatcher(
+        fetcher=Fetcher(FakeTransport({}), 1 << 20, stats),
+        hops=AdmissionHops(admission),
+        frontier=frontier,
+        admission=admission,
+        sink=MemorySink(),
+        stats=stats,
+        not_printed=engine._NotPrinted(stats, None),
+        all_urls=False,
+        format="text",
+        max_bytes=1 << 20,
+        make_parser=Stalled,
+        law=ConcurrencyLaw(64),
+        breaker=CircuitBreaker(),
+        guard=BlockGuard(),
+        max_concurrency=64,
+        max_rps=None,
+        clock=clock,
+        max_pages=None,
+        robots=None,
+        product="web-crawler",
+        robots_refresh=3600.0,
+        retries=3,
+        rng=Lowest(),
+    )
+    made._parser = Stalled(WorkerContext((START,), 1 << 20))
+    return made
+
+
+async def test_the_progress_line_counts_failures_and_workers_at_work() -> None:
+    # Its rates are over the snapshots of the last second; a redirect to a URL another item
+    # prints isn't an error; workers at work are parses in progress, as far as there are
+    # workers.
+    times = iter([10.0, 10.5])
+    made = dispatcher(lambda: next(times))
+    made.stats.pages, made.stats.body_bytes = 7, 1000
+    made.stats.failures.update({"HTTP 404": 2, "redirect to a URL already claimed": 5})
+    made._requests = 3
+    parses = [asyncio.create_task(asyncio.sleep(1)) for _ in range(3)]
+    made._parsing.update(parses)
+    assert made.snapshot().line() == (
+        "pages 7 · 0/s · in-flight 3/8 · queued 0 · retrying 0 · errors 2 · 0 B/s · workers 2/2"
+    )
+    made.stats.pages, made.stats.body_bytes = 17, 6000
+    made._gate.pause(12.5)
+    assert made.snapshot().line() == (
+        "pages 17 · 20/s · in-flight 3/8 · queued 0 · retrying 0 · errors 2 · 10.0 kB/s · "
+        "workers 2/2 · paused: Retry-After, 2 s to go"
+    )
+    for parse in parses:
+        parse.cancel()
+
+
+def test_the_progress_line_says_when_the_crawl_waits_out_a_block() -> None:
+    made = dispatcher(lambda: 0.0)
+    for n in range(BLOCKED_AFTER):
+        made.guard.forbidden(CrawlItem(f"{START}{n}", f"{START}{n}", 1), 0.0, 0.0)
+    assert made.snapshot().paused == "refused with 403s, as a block would be"
+
+
+async def test_the_report_has_the_crawlers_peak_rss_and_the_limits_range() -> None:
+    transport = FakeTransport(fan_out(pages=40, delay=0.01))
+    report = await crawl(Config(start_url=START), MemorySink(), transport=transport)
+    assert report.peak_rss is not None
+    assert report.peak_rss > 10 << 20
+    assert "\npeak RSS: " in report.summary
+    assert "\nconcurrency limit: 8 to " in report.summary
 
 
 class Times(FakeTransport):
@@ -1055,6 +1236,244 @@ async def test_a_page_over_the_size_cap_is_parsed_as_far_as_it_got() -> None:
     assert pages(transport) == [START, "https://example.com/big", "https://example.com/near"]
     assert report.stats.truncated == 1
     assert ", 1 cut short" in report.summary
+
+
+def chain(*steps: tuple[str, Answer | list[Answer]]) -> dict[str, Answer | list[Answer]]:
+    return {f"https://example.com{path}": answer for path, answer in steps}
+
+
+async def test_max_depth_crawls_only_pages_within_n_links() -> None:
+    replies = {START: html("/1", "/1b")} | chain(
+        ("/1", html("/2")), ("/1b", html("/2")), ("/2", html("/3", "/3b")), ("/3", html())
+    )
+    transport, sink = FakeTransport(replies), MemorySink()
+    report = await crawl(Config(start_url=START, max_depth=2), sink, transport=transport)
+    assert report.exit_code is ExitCode.OK
+    assert sorted(pages(transport)) == [
+        START,
+        *(f"https://example.com/{p}" for p in ["1", "1b", "2"]),
+    ]
+    assert len(sink.records) == 4
+    assert report.unique_urls == 6  # /3 and /3b were found, if not crawled
+    assert report.rejected == {"depth limit": 2}
+    assert report.examples == {"depth limit": ["https://example.com/3", "https://example.com/3b"]}
+    assert "not crawled: depth limit (2, such as https://example.com/3)" in report.summary
+
+
+async def test_max_depth_0_crawls_the_start_url_alone() -> None:
+    transport = FakeTransport({START: html("/a", "/b")})
+    report = await crawl(Config(start_url=START, max_depth=0), MemorySink(), transport=transport)
+    assert pages(transport) == [START]
+    assert report.stats.pages == 1
+    assert report.rejected == {"depth limit": 2}
+
+
+def shortcut(slow: Answer | list[Answer]) -> dict[str, Answer | list[Answer]]:
+    """A site where /x is 3 links from the start through /fast and /m, and 2 through /slow,
+    which answers late; /y, on /x, is 3 links from the start at most."""
+    return {START: html("/fast", "/slow")} | chain(
+        ("/fast", html("/m")),
+        ("/m", html("/x")),
+        ("/slow", slow),
+        ("/x", html("/y")),
+        ("/y", html()),
+    )
+
+
+@pytest.mark.parametrize(
+    "slow",
+    [html("/x", delay=0.05), [ErrorKind.RESET, html("/x")]],
+    ids=["a slow page", "a page tried again"],
+)
+async def test_max_depth_waits_for_shorter_paths(slow: Answer | list[Answer]) -> None:
+    # /x is found 3 links from the start first, while /slow, which links to it, is still
+    # to finish. Dispatched then, /x would put /y 4 links away, beyond the limit; the window
+    # holds it back until /slow finishes, which lowers it to 2, so /y is crawled.
+    transport = FakeTransport(shortcut(slow))
+    cfg = Config(start_url=START, max_depth=3)
+    report = await crawl(cfg, MemorySink(), transport=transport, rng=Fixed(0.2))
+    assert "https://example.com/y" in pages(transport)
+    assert report.stats.pages == 6
+    assert not report.rejected
+
+
+async def test_without_max_depth_a_page_found_by_a_longer_path_keeps_that_depth() -> None:
+    transport = FakeTransport(shortcut(html("/x", delay=0.05)))
+    report = await crawl(Config(start_url=START), MemorySink(), transport=transport)
+    assert report.stats.pages == 6
+    assert pages(transport).index("https://example.com/x") < pages(transport).index(
+        "https://example.com/slow"
+    )
+
+
+async def test_max_depth_waits_for_403s_held_until_their_run_is_settled() -> None:
+    # /forbidden's 403 is held, and while it is, the window holds back /deep, 3 links away.
+    # Nothing else can settle the run, so the 403 is final, and the window moves on.
+    replies = {START: html("/a", "/forbidden")} | chain(
+        ("/a", html("/b")),
+        ("/b", html("/deep")),
+        ("/forbidden", Reply(403, HTML, delay=0.05)),
+        ("/deep", html()),
+    )
+    transport = FakeTransport(replies)
+    async with asyncio.timeout(10):  # a crawl that waits on the 403 for ever fails
+        report = await crawl(
+            Config(start_url=START, max_depth=3), MemorySink(), transport=transport
+        )
+    assert report.exit_code is ExitCode.OK
+    assert pages(transport)[-1] == "https://example.com/deep"
+    assert report.stats.pages == 4
+    assert report.stats.failures == {"HTTP 403": 1}
+
+
+def records(sink: MemorySink) -> dict[str, dict[str, object]]:
+    """The JSONL records a crawl wrote, by URL: one each."""
+    parsed = [json.loads(record) for record in sink.records]
+    assert all(record.endswith(b"\n") and record.count(b"\n") == 1 for record in sink.records)
+    by_url = {record["url"]: record for record in parsed}
+    assert len(by_url) == len(parsed)
+    return by_url
+
+
+async def test_jsonl_records_have_each_pages_status_depth_and_redirects() -> None:
+    replies = {START: html("/a", "https://elsewhere.org/")} | chain(
+        ("/a", Reply(301, {"Location": "/b"})),
+        ("/b", Reply(203, HTML, b'<link rel=canonical href=/b><a href="/">home</a>')),
+    )
+    sink = MemorySink()
+    cfg = Config(start_url=START, format="jsonl")
+    report = await crawl(cfg, sink, transport=FakeTransport(replies))
+    assert report.exit_code is ExitCode.OK
+    assert records(sink) == {
+        START: {
+            "url": START,
+            "status": 200,
+            "depth": 0,
+            "links": ["https://example.com/a", "https://elsewhere.org/"],
+        },
+        "https://example.com/b": {
+            "url": "https://example.com/b",
+            "status": 203,
+            "depth": 1,
+            "links": ["https://example.com/b", START],
+            "redirected_from": ["https://example.com/a"],
+            "canonical": "https://example.com/b",
+        },
+    }
+
+
+async def test_include_errors_writes_a_record_for_every_item_without_a_page() -> None:
+    corrupt = Reply(headers=HTML | {"Content-Encoding": "br"}, body=b"<a href=/x>")
+    replies = {
+        START: html(
+            "/page", "/old", "/missing", "/image", "/down", "/off", "/corrupt", "/forbidden"
+        )
+    } | chain(
+        ("/page", html()),
+        ("/old", Reply(301, {"Location": "/page"}, delay=0.01)),
+        ("/missing", Reply(404, HTML)),
+        ("/image", Reply(headers={"Content-Type": "image/png"})),
+        ("/down", ErrorKind.RESET),
+        ("/off", Reply(302, {"Location": "https://elsewhere.org/"})),
+        ("/corrupt", corrupt),
+        ("/forbidden", Reply(403, HTML)),
+    )
+    sink = MemorySink()
+    cfg = Config(start_url=START, format="jsonl", include_errors=True, retries=1)
+    report = await crawl(cfg, sink, transport=FakeTransport(replies), rng=Lowest())
+    assert report.exit_code is ExitCode.OK
+    errors = {url: record for url, record in records(sink).items() if "error" in record}
+    o = "https://example.com"
+    assert errors == {
+        f"{o}/old": {
+            "url": f"{o}/old",
+            "status": 301,
+            "depth": 1,
+            "error": "redirect to a URL already claimed",
+            "location": f"{o}/page",
+        },
+        f"{o}/missing": {"url": f"{o}/missing", "status": 404, "depth": 1, "error": "HTTP 404"},
+        f"{o}/image": {
+            "url": f"{o}/image",
+            "status": 200,
+            "depth": 1,
+            "error": "not HTML",
+            "content_type": "image/png",
+        },
+        f"{o}/down": {
+            "url": f"{o}/down",
+            "depth": 1,
+            "error": "reset",
+            "detail": "reset: scripted",
+        },
+        f"{o}/off": {
+            "url": f"{o}/off",
+            "status": 302,
+            "depth": 1,
+            "error": "redirect out of scope",
+            "detail": "HTTP 302 to https://elsewhere.org/, outside the crawl's scope",
+            "location": "https://elsewhere.org/",
+        },
+        f"{o}/corrupt": {
+            "url": f"{o}/corrupt",
+            "status": 200,
+            "depth": 1,
+            "error": "bad content-encoding",
+        },
+        f"{o}/forbidden": {
+            "url": f"{o}/forbidden",
+            "status": 403,
+            "depth": 1,
+            "error": "HTTP 403",
+        },
+    }
+    # Every item has a record: a page's, or one saying why there's none.
+    assert len(sink.records) == report.stats.pages + sum(report.stats.failures.values()) + 1
+
+
+async def test_include_errors_records_held_403s_and_crashed_parses() -> None:
+    class Crashing(InlineParser):
+        async def parse(self, job: ParseJob) -> ParseResult:
+            if job.url.endswith("/crash"):
+                raise ParseCrashed(job.url)
+            return await super().parse(job)
+
+    replies = {START: html("/old", "/crash")} | chain(
+        ("/old", Reply(301, {"Location": "/forbidden"})),
+        ("/forbidden", Reply(403, HTML, delay=0.01)),
+        ("/crash", html()),
+    )
+    sink = MemorySink()
+    cfg = Config(start_url=START, format="jsonl", include_errors=True)
+    report = await engine.crawl(cfg, sink, transport=FakeTransport(replies), parser=Crashing)
+    assert report.stats.failures == {"HTTP 403": 1, "parse crashed": 1}
+    errors = [record for record in records(sink).values() if "error" in record]
+    assert errors == [
+        {"url": f"{START}crash", "status": 200, "depth": 1, "error": "parse crashed"},
+        {  # held until nothing else could settle its run, then final
+            "url": f"{START}forbidden",
+            "status": 403,
+            "depth": 1,
+            "error": "HTTP 403",
+            "redirected_from": [f"{START}old"],
+        },
+    ]
+
+
+async def test_include_errors_records_a_start_url_that_cant_start() -> None:
+    sink = MemorySink()
+    cfg = Config(start_url=START, format="jsonl", include_errors=True)
+    report = await crawl(cfg, sink, transport=FakeTransport({START: Reply(404, HTML)}))
+    assert report.exit_code is ExitCode.CANNOT_START
+    assert records(sink) == {START: {"url": START, "status": 404, "depth": 0, "error": "HTTP 404"}}
+
+
+async def test_without_include_errors_only_pages_have_records() -> None:
+    replies = {START: html("/missing")}
+    sink = MemorySink()
+    cfg = Config(start_url=START, format="jsonl")
+    await crawl(cfg, sink, transport=FakeTransport(replies))
+    assert list(records(sink)) == [START]
 
 
 async def test_records_stream_in_the_order_pages_complete() -> None:

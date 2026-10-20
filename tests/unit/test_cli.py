@@ -1,14 +1,18 @@
 import importlib.metadata
+import io
+import logging
 import subprocess
 import sys
+from pathlib import Path
 from typing import NoReturn
 
 import pytest
 
 import web_crawler
-from web_crawler.cli import main, parse_args
+from web_crawler.cli import TIP, _ProgressLine, build_parser, main, parse_args
 from web_crawler.config import Config
 from web_crawler.engine import CrawlReport
+from web_crawler.output import Sink
 from web_crawler.stats import Stats
 from web_crawler.types import ExitCode
 
@@ -53,6 +57,79 @@ def test_max_pages_below_1_is_a_usage_error(capsys: pytest.CaptureFixture[str]) 
         parse_args(["https://example.com/", "--max-pages", "0"])
     assert exit_info.value.code == 2
     assert "max_pages must be at least 1, not 0" in capsys.readouterr().err
+
+
+def test_max_depth() -> None:
+    assert parse_args(["https://example.com/", "--max-depth", "2"]).max_depth == 2
+    assert parse_args(["https://example.com/", "--max-depth", "0"]).max_depth == 0
+    assert parse_args(["https://example.com/"]).max_depth is None
+
+
+def test_max_depth_below_0_is_a_usage_error(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        parse_args(["https://example.com/", "--max-depth", "-1"])
+    assert exit_info.value.code == 2
+    assert "max_depth must be at least 0, not -1" in capsys.readouterr().err
+
+
+def test_output_options() -> None:
+    cfg = parse_args(["https://example.com/", "--format", "jsonl", "--include-errors"])
+    assert (cfg.format, cfg.include_errors) == ("jsonl", True)
+    cfg = parse_args(["https://example.com/", "-o", "out.txt"])
+    assert (cfg.format, cfg.include_errors) == ("text", False)
+
+
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        (["--format", "xml"], "argument --format: invalid choice: 'xml'"),
+        (["--include-errors"], "include_errors needs format jsonl"),
+    ],
+)
+def test_output_options_that_dont_fit_are_usage_errors(
+    argv: list[str], message: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        parse_args(["https://example.com/", *argv])
+    assert exit_info.value.code == 2
+    assert message in capsys.readouterr().err
+
+
+async def _two_records(cfg: Config, sink: Sink, **_: object) -> CrawlReport:
+    sink.start(lambda: None, lambda: None)
+    sink.write(b"first\n\n")
+    sink.write(b"second\n\n")
+    sink.close()
+    return CrawlReport(ExitCode.OK, Stats(started=0.0, pages=2), unique_urls=2, finished=1.0)
+
+
+@pytest.mark.parametrize("option", ["-o", "--output"])
+def test_output_goes_to_a_file(
+    option: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    out = tmp_path / "records.txt"
+    out.write_bytes(b"what was there before")
+    monkeypatch.setattr("web_crawler.cli.crawl", _two_records)
+    assert main(["https://example.com/", option, str(out)]) == ExitCode.OK
+    assert out.read_bytes() == b"first\n\nsecond\n\n"  # replaced
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("2 pages in 1.0 s")
+
+
+def test_an_output_file_that_cant_be_written_is_a_usage_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr("web_crawler.cli.crawl", _two_records)
+    with pytest.raises(SystemExit) as exit_info:
+        main(["https://example.com/", "-o", str(tmp_path / "missing" / "records.txt")])
+    assert exit_info.value.code == 2
+    assert f"can't write to {tmp_path}/missing/records.txt: No such file or directory" in (
+        capsys.readouterr().err
+    )
 
 
 def test_speed_options() -> None:
@@ -164,8 +241,9 @@ def test_help_exits_zero(capsys: pytest.CaptureFixture[str]) -> None:
     assert exit_info.value.code == 0
     usage = " ".join(capsys.readouterr().out.split())  # however the terminal's width wraps it
     assert usage.startswith(
-        "usage: crawl [-h] [--all-urls] [--max-pages N] [--max-concurrency N] [--max-rps R] "
-        "[--parse-workers N] [--timeout S] [--max-page-bytes N] [--retries N] "
+        "usage: crawl [-h] [--all-urls] [--max-pages N] [--max-depth N] "
+        "[--format {text,jsonl}] [--include-errors] [-o FILE] [--max-concurrency N] "
+        "[--max-rps R] [--parse-workers N] [--timeout S] [--max-page-bytes N] [--retries N] "
         "[--no-skip-extensions] [--ignore-robots]"
     )
 
@@ -174,7 +252,7 @@ def test_help_exits_zero(capsys: pytest.CaptureFixture[str]) -> None:
     ("argv", "message"),
     [
         ([], "the following arguments are required: URL"),
-        (["https://example.com/", "--max-dept", "2"], "unrecognized arguments: --max-dept 2"),
+        (["https://example.com/", "--max-deph", "2"], "unrecognized arguments: --max-deph 2"),
         (["https://a.example/", "https://b.example/"], "unrecognized arguments"),
     ],
 )
@@ -229,3 +307,122 @@ def test_ctrl_c_before_the_crawl_handles_it_exits_130(monkeypatch: pytest.Monkey
 
     monkeypatch.setattr("web_crawler.cli.crawl", interrupted)
     assert main(["https://example.com/"]) == ExitCode.INTERRUPTED
+
+
+@pytest.mark.parametrize(
+    ("argv", "verbose", "quiet"),
+    [([], 0, False), (["-v"], 1, False), (["-vv"], 2, False), (["-q"], 0, True)],
+)
+def test_verbosity(argv: list[str], verbose: int, quiet: bool) -> None:
+    args = build_parser().parse_args(["https://example.com/", *argv])
+    assert (args.verbose, args.quiet) == (verbose, quiet)
+
+
+def test_verbose_and_quiet_together_are_a_usage_error(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        parse_args(["https://example.com/", "-v", "-q"])
+    assert exit_info.value.code == 2
+    assert "argument -q/--quiet: not allowed with argument -v/--verbose" in capsys.readouterr().err
+
+
+class Terminal(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
+def logging_crawl(seen: dict[str, object]) -> object:
+    async def crawl(cfg: Config, sink: Sink, **kwargs: object) -> CrawlReport:
+        seen.update(kwargs)
+        log = logging.getLogger("web_crawler.engine")
+        log.info("an info")
+        log.debug("a debug")
+        log.warning("a warning")
+        logging.getLogger("aiohttp").info("another library's info")
+        sink.start(lambda: None, lambda: None)
+        sink.close()
+        return CrawlReport(ExitCode.OK, Stats(started=0.0, pages=1), unique_urls=1, finished=1.0)
+
+    return crawl
+
+
+@pytest.mark.parametrize(
+    ("argv", "logged"),
+    [
+        ([], ["a warning"]),
+        (["-v"], ["an info", "a warning"]),
+        (["-vv"], ["an info", "a debug", "a warning"]),
+        (["-q"], []),
+    ],
+)
+def test_verbosity_sets_what_is_logged(
+    argv: list[str], logged: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stderr = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", stderr)
+    monkeypatch.setattr("web_crawler.cli.crawl", logging_crawl({}))
+    before = logging.getLogger().level, logging.getLogger("web_crawler").level
+    assert main(["https://example.com/", *argv]) == ExitCode.OK
+    lines = stderr.getvalue().splitlines()
+    assert [line.removeprefix("crawl: ") for line in lines if line.startswith("crawl: ")] == logged
+    assert lines[-1].startswith("1 page in") if "-q" not in argv else lines == []
+    # As it was, after.
+    assert (logging.getLogger().level, logging.getLogger("web_crawler").level) == before
+
+
+def test_a_terminal_shows_the_progress_line_when_records_go_elsewhere(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    seen: dict[str, object] = {}
+    monkeypatch.setattr(sys, "stderr", Terminal())
+    monkeypatch.setattr("web_crawler.cli.crawl", logging_crawl(seen))
+    main(["https://example.com/", "-o", str(tmp_path / "out")])
+    assert isinstance(seen["progress"], _ProgressLine)
+    main(["https://example.com/", "-q", "-o", str(tmp_path / "out")])
+    assert seen["progress"] is None
+
+
+def test_records_on_the_terminal_get_a_tip_instead_of_the_progress_line(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, object] = {}
+    stderr = Terminal()
+    monkeypatch.setattr(sys, "stderr", stderr)
+    monkeypatch.setattr(sys, "stdout", Terminal())
+    monkeypatch.setattr(sys.stdout, "buffer", io.BytesIO(), raising=False)
+    monkeypatch.setattr("web_crawler.cli.crawl", logging_crawl(seen))
+    main(["https://example.com/"])
+    assert seen["progress"] is None
+    assert stderr.getvalue().endswith(f"1 unique in-scope URL\n{TIP}\n")
+
+
+def test_the_progress_line_is_redrawn_in_place() -> None:
+    stream = io.StringIO()
+    line = _ProgressLine(stream)
+    line.show("pages 1")
+    line.show("pages 2")
+    assert stream.getvalue() == "\rpages 1\x1b[K\rpages 2\x1b[K"
+
+
+def test_a_log_record_takes_the_progress_line_away_and_it_comes_back_below() -> None:
+    stream = io.StringIO()
+    line = _ProgressLine(stream)
+    line.setFormatter(logging.Formatter("crawl: %(message)s"))
+    line.show("pages 1")
+    line.handle(logging.makeLogRecord({"msg": "a warning", "levelno": logging.WARNING}))
+    assert stream.getvalue() == "\rpages 1\x1b[K\r\x1b[Kcrawl: a warning\n\rpages 1\x1b[K"
+
+
+def test_once_cleared_the_progress_line_stays_away() -> None:
+    stream = io.StringIO()
+    line = _ProgressLine(stream)
+    line.show("pages 1")
+    line.clear()
+    line.show("pages 2")
+    line.handle(logging.makeLogRecord({"msg": "a warning", "levelno": logging.WARNING}))
+    assert stream.getvalue() == "\rpages 1\x1b[K\r\x1b[Ka warning\n"
+
+
+def test_the_progress_line_fits_the_terminal() -> None:
+    stream = io.StringIO()  # with no terminal behind it, 80 columns
+    _ProgressLine(stream).show("x" * 100)
+    assert stream.getvalue() == "\r" + "x" * 79 + "\x1b[K"

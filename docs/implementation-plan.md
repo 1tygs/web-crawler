@@ -1,12 +1,12 @@
 # web-crawler v1: implementation plan
 
-**Status:** proposed · **Date:** 2026-10-20 · **Implements:** [DESIGN.md](../DESIGN.md) §15 (v1) · **Lands as:** five stacked PRs, one per DESIGN §15 step
+**Status:** done: v1 is built · **Date:** 2026-10-20 · **Implements:** [DESIGN.md](../DESIGN.md) §15 (v1) · **Landed as:** five PRs, one per DESIGN §15 step (#2, #4, #7, #8, #9), and #5 for `--max-pages` and a clean Ctrl-C
 
 "DESIGN §n" refers to DESIGN.md; a bare "§n" refers to this plan.
 
 ## Context
 
-[DESIGN.md](../DESIGN.md) (reviewed, with [ADR-001](adr/001-concurrency-control.md)) specifies a fast, accurate, polite single-host crawler; nothing is implemented yet and the README still says "design stage". This plan turns the design into a build. It fixes the module boundaries and contracts, the data structures and algorithms each module owns, the tests that prove each one, and the order the code lands in.
+[DESIGN.md](../DESIGN.md) (reviewed, with [ADR-001](adr/001-concurrency-control.md)) specifies a fast, accurate, polite single-host crawler; when this plan was written, nothing was implemented and the README still said "design stage". This plan turns the design into a build. It fixes the module boundaries and contracts, the data structures and algorithms each module owns, the tests that prove each one, and the order the code lands in.
 
 DESIGN.md stays the source of truth for *what* and *why*; this document fixes *how*. Planning against the real libraries found a few things the design doesn't say. They are listed in §9 so that the PR implementing each one also updates DESIGN.md.
 
@@ -63,6 +63,13 @@ Checked on 2026-10-20 against the versions pinned in Appendix A (Python 3.14.6, 
 | Found in PR 4: `email.utils.parsedate_to_datetime` reads HTTP's asctime date format, which has no zone, as local time; RFC 9110 has every HTTP date in GMT | `parse_retry_after` reads a date without a zone as UTC |
 | Found in PR 4: aiohttp's total timeout raises the same `TimeoutError` whether it runs out while connecting or while waiting for headers, and with `--timeout` under 10 s the connect timeout never fires first | The transport counts a total timeout as a connect timeout when its connector hadn't yet handed the request a connection, so that the circuit breaker hears of a host it can't reach |
 | Found in PR 4: a retry that starts again from an item's first URL finds the targets of the redirects it followed claimed, by the item itself, and nothing prints the page | A retry resumes where its chain failed: `CrawlItem.redirected_from` holds the redirects already followed |
+| Found in PR 5: a URL found beyond `--max-depth` isn't claimed, so the rules that count, the query-variant cap among them, would count it again each time it's found | The depth check comes first, once per page, and the other rules see a URL only once it's found within the limit. The summary counts the URLs found only beyond it, each once |
+| Found in PR 5: lowering costs a dict lookup for every link already seen, 86 ns a link against 42, 10.3 µs a page of 120 links (DESIGN A.16) | The frontier keeps queued items by key, and admission lowers them, under `--max-depth` only, where exactness needs it |
+| Found in PR 5: a progress line redrawn on the terminal the records are printed to garbles them, since the writer thread prints records between redraws | The progress line shows only when the records go elsewhere, as curl hides its meter; records printed to the terminal get a tip after the summary instead |
+| Found in PR 5: `ProcessPoolExecutor` has no public count of its running processes | The progress line's `workers` is parses in progress, as far as there are workers |
+| Found in PR 5: a new pseudo-terminal reports 0 columns until it's sized | The progress line takes a width of 0 as 80 columns |
+| Found in PR 5: argparse accepts an unambiguous prefix of an option, so `--max-depth` turned `--max-dept 2` from a usage error into `--max-depth 2` | Abbreviations stay on, as argparse has them; a test that used `--max-dept` as a misspelling now uses `--max-deph` |
+| Found in PR 5: GitHub's `ubuntu-latest` runners run e2e.py's crawl at 626–987 pages/s and 400–702 µs of coordinator CPU per page, depending most on their processor (DESIGN A.15) | The performance job's gates sit a quarter beyond the worst of ten runs on the runners, rather than relative to the M5's numbers |
 
 ## 3. Repository layout and tooling
 
@@ -93,6 +100,7 @@ web-crawler/
 │   ├── transport.py          # Transport/Response protocols + the aiohttp implementation
 │   ├── fetcher.py            # redirects, triage, size caps
 │   ├── pool.py               # parse gateway
+│   ├── records.py            # output records: text and JSONL pages, JSONL errors (PR 5)
 │   ├── output.py             # Sink protocol + writer-thread sink
 │   └── engine.py             # crawl(): startup, dispatcher, tasks, termination, signals
 ├── tests/
@@ -155,9 +163,10 @@ class CrawlItem:
     redirected_from: tuple[str, ...] = () # hops already followed: retries resume mid-chain; JSONL reports them
 
 @dataclass(frozen=True, slots=True)
-class ParseJob:                           # as DESIGN §6.2
-    url: str; depth: int; status: int; content_encoding: str | None; http_charset: str | None
-    body: bytes; redirected_from: tuple[str, ...]; truncated: bool
+class ParseJob:                           # as DESIGN §6.2; the fields grew with the PRs that read them
+    url: str; body: bytes; http_charset: str | None = None; truncated: bool = False
+    content_encoding: str | None = None
+    depth: int = 0; status: int = 200; redirected_from: tuple[str, ...] = ()  # for JSONL (PR 5)
 
 class ParseResult(NamedTuple):
     record: bytes                         # rendered output, written verbatim (b"" on a decode error)
@@ -169,7 +178,8 @@ class ParseResult(NamedTuple):
 
 @dataclass(frozen=True, slots=True)
 class WorkerContext:                      # sent once, through the pool initializer
-    scope_prefixes: tuple[str, ...]; fmt: Literal["text", "jsonl"]; all_urls: bool; max_bytes: int
+    scope_prefixes: tuple[str, ...]; max_bytes: int; all_urls: bool = False
+    format: Literal["text", "jsonl"] = "text"
 ```
 
 ### 5.2 `config.py` and `cli.py`
@@ -275,12 +285,12 @@ Golden fixtures (`tests/fixtures/parse/*.html` with expected JSON) cover:
 
 **Methods:**
 - **`Admission.admit(links, depth)`**, for each `(key, url)`, cheapest check first:
-  1. If `key in seen`, maybe lower it: when `queued.get(key)` is deeper, create a new frozen item at `depth`, set `queued[key]` to it, append it to its queue, and move the incomplete count. The old deque entry goes stale and is skipped on pop by an identity check.
-  2. Trap rule.
-  3. Query-variant cap.
-  4. Extension filter.
-  5. `robots.allowed(url)`.
-  6. `--max-depth`. A depth rejection isn't claimed, so a shorter path can still admit the URL.
+  1. If `key in seen`, maybe lower it, under `--max-depth`: when `queued.get(key)` is deeper, create a new frozen item at `depth`, set `queued[key]` to it, append it to its queue, and move the incomplete count. The old deque entry goes stale and is skipped on pop by an identity check.
+  2. `--max-depth`, once per call, since a page's links share a depth. A depth rejection isn't claimed, so a shorter path can still admit the URL; until one does, the rules below don't see it, since the query-variant cap would count it again each time (PR 5; it was step 6 in this plan).
+  3. Trap rule.
+  4. Query-variant cap.
+  5. Extension filter.
+  6. `robots.allowed(url)`.
   7. Otherwise claim it (`seen.add`) and enqueue it.
 
   Every other rejection is claimed, so it's checked only once.
@@ -389,7 +399,7 @@ It loops over at most 10 hops. Each iteration opens the request, feeds the limit
 
 - **Counters:** pages, links found, unique in-scope URLs (`len(seen)`), statuses, errors by class, rejections by rule with examples, wire and decoded bytes, limiter range, peak pages/s over 1-second windows, and peak RSS (normalized for Linux KiB vs macOS bytes).
 - **TTFB** goes into a log-bucketed histogram (1% buckets, fixed memory) that gives p50, p95 and p99.
-- **Output:** `progress_line()` and `summary()`. The progress line is refreshed four times a second, and only when stderr is a terminal; when stdout is a terminal too, it suggests redirecting to a file. A logging handler clears and redraws it, so `-v` log lines don't tear it.
+- **Output:** `progress_line()` and `summary()`. The progress line is refreshed four times a second, and only when stderr is a terminal; when stdout is a terminal too, it suggests redirecting to a file. A logging handler clears and redraws it, so `-v` log lines don't tear it. As built in PR 5, the line is `Snapshot.line()`, and it shows only when the records go elsewhere than the terminal: drawn between records it would garble them, so records printed to the terminal get the suggestion as a tip after the summary.
 
 ### 5.15 `engine.py`
 
@@ -515,6 +525,8 @@ Branches `v1/1-skeleton` through `v1/5-limits-output`, each based on the one bef
 
 **Done when** the §8 checks pass.
 
+**Measured:** six 50,000-page crawls alternating with PR 4's code ran at 1,071–1,114 pages/s against 1,085–1,110, for 267–281 µs of coordinator CPU per page against 254–276 and 68 MiB either way, within the runs' spread; the engine alone costs 0.7 µs more per page (DESIGN A.15). The crawler's frontier was exact on all 600 of A.10's simulated sites. On GitHub's runners the same crawl ran at 626–987 pages/s and 400–702 µs per page, depending most on the processor, which set the performance job's gates: at least 470 pages/s, at most 880 µs per page and 120 MiB, and no page lost (§2). The §8 checks' results are in PR #9's description.
+
 ---
 
 ## 8. Verification
@@ -522,7 +534,7 @@ Branches `v1/1-skeleton` through `v1/5-limits-output`, each based on the one bef
 - **Every PR:** `make check` locally (ruff, `mypy --strict`, pytest with coverage), and CI green on Linux and macOS.
 - **Before PR 5 merges, end to end:**
   1. `uv run crawl --format jsonl https://www.python.org/ --max-pages 200 -v`, and the same against docs.python.org. Expect no tracebacks, the limiter's decisions logged, a sensible summary, and every printed URL valid WHATWG. Spot-check 20 pages' links against a browser.
-  2. `bench/e2e.py` with 50k pages at 50 ms: record pages/s, coordinator CPU per page (expected within DESIGN §1's 140–230 µs) and peak RSS (expected under 300 MB).
+  2. `bench/e2e.py` with 50k pages at 50 ms: record pages/s, coordinator CPU per page (expected within DESIGN §1's 140–230 µs, which became 250–280 µs once PR 3 measured a whole crawl's bookkeeping, DESIGN A.15) and peak RSS (expected under 300 MB).
   3. Rerun `bench/pipeline_bench.py` and `bench/limiter_sim.py` on production code, and update Appendix A if the numbers moved.
   4. Interrupt a crawl piped into `| head` and one writing to a file: only whole records, and the exit codes in §5.2.
 
@@ -538,7 +550,7 @@ Each lands in the PR that implements it:
 6. **A closed stdout exits 141** (128 + SIGPIPE), consistent with 130 and 143; DESIGN §6.1 is silent on it. PR 4 (folded into DESIGN §5.9 and §6.1).
 7. **`ParseResult` gains `links_found`, `decoded_bytes` and `error`.** PRs 1 and 3; and `truncated`, PR 4.
 8. **A compressed stream that ends cleanly but early** is parsed as far as it got and flagged `truncated`, as a browser renders it; only corrupt data is a final error. PR 3.
-9. **`--include-errors` requires `--format jsonl`.** PR 5.
+9. **`--include-errors` requires `--format jsonl`.** PR 5 (folded into DESIGN §5.8 and §6.1).
 10. **A.11 gains a 429-ing origin,** covering the cut path that ADR-001's table doesn't. PR 3.
 
 ## 10. Risks and open questions
@@ -547,4 +559,4 @@ Each lands in the PR that implements it:
 - **Windows** has no CI: no uvloop, and signal handling is best effort.
 - **Multi-byte legacy decoders.** Python's codecs for Big5, gb18030, EUC-JP and ISO-2022-JP differ from the standard's on a few hundred rare characters (DESIGN A.14). This affects only hrefs that contain those characters unescaped. Single-byte encodings, including windows-1252, decode exactly since PR 2.
 - **Legacy-encoded query strings** behave as described in DESIGN §13.
-- **Performance gates** depend on how fast CI runners are. They're calibrated in PR 3 and enforced relative to that baseline from PR 5.
+- **Performance gates** depend on how fast CI runners are. They were calibrated on GitHub's runners themselves in PR 5, a quarter beyond the worst of ten runs, since the runners' processors differ by half again (DESIGN A.15); the job isn't a required check.

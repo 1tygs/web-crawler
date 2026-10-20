@@ -1,7 +1,12 @@
 """Test sites built from link graphs, and the output a correct crawl prints for them."""
 
+import asyncio
+from collections.abc import Mapping
+
+from aiohttp import web
+
 from tests.support.bench import bfs
-from tests.support.site import Resource, page
+from tests.support.site import Handler, Resource, page
 
 
 def path(node: int) -> str:
@@ -22,22 +27,43 @@ def href(origin: str, source: int, target: int) -> str:
             return f"p/{target}" if source == 0 else str(target)
 
 
-def graph_site(origin: str, site: list[list[int]], external: bool = True) -> dict[str, Resource]:
+def graph_site(
+    origin: str,
+    site: list[list[int]],
+    external: bool = True,
+    delays: Mapping[int, float] | None = None,
+) -> dict[str, Resource | Handler]:
     """A page per node, linking to its targets in order. Each page also links off the host,
-    which a correct crawl prints and never requests."""
-    resources = {}
+    which a correct crawl prints and never requests. A node in delays answers that many
+    seconds late."""
+    resources: dict[str, Resource | Handler] = {}
     for source, targets in enumerate(site):
         hrefs = [href(origin, source, target) for target in targets]
         if external:
             hrefs.append(f"https://external.example/{source}")
-        resources[path(source)] = page(*hrefs)
+        resource = page(*hrefs)
+        delay = (delays or {}).get(source, 0.0)
+        resources[path(source)] = _late(resource, delay) if delay else resource
     return resources
 
 
-def expected_records(origin: str, site: list[list[int]], external: bool = True) -> list[bytes]:
-    """The record of each page reachable from the home page, sorted: the ground truth."""
+def _late(resource: Resource, delay: float) -> Handler:
+    async def handle(request: web.Request) -> web.StreamResponse:
+        await asyncio.sleep(delay)
+        return web.Response(status=resource.status, body=resource.body, headers=resource.headers)
+
+    return handle
+
+
+def expected_records(
+    origin: str, site: list[list[int]], external: bool = True, max_depth: int | None = None
+) -> list[bytes]:
+    """The record of each page reachable from the home page, within max_depth links of it
+    if that's given, sorted: the ground truth."""
     records = []
-    for source in bfs(site):
+    for source, depth in bfs(site).items():
+        if max_depth is not None and depth > max_depth:
+            continue
         printed = list(dict.fromkeys(origin + path(target) for target in site[source]))
         if external:
             printed.append(f"https://external.example/{source}")

@@ -7,6 +7,8 @@ the argument parser.
 import math
 from dataclasses import dataclass
 
+from web_crawler.records import FORMATS
+from web_crawler.types import Format
 from web_crawler.urls import (
     MAX_QUERY_VARIANTS,
     MAX_SEGMENT_REPEATS,
@@ -37,6 +39,9 @@ class Config:
     # The most of a page's body that's read, as sent, and that it decompresses to.
     max_page_bytes: int = 32 * MIB
     max_pages: int | None = None  # stop once this many pages are printed
+    max_depth: int | None = None  # crawl only pages within this many links of the start URL
+    format: Format = "text"  # the records' (DESIGN.md §5.8)
+    include_errors: bool = False  # a JSONL record for each item that ends without a page too
     all_urls: bool = False  # print every URL-bearing attribute; still crawl only links
     ignore_robots: bool = False  # for crawling your own site
     strict_host: bool = False  # a start URL that redirects to its www. variant can't start
@@ -69,6 +74,11 @@ class Config:
             raise ConfigError(f"user_agent must be non-blank ASCII, not {self.user_agent!r}")
         if not self.user_agent.isprintable():
             raise ConfigError(f"user_agent can't contain control characters: {self.user_agent!r}")
+        if self.format not in FORMATS:
+            raise ConfigError(f"format must be text or jsonl, not {self.format!r}")
+        if self.include_errors and self.format != "jsonl":
+            # A text record is a page's links: an error has none (plan §9 item 9).
+            raise ConfigError("include_errors needs format jsonl: errors have JSONL records only")
 
 
 # The least each count may be, and the unit of each number that must be positive. A setting
@@ -79,6 +89,7 @@ _AT_LEAST = {
     "retries": 0,
     "max_page_bytes": 1,
     "max_pages": 1,
+    "max_depth": 0,
     "max_url_length": 1,
     "max_segment_repeats": 1,
     "max_query_variants": 1,

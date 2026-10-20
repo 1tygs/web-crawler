@@ -9,5 +9,6 @@
     "https://example.com/canonical-in-noscript",
     "https://example.com/a-in-head-noscript",
     "https://example.com/no-js"
-  ]
+  ],
+  "canonical": "https://example.com/canonical-in-noscript"
 }

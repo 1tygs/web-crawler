@@ -39,5 +39,6 @@
     "https://example.com/canonical",
     "https://example.com/page",
     "https://example.com/frame"
-  ]
+  ],
+  "canonical": "https://example.com/canonical"
 }
