@@ -1,0 +1,6 @@
+{
+  "about": "The base resolves against the URL the page came from after redirects, not the one requested.",
+  "url": "https://example.com/new/place",
+  "printed": ["https://example.com/new/sub/page"],
+  "crawled": ["https://example.com/new/sub/page"]
+}

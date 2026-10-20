@@ -1,0 +1,10 @@
+{
+  "about": "A byte order mark decides before anything else, even a header that says otherwise: UTF-16LE.",
+  "http_charset": "iso-8859-2",
+  "printed": [
+    "https://example.com/%C3%A9"
+  ],
+  "crawled": [
+    "https://example.com/%C3%A9"
+  ]
+}

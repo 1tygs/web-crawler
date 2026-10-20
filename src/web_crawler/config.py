@@ -26,6 +26,11 @@ class Config:
     max_concurrency: int = 64  # upper bound on requests in flight
     timeout: float = 60.0  # seconds, for one whole request
     max_page_bytes: int = 32 * MIB  # body bytes read from one page
+    all_urls: bool = False  # print every URL-bearing attribute; still crawl only links
+    ignore_robots: bool = False  # for crawling your own site
+    strict_host: bool = False  # a start URL that redirects to its www. variant can't start
+    insecure: bool = False  # don't verify TLS certificates
+    robots_refresh: float = 24 * 3600.0  # seconds between fetches of robots.txt (RFC 9309)
 
     def __post_init__(self) -> None:
         try:
@@ -36,6 +41,10 @@ class Config:
             raise ConfigError(f"max_concurrency must be at least 1, not {self.max_concurrency}")
         if not (math.isfinite(self.timeout) and self.timeout > 0):
             raise ConfigError(f"timeout must be a positive number of seconds, not {self.timeout}")
+        if not (math.isfinite(self.robots_refresh) and self.robots_refresh > 0):
+            raise ConfigError(
+                f"robots_refresh must be a positive number of seconds, not {self.robots_refresh}"
+            )
         if self.max_page_bytes < 1:
             raise ConfigError(f"max_page_bytes must be at least 1, not {self.max_page_bytes}")
         if not (self.user_agent.strip() and self.user_agent.isascii()):

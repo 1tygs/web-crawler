@@ -24,6 +24,8 @@ class ParseJob:
 
     url: str  # final URL after redirects, which is also the base URL
     body: bytes
+    http_charset: str | None = None  # the Content-Type header's charset parameter
+    truncated: bool = False  # the body was cut at the size cap
 
 
 class ParseResult(NamedTuple):
@@ -39,6 +41,7 @@ class WorkerContext:
     """What every parse needs and never changes during a crawl, sent to each worker once."""
 
     scope_prefixes: tuple[str, ...]
+    all_urls: bool = False  # print every URL-bearing attribute, not only navigational links
 
 
 class ExitCode(IntEnum):

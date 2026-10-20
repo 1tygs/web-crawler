@@ -1,0 +1,5 @@
+{
+  "about": "A refresh without a URL reloads the page: it isn't a link, and later refreshes are ignored.",
+  "printed": ["https://example.com/link"],
+  "crawled": ["https://example.com/link"]
+}

@@ -37,11 +37,38 @@ def test_builds_a_config_from_the_url() -> None:
     assert parse_args(["https://example.com/"]) == Config(start_url="https://example.com/")
 
 
+def test_all_urls() -> None:
+    assert parse_args(["--all-urls", "https://example.com/"]).all_urls
+
+
+def test_start_url_options() -> None:
+    cfg = parse_args(["https://example.com/", "--strict-host", "--insecure"])
+    assert (cfg.strict_host, cfg.insecure) == (True, True)
+    cfg = parse_args(["https://example.com/"])
+    assert (cfg.strict_host, cfg.insecure) == (False, False)
+
+
+def test_robots_options() -> None:
+    cfg = parse_args(["https://example.com/", "--ignore-robots", "--user-agent", "MyBot/2.0"])
+    assert cfg.ignore_robots
+    assert cfg.user_agent == "MyBot/2.0"
+    assert not parse_args(["https://example.com/"]).ignore_robots
+
+
+def test_an_invalid_user_agent_is_a_usage_error(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        parse_args(["https://example.com/", "--user-agent", " "])
+    assert exit_info.value.code == 2
+    assert "user_agent must be non-blank ASCII" in capsys.readouterr().err
+
+
 def test_help_exits_zero(capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit) as exit_info:
         parse_args(["--help"])
     assert exit_info.value.code == 0
-    assert capsys.readouterr().out.startswith("usage: crawl [-h] [--version] URL")
+    assert capsys.readouterr().out.startswith(
+        "usage: crawl [-h] [--all-urls] [--ignore-robots] [--strict-host] [--insecure]"
+    )
 
 
 @pytest.mark.parametrize(

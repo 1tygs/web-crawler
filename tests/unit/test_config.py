@@ -13,6 +13,9 @@ def test_defaults_follow_the_design() -> None:
     assert cfg.max_concurrency == 64
     assert cfg.timeout == 60.0
     assert cfg.max_page_bytes == 32 * MIB
+    assert not cfg.all_urls
+    assert not cfg.ignore_robots
+    assert cfg.robots_refresh == 24 * 3600  # RFC 9309 §2.4
 
 
 def test_is_immutable() -> None:
@@ -30,6 +33,8 @@ def test_is_immutable() -> None:
         ("timeout", -1.0, "timeout must be a positive number"),
         ("timeout", math.inf, "timeout must be a positive number"),
         ("timeout", math.nan, "timeout must be a positive number"),
+        ("robots_refresh", 0.0, "robots_refresh must be a positive number"),
+        ("robots_refresh", math.inf, "robots_refresh must be a positive number"),
         ("max_page_bytes", 0, "max_page_bytes must be at least 1"),
         ("user_agent", "", "user_agent must be non-blank ASCII"),
         ("user_agent", "   ", "user_agent must be non-blank ASCII"),

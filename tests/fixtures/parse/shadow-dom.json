@@ -1,0 +1,21 @@
+{
+  "about": "Declarative shadow roots are rendered, so their links count, in document order where the template is, nested ones too. Only modes open and closed, in any case, on a valid shadow host make a root. A later template of the same mode replaces the root's content; one of the other mode, like any other template, is inert.",
+  "printed": [
+    "https://example.com/first",
+    "https://example.com/open",
+    "https://example.com/nested",
+    "https://example.com/light",
+    "https://example.com/custom",
+    "https://example.com/replacement",
+    "https://example.com/last"
+  ],
+  "crawled": [
+    "https://example.com/first",
+    "https://example.com/open",
+    "https://example.com/nested",
+    "https://example.com/light",
+    "https://example.com/custom",
+    "https://example.com/replacement",
+    "https://example.com/last"
+  ]
+}

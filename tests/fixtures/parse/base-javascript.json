@@ -1,0 +1,5 @@
+{
+  "about": "Only the first <base> with an href counts. A javascript: base is ignored (HTML Standard), and doesn't let a later one take its place.",
+  "printed": ["https://example.com/dir/x"],
+  "crawled": ["https://example.com/dir/x"]
+}

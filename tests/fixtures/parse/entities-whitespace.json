@@ -1,0 +1,27 @@
+{
+  "about": "Attribute values are unescaped by the HTML parser, then resolved by the URL parser, which strips surrounding whitespace, removes tabs and newlines, escapes spaces and non-ASCII, and reads \\ as /.",
+  "printed": [
+    "https://example.com/q?a=1&b=2&c=3&d",
+    "https://example.com/slash",
+    "https://example.com/caf%C3%A9?q=%C3%A9",
+    "https://example.com/spaces",
+    "https://example.com/newlines",
+    "https://example.com/inside/tab",
+    "https://example.com/a%20b",
+    "https://example.com/back/slash",
+    "https://example.com/%7Euser/",
+    "http://example.com/UPPER"
+  ],
+  "crawled": [
+    "https://example.com/q?a=1&b=2&c=3&d",
+    "https://example.com/slash",
+    "https://example.com/caf%C3%A9?q=%C3%A9",
+    "https://example.com/spaces",
+    "https://example.com/newlines",
+    "https://example.com/inside/tab",
+    "https://example.com/a%20b",
+    "https://example.com/back/slash",
+    "https://example.com/%7Euser/",
+    "http://example.com/UPPER"
+  ]
+}

@@ -3,8 +3,9 @@ import html
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
+from selectolax.lexbor import LexborHTMLParser
 
-from web_crawler.parse import parse_page
+from web_crawler.parse import parse_page, parse_refresh, parse_srcset
 from web_crawler.types import ParseJob, WorkerContext
 
 PAGE = "https://example.com/dir/page.html"
@@ -124,11 +125,181 @@ def test_returns_in_scope_links_only_but_prints_all() -> None:
     assert all(key == url for key, url in result.links)
 
 
-def test_skips_valueless_hrefs_and_svg_xlink() -> None:
+def test_prints_each_spelling_but_crawls_each_resource_once() -> None:
+    # Escapes of unreserved characters and the case of other escapes don't change the
+    # resource (DESIGN.md §5.6), so the first spelling found is the one to crawl.
+    markup = anchors("/~a", "/%7Ea", "/%7ea", "/b%2fc", "/b%2Fc", "/b/c")
+    result = parse_page(ParseJob(url=PAGE, body=markup.encode()), CTX)
+    assert result.links_found == 6
+    assert result.links == [
+        ("https://example.com/~a", "https://example.com/~a"),
+        ("https://example.com/b%2Fc", "https://example.com/b%2fc"),
+        ("https://example.com/b/c", "https://example.com/b/c"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("body", "http_charset", "url"),
+    [
+        # Undeclared and not UTF-8: windows-1252, so 0xE9 is é.
+        (b'<a href="/caf\xe9">x</a>', None, "https://example.com/caf%C3%A9"),
+        (b'<a href="/caf\xc3\xa9">x</a>', None, "https://example.com/caf%C3%A9"),
+        # Declared by the header, which a <meta> can't overrule, or by a <meta>.
+        (b'<a href="/\xe0">x</a>', "windows-1251", "https://example.com/%D0%B0"),
+        (
+            b'<meta charset=koi8-r><a href="/\xe0">x</a>',
+            "windows-1251",
+            "https://example.com/%D0%B0",
+        ),
+        (b'<meta charset=koi8-r><a href="/\xc1">x</a>', None, "https://example.com/%D0%B0"),
+        (
+            b'<meta charset=shift_jis><a href="/\x93\xfa">x</a>',
+            None,
+            "https://example.com/%E6%97%A5",
+        ),
+        # A <meta> beyond the first 1,024 bytes: the parser reaches it and starts over.
+        (
+            b"<!--" + b"-" * 1024 + b'--><meta charset=windows-1251><a href="/\xe0">x</a>',
+            None,
+            "https://example.com/%D0%B0",
+        ),
+        # A byte order mark wins, and isn't text.
+        (
+            b"\xff\xfe<\x00a\x00 \x00h\x00r\x00e\x00f\x00=\x00/\x00\xe9\x00>\x00",
+            None,
+            "https://example.com/%C3%A9",
+        ),
+    ],
+)
+def test_decodes_a_page_as_a_browser_does(body: bytes, http_charset: str | None, url: str) -> None:
+    job = ParseJob(url=PAGE, body=body, http_charset=http_charset)
+    assert parse_page(job, CTX).record.decode().split("\n")[1:-2] == [f"  {url}"]
+
+
+def test_a_byte_order_mark_is_not_text() -> None:
+    body = b'\xef\xbb\xbf<!doctype html><frameset><frame src="/top"></frameset>'
+    # lexbor reads the mark as text, which ends <head> early and makes it ignore the
+    # <frameset>, so parse_page drops it first.
+    assert LexborHTMLParser(body).css("frame") == []
+    result = parse_page(ParseJob(url=PAGE, body=body), CTX)
+    assert result.links == [("https://example.com/top", "https://example.com/top")]
+
+
+def test_a_page_in_the_replacement_encoding_has_no_links() -> None:
+    # Some encodings aren't safe to decode; a browser shows such a page as one U+FFFD.
+    job = ParseJob(url=PAGE, body=b'<a href="/x">x</a>', http_charset="iso-2022-kr")
+    assert parse_page(job, CTX) == (b"https://example.com/dir/page.html\n\n", [], 0)
+
+
+def test_a_truncated_page_may_end_inside_a_utf8_character() -> None:
+    body = '<a href="/caf\u00e9">x</a><p>\u65e5'.encode()[:-1]
+    for truncated in (True, False):
+        result = parse_page(ParseJob(url=PAGE, body=body, truncated=truncated), CTX)
+        url = (
+            "https://example.com/caf%C3%A9" if truncated else "https://example.com/caf%C3%83%C2%A9"
+        )
+        assert result.links == [(url, url)]
+
+
+def test_reads_valueless_hrefs_and_svg_xlink() -> None:
     # lexbor reports both as None: `<a href>` has no value, and an SVG <a> matched by [href]
-    # has only xlink:href. Neither is read as "", which would be a link to the page itself.
+    # has only xlink:href. A valueless href is "", a link to the page itself.
     markup = '<a href>x</a><svg><a xlink:href="/svg">s</a></svg><a href="/ok">ok</a>'
-    assert links(markup) == ["https://example.com/ok"]
+    assert links(markup) == [PAGE, "https://example.com/svg", "https://example.com/ok"]
+
+
+@pytest.mark.parametrize(
+    ("content", "refresh"),
+    [
+        # A time, then optionally the URL, after ";" or "," or whitespace, and "url=".
+        ("0", (True, None)),
+        ("  30  ", (True, None)),
+        ("0;", (True, None)),
+        ("0; url=/next", (True, "/next")),
+        ("0;URL=/next", (True, "/next")),
+        ("0, url = /next", (True, "/next")),
+        ("0 url=/next", (True, "/next")),
+        ("0;/next", (True, "/next")),
+        ("1.5; url=/next", (True, "/next")),  # the fraction is ignored
+        (".5;url=/next", (True, "/next")),
+        ("5.;url=/next", (True, "/next")),
+        # Quotes around the URL are dropped, up to the matching one.
+        ("0; url='/next'", (True, "/next")),
+        ('0; url="/next"', (True, "/next")),
+        ("0; url='/next", (True, "/next")),
+        ("0;'/next' trailing", (True, "/next")),
+        ('0; url="/a\'b"', (True, "/a'b")),
+        # Without "url=", whatever follows is the URL, "ur" and all.
+        ("0; urn:x", (True, "urn:x")),
+        ("0; u", (True, "u")),
+        ("0; url /next", (True, "url /next")),
+        ("0; url=", (True, "")),
+        ("0; UrL\t=\t/next", (True, "/next")),
+        # Not a refresh at all: no time, or something else right after it.
+        ("", (False, None)),
+        ("; url=/next", (False, None)),
+        ("url=/next", (False, None)),
+        ("-1; url=/next", (False, None)),
+        ("5x; url=/next", (False, None)),
+        ("\u00a05; url=/next", (False, None)),  # NO-BREAK SPACE isn't ASCII whitespace
+    ],
+)
+def test_parse_refresh(content: str, refresh: tuple[bool, str | None]) -> None:
+    assert parse_refresh(content) == refresh
+
+
+@pytest.mark.parametrize(
+    ("srcset", "urls"),
+    [
+        ("a.png", ["a.png"]),
+        ("a.png 1x, b.png 2x", ["a.png", "b.png"]),
+        ("a.png 100w, b.png 200w 50h", ["a.png", "b.png"]),
+        (" a.png  1.5x ,b.png 2e0x", ["a.png", "b.png"]),
+        ("a.png,b.png 2x", ["a.png,b.png"]),  # a comma inside a URL stays in it
+        ("a.png, b.png,", ["a.png", "b.png"]),
+        ("a.png,, ,b.png", ["a.png", "b.png"]),
+        ("data:image/gif;base64,R0lG, b.png 2x", ["data:image/gif;base64,R0lG", "b.png"]),
+        ("a.png (x, y), b.png", ["b.png"]),  # a parenthesized descriptor is unknown
+        # Invalid descriptors drop their candidate.
+        ("a.png 2y, b.png", ["b.png"]),
+        ("a.png 1X", []),
+        ("a.png 0w", []),
+        ("a.png 100w 0h", []),
+        ("a.png 50h", []),  # a height needs a width
+        ("a.png 100w 2x", []),
+        ("a.png 2x 2x", []),
+        ("a.png 2x 50h", []),
+        ("a.png -1x", []),
+        ("a.png 1.x", []),
+        ("a.png -0x", ["a.png"]),
+        ("", []),
+        (" , ", []),
+    ],
+)
+def test_parse_srcset(srcset: str, urls: list[str]) -> None:
+    assert parse_srcset(srcset) == urls
+
+
+@pytest.mark.parametrize(
+    ("host", "can_host"),
+    [
+        *[(tag, True) for tag in ("article", "body", "div", "h1", "main", "p", "section", "span")],
+        *[(tag, False) for tag in ("a", "ul", "li", "table", "head", "button", "my_element")],
+        # A custom element name: a lowercase letter, then a "-" somewhere, from a set of
+        # characters that includes most non-ASCII ones, and not one of eight reserved names.
+        ("my-element", True),
+        ("x-\u00e9l\u00e8ve", True),
+        ("a-\U0001f600", True),
+        ("my:el-x", False),
+        ("x-\u00d7", False),
+        ("x-\u2000", False),
+        ("font-face", False),
+        ("annotation-xml", False),
+    ],
+)
+def test_declarative_shadow_roots_attach_only_to_valid_hosts(host: str, can_host: bool) -> None:
+    markup = f'<{host}><template shadowrootmode="open"><a href="/shadow">s</a></template></{host}>'
+    assert ("https://example.com/shadow" in links(markup)) is can_host
 
 
 def test_parses_noscript_as_markup_and_skips_inert_templates() -> None:

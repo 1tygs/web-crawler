@@ -1,0 +1,19 @@
+{
+  "about": "The first <base href> is the base, resolved against the page's URL. An empty href and a fragment resolve to the base itself.",
+  "printed": [
+    "https://example.com/other/a",
+    "https://example.com/b",
+    "https://example.com/c",
+    "https://example.com/other/?q=1",
+    "https://example.com/other/",
+    "https://example.com/d"
+  ],
+  "crawled": [
+    "https://example.com/other/a",
+    "https://example.com/b",
+    "https://example.com/c",
+    "https://example.com/other/?q=1",
+    "https://example.com/other/",
+    "https://example.com/d"
+  ]
+}

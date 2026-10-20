@@ -1,0 +1,19 @@
+{
+  "about": "srcset by the HTML Standard's \"parse a srcset attribute\": candidates split at commas after whitespace, so a comma inside a URL stays, a trailing comma ends one, and a candidate with invalid descriptors is dropped.",
+  "all_urls": true,
+  "printed": [
+    "https://example.com/a.png",
+    "https://example.com/b.png",
+    "https://example.com/c.png",
+    "https://example.com/d.png",
+    "https://example.com/j.png",
+    "https://example.com/k.png,/l.png",
+    "https://example.com/m.png",
+    "https://example.com/n.png",
+    "data:image/png;base64,iVBORw0KGgo=",
+    "https://example.com/o.png",
+    "https://example.com/q.png",
+    "https://example.com/r.png"
+  ],
+  "crawled": []
+}

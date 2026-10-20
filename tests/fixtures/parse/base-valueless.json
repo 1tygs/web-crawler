@@ -1,0 +1,5 @@
+{
+  "about": "A valueless base href is \"\", which resolves to the page's own URL.",
+  "printed": ["https://example.com/dir/x"],
+  "crawled": ["https://example.com/dir/x"]
+}

@@ -1,0 +1,19 @@
+{
+  "about": "A <link> is a link when its rel, in any case, has canonical, alternate, next or prev, except alternate with stylesheet, which is an alternative style sheet.",
+  "printed": [
+    "https://example.com/canonical",
+    "https://example.com/fr/",
+    "https://example.com/feed.xml",
+    "https://example.com/page/2",
+    "https://example.com/page/0",
+    "https://example.com/both.css"
+  ],
+  "crawled": [
+    "https://example.com/canonical",
+    "https://example.com/fr/",
+    "https://example.com/feed.xml",
+    "https://example.com/page/2",
+    "https://example.com/page/0",
+    "https://example.com/both.css"
+  ]
+}

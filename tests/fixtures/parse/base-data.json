@@ -1,0 +1,5 @@
+{
+  "about": "A data: base is ignored too.",
+  "printed": ["https://example.com/dir/x"],
+  "crawled": ["https://example.com/dir/x"]
+}

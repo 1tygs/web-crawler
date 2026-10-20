@@ -2,7 +2,7 @@
 
 A fast, accurate and polite web crawler for the command line, written in Python. Give it a start URL and it crawls that host, printing each page's URL followed by every link found on the page.
 
-> **Status: in development, step 1 of the 5 in [the v1 plan](docs/implementation-plan.md).** The walking skeleton crawls: `crawl URL` fetches the start URL's host breadth-first, eight requests at a time, and prints each page's links. It doesn't read robots.txt yet, so point it only at sites you run. Accuracy, speed, robustness, and the limits and output options come in the next four steps; until then [DESIGN.md](DESIGN.md) describes more than the code does. The measurements behind the design can be reproduced with the scripts in [`bench/`](bench/).
+> **Status: in development, step 2 of the 5 in [the v1 plan](docs/implementation-plan.md).** `crawl URL` crawls the start URL's host breadth-first, eight requests at a time, and prints each page's links as a browser resolves them: in the page's charset, against its `<base href>`, from declarative shadow DOM and meta refresh too, and with `--all-urls` every URL-bearing attribute. It obeys robots.txt (RFC 9309), fetches each page once however many links and redirects lead to it, and follows a start URL's redirect to its `www.` host. Speed, robustness, and the limits and output options come in the next three steps; until then [DESIGN.md](DESIGN.md) describes more than the code does. The measurements behind the design can be reproduced with the scripts in [`bench/`](bench/).
 
 ## Planned usage
 
@@ -89,10 +89,12 @@ curl --compressed -o bench/fixtures/python.html https://www.python.org/
 | `python bench/depth_sim.py`                     | `--max-depth` rules against breadth-first-search ground truth, in simulation           | A.10     |
 | `python bench/limiter_sim.py`                   | Concurrency laws on simulated servers                                                  | A.11     |
 | `python bench/ttfb_spread.py URL`               | How widely a real site's response times spread                                         | A.12     |
+| `uv run python bench/encoding_check.py INDEXES` | The crawler's legacy decoders against the Encoding Standard's indexes                  | A.14     |
 
 
 - `client_bench.py` needs `python bench/server.py PAGE.html` running in another shell; it serves that page on 127.0.0.1:8899. `CLIENT` is one of `aiohttp`, `aiohttp+uvloop`, `aiohttp+uvloop+raw` (no decompression), `curl_cffi`, `niquests` or `httpx`. Adding `+env` to an aiohttp client turns on `trust_env`.
 - `robots_bench.py` expects `wikipedia.html` and `wikipedia.robots.txt` from en.wikipedia.org, and `guardian.html` and `guardian.robots.txt` from [www.theguardian.com](http://www.theguardian.com).
 - `pool_check.py` takes a `MODE` of `ondemand`, `crash` or `sigint`, and `--method spawn` or `--method forkserver`. It and the two simulations use only the standard library.
 - `ttfb_spread.py` needs curl, and sends about 40 requests, one at a time, to the site you give it.
+- `encoding_check.py` imports the crawler, so it runs in the project's environment through `uv run`. `INDEXES` is the Encoding Standard's [`indexes.json`](https://github.com/whatwg/encoding/blob/main/indexes.json).
 

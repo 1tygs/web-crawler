@@ -1,4 +1,5 @@
-"""URL rules: the start URL, the crawl's scope and fragments (DESIGN.md §2.4, §5.5).
+"""URL rules: the start URL, the crawl's scope, fragments and dedupe keys (DESIGN.md §2.4,
+§5.5, §5.6).
 
 Every URL past normalize_start is a WHATWG serialization from ada-url, which is canonical:
 scheme and host are lowercase, the host is punycode, a default port is omitted, and a path
@@ -17,6 +18,28 @@ _TAB_OR_NEWLINE = dict.fromkeys(map(ord, "\t\n\r"))
 
 _HTTP_SCHEME = re.compile(r"https?:", re.IGNORECASE)
 _SCHEME_AND_SLASHES = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://")
+
+# RFC 3986 §2.3: the characters that mean the same whether or not they're percent-encoded.
+_UNRESERVED = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
+_HEX_DIGITS = "0123456789ABCDEFabcdef"
+# Each escape, mapped to its normal form: the character, if it's unreserved, and otherwise
+# the escape with uppercase hex digits.
+_ESCAPES = {
+    f"%{high}{low}": (
+        char if (char := chr(int(high + low, 16))) in _UNRESERVED else f"%{high}{low}".upper()
+    )
+    for high in _HEX_DIGITS
+    for low in _HEX_DIGITS
+}
+# A hex digit, written as itself or as its escape, mapped to its escape.
+_HEX_DIGIT_ESCAPES = {
+    form: f"%{ord(digit):02X}" for digit in _HEX_DIGITS for form in (digit, f"%{ord(digit):02X}")
+}
+_HEX_DIGIT = r"(?:[0-9A-Fa-f]|%(?:3[0-9]|4[1-6]|6[1-6]))"  # as itself or as its escape
+# An escape; or a "%" that starts none, with the first of two hex digits that decoding would
+# put after it. WHATWG leaves such a "%" alone, and decoding them would make it start one:
+# /%%34%31 must not become /%41, which already means /A.
+_TO_NORMALIZE = re.compile(rf"%[0-9A-Fa-f]{{2}}|%{_HEX_DIGIT}(?={_HEX_DIGIT})")
 
 
 class StartURLError(ValueError):
@@ -54,6 +77,7 @@ class Scope:
     port, only the start URL's own scheme and port are: another port is another service.
     """
 
+    host: str  # as WHATWG serializes it: an IPv6 literal keeps its brackets
     prefixes: tuple[str, ...]  # every in-scope display URL starts with one of these
     origins: tuple[str, ...]  # the origins whose robots.txt applies
 
@@ -62,17 +86,36 @@ class Scope:
         parsed = ada_url.URL(url)
         if parsed.protocol not in ("http:", "https:"):
             raise ValueError(f"not an http or https URL: {url!r}")
-        host = parsed.hostname  # an IPv6 literal keeps its brackets
+        host = parsed.hostname
         if parsed.port:
             origins: tuple[str, ...] = (f"{parsed.protocol}//{host}:{parsed.port}",)
         else:
             origins = (f"https://{host}", f"http://{host}")
-        return cls(prefixes=tuple(f"{origin}/" for origin in origins), origins=origins)
+        return cls(host, tuple(f"{origin}/" for origin in origins), origins)
 
     def contains(self, url: str) -> bool:
         """Whether a display URL is in scope. Look-alikes such as example.com.evil.net,
         example.com:8443 and example.com@evil.net fail without being parsed."""
         return url.startswith(self.prefixes)
+
+    def www_switch(self, url: str) -> Scope | None:
+        """The scope a start URL moves to when it redirects to url (DESIGN.md §2.4): url's
+        host, if it only adds or removes "www." from this scope's, on the same ports and
+        schemes. None for any other URL."""
+        try:
+            hostname = ada_url.URL(url).hostname
+            switched = Scope.for_url(url)
+        except ValueError:
+            return None
+        same_ports = switched.origins == tuple(
+            origin.replace(f"//{self.host}", f"//{hostname}", 1) for origin in self.origins
+        )
+        return switched if same_ports and is_www_variant(self.host, hostname) else None
+
+
+def is_www_variant(a: str, b: str) -> bool:
+    """Whether two hosts differ only by a "www." label at the start of one of them."""
+    return a == f"www.{b}" or b == f"www.{a}"
 
 
 def strip_fragment(url: str) -> str:
@@ -83,3 +126,22 @@ def strip_fragment(url: str) -> str:
     """
     hash_at = url.find("#")
     return url if hash_at == -1 else url[:hash_at]
+
+
+def dedupe_key(url: str) -> str:
+    """The key that identifies a display URL's resource (DESIGN.md §5.6).
+
+    It applies the RFC 3986 §6.2.2 equivalences that WHATWG serialization leaves alone:
+    escapes of unreserved characters are decoded (%7E is ~) and other escapes get uppercase
+    hex digits (%2f is %2F). URLs with the same key differ in nothing else, and a URL with no
+    "%", which is most of them, is its own key: the same object comes back.
+    """
+    if "%" not in url:
+        return url
+    return _TO_NORMALIZE.sub(_normalize, url)
+
+
+def _normalize(match: re.Match[str]) -> str:
+    found = match[0]
+    # Otherwise found is a "%" that starts no escape, then a hex digit, which stays encoded.
+    return _ESCAPES.get(found) or "%" + _HEX_DIGIT_ESCAPES[found[1:]]

@@ -60,9 +60,9 @@ The target server will be the limit, not the crawler.
 | Question | Decision | Rationale |
 |---|---|---|
 | What is "the same domain"? | Exact host match after normalization (lowercase, IDNA/punycode). `example.com`, `www.example.com` and `blog.example.com` are three different hosts. The port must match the start URL's, where an omitted port means the scheme's default. On the default ports, `http` and `https` on that host are both in scope; a start URL with any other port keeps to its own scheme | Literal reading of "no subdomains". The scheme isn't part of a domain. Another port is another service |
-| The start URL redirects to another host (e.g. apex → `www`) | If the redirect only adds or removes `www.`, crawl the final host instead and say so on stderr. Any other cross-host redirect stops with exit code 3 and prints the URL to use. `--strict-host` treats the `www.` case like the others | The scope is still exactly one host, fixed before any page is fetched, so F3 holds. 5 of 6 bare domains tried redirect to `www` (A.13), so refusing would fail on the most obvious first command |
+| The start URL redirects to another host (e.g. apex → `www`) | If the redirect only adds or removes `www.`, crawl the final host instead and say so on stderr. Any other cross-host redirect stops with exit code 3 and prints the URL to use. `--strict-host` treats the `www.` case like the others. The new host's robots.txt is read before the redirect is followed | The scope is still exactly one host, fixed before any page is fetched, so F3 holds. 5 of 6 bare domains tried redirect to `www` (A.13), so refusing would fail on the most obvious first command |
 | What counts as a page? | A 2xx response with HTML content: `text/html` or `application/xhtml+xml`, or sniffed as HTML when the type is missing. Redirects are transparent hops. Errors and non-HTML responses are counted but not printed (JSONL can include them) | A page is a document that can contain links |
-| Which URLs are "found on the page"? | Navigational links: `a[href]`, `area[href]`, `iframe[src]`, `frame[src]`, `link[href]` with rel `canonical`/`alternate`/`next`/`prev`, and `<meta http-equiv="refresh">` targets, including inside declarative shadow DOM. `--all-urls` reports every URL-bearing attribute (img/srcset, script, stylesheet, media, …) and every scheme | This is what people mean by "the links on a page". The flag gives the literal reading |
+| Which URLs are "found on the page"? | Navigational links: `a[href]`, `area[href]`, `iframe[src]`, `frame[src]`, `link[href]` with rel `canonical`/`alternate`/`next`/`prev`, and `<meta http-equiv="refresh">` targets, including inside declarative shadow DOM. `--all-urls` reports every URL-bearing attribute (img/srcset, script, stylesheet, media, …) and every scheme, but the crawl still follows navigational links only | This is what people mean by "the links on a page". The flag gives the literal reading; fetching every image and script, or a form's action, would only cost requests and find no pages |
 | In what form are found URLs printed? | Absolute and serialized as a browser would request them (WHATWG), fragment removed, de-duplicated within the page in document order, `http(s)` only | Unambiguous and faithful. Fragments never reach the server |
 | Output order | Streamed in completion order | Sorting needs the whole crawl in memory and kills live output. `--format jsonl` piped to `sort` gives determinism |
 
@@ -153,7 +153,7 @@ Few sites will serve one client thousands of pages per second. The crawler's cei
 2. **Admitted.** The coordinator checks `key in seen` (~50 ns). If the key is new, it applies the trap rules, the extension filter, robots.txt (Protego, ~3 µs) and the depth limit. If all pass, the key goes into `seen` and the URL into the frontier. This is *claim on discovery*: from now on, no other page, redirect or retry can cause a second fetch.
 3. **Dispatched.** The dispatcher takes a *pipeline slot*, which bounds memory (fetches plus the parse queue). It then takes a *limiter permit*, which bounds load on the server, and starts a fetch task. Under `--max-depth` it dispatches only inside the depth window, and under `--max-pages` only while pages printed plus fetches in flight is below the limit ([§5.1](#51-frontier-and-admission)).
 4. **Fetched.** A GET is sent with compression enabled and auto-decompression off. When the headers arrive, the limiter records time-to-first-byte and the status is triaged ([§5.4](#54-errors-and-retries)). Non-HTML responses are never parsed, and their bodies are only read when small enough to drain for connection reuse. HTML bodies are streamed up to the size cap. The limiter permit is then released, so parse time never throttles fetching.
-5. **Redirected** (on 3xx). `Location` is resolved, scope-checked and admitted as a hop. If it's already claimed, this task stops; that page is fetched by its own task.
+5. **Redirected** (on 3xx). `Location` is resolved, scope-checked and admitted as a hop, which claims it. If another item has already claimed it, this task stops; that page is fetched by its own task. A target already in this task's own chain is followed again ([§5.2](#52-fetcher-and-transport)).
 6. **Parsed.** The final URL, content-encoding, charset, raw body and depth go to a worker. The worker returns the rendered output record and the page's in-scope links.
 7. **Completed.** The record goes to the writer and the links go to admission (step 2). The pipeline slot is released and `outstanding` is decremented.
 8. **Terminated.** `outstanding` counts admitted URLs that haven't finished. Children are admitted before the parent decrements, so `outstanding == 0` means the crawl is complete. No polling or idle timeouts are needed.
@@ -212,7 +212,8 @@ Few sites will serve one client thousands of pages per second. The crawler's cei
 - Proxies are taken from the environment (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`) and read once. aiohttp's own `trust_env` re-reads them, and `~/.netrc`, on a thread for every request. That costs 162.5 µs of CPU per request against 26.9 µs (A.4), and it would send `~/.netrc` credentials to the crawled host.
 
 **Fetcher** is the crawl logic on top of the transport:
-- **Manual redirects.** `allow_redirects=False`, then a loop of up to 10 hops. Each hop is resolved with ada-url, scope-checked, admitted (robots and traps; same depth) and checked for loops. aiohttp's automatic redirects would fetch off-host targets, breaking F3, and would re-fetch pages other tasks have already claimed. The start URL's own redirects are resolved before the scope is fixed ([§2.4](#24-how-ambiguous-requirements-are-read)).
+- **Manual redirects.** `allow_redirects=False`, then a loop of up to 10 hops. Each hop is resolved with ada-url, scope-checked, admitted (robots and traps; same depth) and claimed before it's requested. aiohttp's automatic redirects would fetch off-host targets, breaking F3, and would re-fetch pages other tasks have already claimed. The start URL's own redirects are resolved before the scope is fixed ([§2.4](#24-how-ambiguous-requirements-are-read)).
+- **Cookie-gated redirects.** A redirect back to a URL already in the same chain is followed, rather than called a loop: a consent or login gate redirects to a page that sets a cookie, which redirects back, and with the cookie the page is served. The cookie jar is on for exactly this. A real loop ends at the 10-hop limit and is reported as a loop, with its chain; a chain of 10 distinct hops is reported as too many redirects.
 - **Headers-first triage:**
   - HTML: stream the body up to `--max-page-bytes` (default 32 MiB) and flag truncation.
   - Non-HTML: don't read the body. If `Content-Length ≤ 64 KiB`, drain it so the connection can be reused; otherwise close it.
@@ -267,7 +268,7 @@ on 429 / 503 / timeout / connection reset / refused:
 | 408, 500, 502, 504 | Retry up to 3 times with backoff |
 | Other 4xx/5xx (404, 410, 401, 403, …) | Final: counted, logged at `-v`, optional JSONL error record |
 | 20 consecutive 403s after successful pages | Likely a firewall block, not 20 forbidden pages. Pause dispatch and re-request the start URL with backoff. If it recovers, requeue those URLs once; if it's still blocked after 5 minutes, abort with exit code 4 and keep the partial results |
-| Redirect loop, more than 10 hops, off-host redirect | Final: recorded with the redirect chain |
+| Redirect loop, more than 10 hops, off-host redirect | Final: recorded with the redirect chain. A redirect back into its own chain is followed first, for cookie gates; a loop ends at the 10-hop limit |
 | Body over the size cap | Parse the part received and flag `truncated` |
 | Invalid compression in a complete body | Final; the result is deterministic, so retrying won't help |
 | Worker crash (`BrokenProcessPool`) | Every job in the pool fails, not just the one that crashed (A.9). Rebuild the pool and resubmit them all without using up retries. If it breaks again, rerun the survivors one at a time: the page that crashes on its own gets a parse error, and the rest go through |
@@ -284,17 +285,20 @@ The pipeline:
 2. **Pick the charset in WHATWG order:**
    - Byte-order mark.
    - HTTP `charset` parameter.
-   - `<meta charset>` in the first 1,024 bytes.
-   - UTF-8 if the bytes validate, else windows-1252.
+   - `<meta charset>`, or `http-equiv="Content-Type"` with a charset, in the first 1,024 bytes, found by the HTML standard's prescan.
+   - UTF-8 if the bytes validate, else windows-1252. A character cut off by the size cap doesn't count against UTF-8.
 
-   WHATWG label aliases apply, e.g. `latin1` and `ascii` map to windows-1252. UTF-8 pages, the vast majority, reach the parser as bytes with no decode copy. lexbor's own detection isn't used: it can't see the HTTP header and has no fallback (verified).
+   The last two are tentative, as in a browser: if the parser then reaches a `<meta>` that declares another encoding, the page is decoded again in that one. That is how a declaration beyond the first 1,024 bytes still counts; html5lib's encoding tests expect it.
+
+   Every label in the Encoding Standard is known, e.g. `latin1` and `ascii` map to windows-1252. Single-byte encodings decode exactly as the standard's indexes say, which Python's codecs alone don't (A.14). Multi-byte encodings go through Python's codecs, which differ from the standard on a few hundred rare characters. UTF-8 pages, the vast majority, reach the parser as bytes with no decode copy, and a byte-order mark is dropped first: lexbor would read it as text, end `<head>` there and ignore a `<frameset>` after it. lexbor's own detection isn't used: it can't see the HTTP header and has no fallback (verified).
 3. **Parse** with selectolax's lexbor engine. Tree construction follows HTML5. Scripting is off, so `<noscript>` content is parsed as markup, which is what a client without JavaScript sees.
-4. **Base URL.** Start from the response's final URL after redirects. The first `<base href>` overrides it, resolved against it, per the HTML standard. Resolving against the *requested* URL instead is a classic crawler bug.
+4. **Base URL.** Start from the response's final URL after redirects. The first `<base href>` overrides it, resolved against it, per the HTML standard, unless it doesn't parse or is a `data:` or `javascript:` URL. Resolving against the *requested* URL instead is a classic crawler bug.
 5. **Extract** with one CSS selector-list pass, plus recursion into **declarative shadow DOM** (`<template shadowrootmode>`), which browsers render. The content of an ordinary `<template>` is inert and is skipped.
    - On MDN, 11 rendered links (the language switcher) exist only inside shadow roots. A plain lexbor query misses them.
    - lxml or a regex scan would find those, but would also pick up inert template placeholders on other sites.
+   - A template makes a shadow root as a browser's parser does: only with mode `open` or `closed`, only on a valid shadow host (a custom element, `div`, `span`, `section` and a dozen more), and once per host, so a later template of the same mode replaces the root's content and one of the other mode stays inert. A root's links are read where its template is, in document order.
 
-   Meta refresh `content` is parsed following the HTML standard's refresh steps.
+   Each element is read as a browser reads it. A valueless `href` is `""`, a link to the page itself, and an SVG `<a>` falls back to `xlink:href`. An empty frame or iframe `src` loads `about:blank`, so it isn't a link. A `<link>` is a link if its `rel` has `canonical`, `alternate`, `next` or `prev`, but not `alternate stylesheet`. Meta refresh `content` is parsed following the HTML standard's refresh steps, and only the first refresh that works counts, as in a browser; one without a URL just reloads the page. Under `--all-urls`, `srcset` goes through the standard's srcset parser, which drops candidates with invalid descriptors.
 6. **Resolve** each value with ada-url, which implements the WHATWG URL Standard and is the URL parser behind Node.js. It:
    - strips surrounding whitespace and inner tabs and newlines;
    - treats `\` as `/`;
@@ -312,7 +316,7 @@ The pipeline:
 
 Each URL has two forms:
 - **Display URL:** the WHATWG serialization without its fragment. This form is printed and requested; it's exactly what a browser sends.
-- **Dedupe key:** the display URL plus the RFC 3986 §6.2.2 equivalences that WHATWG leaves alone. Percent-encoded unreserved characters are decoded (`%7E` → `~`) and other escapes are uppercased (`%2f` → `%2F`). This step only runs when the URL contains `%`.
+- **Dedupe key:** the display URL plus the RFC 3986 §6.2.2 equivalences that WHATWG leaves alone. Percent-encoded unreserved characters are decoded (`%7E` → `~`) and other escapes are uppercased (`%2f` → `%2F`). A `%` that starts no escape, which WHATWG leaves as it is, stays distinct from `%25`, and an escaped hex digit right after one stays escaped, so decoding never makes an escape the URL didn't have: `/%%34%31` doesn't become `/%41`, which means `/A`. This step only runs when the URL contains `%`.
 
 | Normalization | Applied? | Why |
 |---|---|---|
@@ -331,14 +335,15 @@ Each URL has two forms:
 
 ### 5.7 robots.txt
 
-- **When.** Rules are per origin (RFC 9309), so the file for every in-scope origin (at most two: `https` and `http` on the default ports) is fetched in parallel before the first page, while the parser pool warms up. Admission then never waits for a file, so it stays synchronous ([§4.3](#43-concurrency-model)).
+- **When.** Rules are per origin (RFC 9309), so the file for every in-scope origin (at most two: `https` and `http` on the default ports) is fetched in parallel before the first page, while the parser pool warms up. Admission then never waits for a file, so it stays synchronous ([§4.3](#43-concurrency-model)). Most sites redirect `http://host/robots.txt` to `https://host/robots.txt`; each URL is requested once, and its answer serves both origins.
 - **Status handling per RFC 9309:**
-  - Follow at least 5 redirects.
-  - 2xx: parse the first 500 KiB.
-  - 4xx other than 429: allow everything.
-  - 429, 5xx or unreachable: retry with backoff, then treat as complete disallow. For the start URL's origin that means exit 3, suggesting `--ignore-robots` for site owners; for the other origin, its URLs are skipped and counted. RFC 9309 doesn't single out 429, but reading "too many requests" as permission would be the wrong way round; Google treats it as a server error too.
+  - Follow at least 5 redirects, to other hosts too; the file found governs the origin it was asked for. More than 5: there is no file.
+  - 2xx: parse the first 500 KiB, as UTF-8 with replacement. A line cut off at the limit is dropped, and so is a byte-order mark, which would hide the first line from Protego.
+  - 4xx other than 429, and anything else that isn't a file: allow everything.
+  - 429, 5xx or no answer: 3 tries with backoff, then treat as complete disallow. For the start URL's origin that means exit 3, suggesting `--ignore-robots` for site owners; if the host never answered at all, the message says so instead, since `--ignore-robots` wouldn't help. For the other origin, its URLs are skipped and counted. RFC 9309 doesn't single out 429, but reading "too many requests" as permission would be the wrong way round; Google treats it as a server error too.
 - **Parser: Protego.** A small pure-Python library with no dependencies; the Scrapy project maintains it, but it doesn't need Scrapy. It implements longest-match precedence, `*` and `$` wildcards, and `Allow`. `urllib.robotparser` was rejected: it uses first-match semantics, doesn't support wildcards, and is 6–17× slower (measured).
-- Groups are matched on the User-Agent's product token. Protego is looser than RFC 9309 here: a group name that starts a token in the User-Agent matches, so a `User-agent: web` group also applies to `web-crawler` (verified, A.6). That only matters when a site names a group after a prefix of the token, so it's accepted and pinned in a test rather than worked around. The file is re-fetched if a crawl runs past 24 hours.
+- Groups are matched on the User-Agent's product token: its leading letters, hyphens and underscores (RFC 9309 §2.2.1), `web-crawler` by default and whatever `--user-agent` gives. Protego is looser than RFC 9309 here: a group name that starts a token in the User-Agent matches, so a `User-agent: web` group also applies to `web-crawler` (verified, A.6). That only matters when a site names a group after a prefix of the token, so it's accepted and pinned in a test rather than worked around.
+- Every origin's file is fetched again every 24 hours while a crawl runs, as RFC 9309 asks; one that's unreachable then keeps the rules it had. URLs a rule rejects are counted, with examples, in the summary.
 
 ### 5.8 Output
 
@@ -388,7 +393,7 @@ crawl URL [options]
 | `--max-pages N`, `--max-depth N` | unlimited | Crawl limits, with exact semantics ([§5.1](#51-frontier-and-admission)) |
 | `--format text\|jsonl` | text | Output format |
 | `-o, --output FILE` | stdout | Output destination |
-| `--all-urls` | off | Report every URL-bearing attribute and every scheme |
+| `--all-urls` | off | Report every URL-bearing attribute and every scheme; only links are crawled |
 | `--include-errors` | off | JSONL records for URLs that failed |
 | `--ignore-robots` | off | For crawling your own site; also ignores `Crawl-delay` |
 | `--strict-host` | off | Refuse a start URL that redirects to another host, even when only `www.` differs |
@@ -400,7 +405,7 @@ crawl URL [options]
 
 Designed but after v1 ([§15](#15-delivery-plan)): `--strip-params LIST` (query parameters to drop before dedupe, e.g. `utm_*,gclid`), `--respect-nofollow` (don't follow `rel=nofollow` or meta-`nofollow` links, though they're still printed), `--sitemaps` (also seed from the sitemaps listed in robots.txt), `--stats-json FILE` and `--no-cookies`.
 
-A start URL given without a scheme gets `https://`. If connecting or the TLS handshake fails, it's retried once as `http://`, with a note on stderr, so `crawl localhost:8000` works against a plain local server.
+A start URL given without a scheme gets `https://`. If its host gives no answer there, because connecting or the TLS handshake fails, whether for robots.txt or the page, it's retried once as `http://`, with a note on stderr, so `crawl localhost:8000` works against a plain local server.
 
 **Exit codes:**
 - `0`: crawl completed. Errors on individual pages are reported, not fatal.
@@ -552,7 +557,7 @@ Python 3.14 or later is required, because `compression.zstd` is in its standard 
 | Unit: frontier | Each URL is dispatched at most once; the crawl ends exactly when nothing is outstanding; depths are exact inside the window | Admission, the depth window and accounting have no I/O ([§4.1](#41-process-and-component-view)), so hypothesis can drive them with generated completion orders |
 | Unit: limiter | Within 15% of the ceiling's crawl time when the server has spare capacity; under half the unthrottled queueing on a small origin; halves on 429; honours `Retry-After`; one cut per congestion event | The simulator behind ADR-001 (`bench/limiter_sim.py`) with a fake clock: a narrow and a wide steady spread of response times, a page-mix shift late and during slow start, and a small origin that queues |
 | Unit: robots | The crawler's own handling: fetching every origin up front, each status class including 429, redirects, re-fetching after 24 hours | Table tests, plus a few pinned Protego behaviours (longest match, wildcards, group selection). Google's test suite isn't run against Protego, which matches groups more loosely ([§5.7](#57-robotstxt)) |
-| Integration | Output matches ground truth exactly; each URL is fetched at most once | An in-process aiohttp server serving sites with known link graphs: the scenarios below, plus seeded random graphs with random latencies, compared against a breadth-first search with and without `--max-depth`. The server's request log proves there are no double fetches |
+| Integration | Output matches ground truth exactly; each URL is fetched at most once | An in-process aiohttp server, over http and https, serving sites with known link graphs; a test resolver serves `*.test` hosts on their default ports: the scenarios below, plus seeded random graphs with random latencies, compared against a breadth-first search with and without `--max-depth`. The server's request log proves there are no double fetches |
 | Fault injection | Recovery without losing pages | Connection resets mid-body, truncated gzip, `kill -9` on one worker of a busy pool (only its page fails), Ctrl-C mid-crawl and while workers are starting (no partial records; summary printed), a run of 403s mid-crawl |
 | Performance | No regressions | A local server with 50 ms of injected latency and 50k pages, tracking pages/s, coordinator CPU per page and peak RSS in CI. `bench/` holds the scripts behind this document |
 
@@ -604,7 +609,7 @@ Each commit is small and lands with its tests, so the history shows how the craw
 **Known limitations**
 - **No JavaScript.** Links created client-side aren't seen. Server-rendered and statically generated sites are unaffected; single-page apps are.
 - **Soft 404s.** A 200 response for a missing page looks like a real page. Trap rules limit the damage.
-- **Legacy-encoded pages.** Browsers percent-encode non-ASCII characters in the *query* using the document's encoding; ada-url always uses UTF-8. This only matters on non-UTF-8 pages with raw non-ASCII in query strings. If it comes up, the fix is to pre-encode the query in the document's charset.
+- **Legacy-encoded pages.** Browsers percent-encode non-ASCII characters in the *query* using the document's encoding; ada-url always uses UTF-8. This only matters on non-UTF-8 pages with raw non-ASCII in query strings. If it comes up, the fix is to pre-encode the query in the document's charset. Separately, Python's multi-byte decoders differ from the standard's on a few hundred rare characters (A.14).
 - **Trap thresholds.** The defaults give up a little completeness (e.g. listings with more than 1,000 query variants) in exchange for guaranteed termination. Every cut is reported in the summary.
 - **Printed depth.** Without `--max-depth`, the `depth` field is the shortest path known when the page was printed. With it, depths are exact.
 - **Limiter thresholds.** The law in [§5.3](#53-adaptive-concurrency-limiter) is validated in simulation only, and its thresholds are untuned. `-v` logs every decision so real crawls can check them.
@@ -889,3 +894,26 @@ The first draft of §5.3 read any ratio above 2 as congestion. On www.python.org
 | developer.mozilla.org | 302 → `https://developer.mozilla.org/en-US/` (same host) |
 
 5 of the 6 bare domains redirect to `www`.
+
+**A.14 Legacy decoders against the Encoding Standard** (`bench/encoding_check.py`)
+
+The standard's `indexes.json` at whatwg/encoding commit `be17ac5`, against Python 3.14.6's codecs. Single-byte encodings, bytes 0x80–0xFF decoded differently from the standard's index:
+
+| Encoding | Python's codec | The codec | The crawler |
+|---|---|---|---|
+| windows-874, windows-1250 to 1258 (not 1256) | cp874, cp1250, … | 87: bytes in 0x80–0x9F it leaves undefined, which the standard maps to the C1 control of the same value, and windows-1255 0xCA (U+05BA) | 0 |
+| KOI8-U | koi8_u | 2: the standard's KOI8-U is KOI8-RU, with ў and Ў at 0xAE and 0xBE | 0 |
+| The other 18 | | 0 | 0 |
+
+`encodings.py` fills those gaps, and a test checks all 28 single-byte encodings, byte by byte, against the standard's indexes. Multi-byte encodings, every sequence their lead and trail bytes allow:
+
+| Encoding | Python's codec | Sequences the standard decodes | Decoded alike | Differently | By the standard only |
+|---|---|---|---|---|---|
+| Shift_JIS | cp932 | 9,604 | 9,604 | 0 | 0 |
+| EUC-KR | cp949 | 17,048 | 17,048 | 0 | 0 |
+| Big5 | big5hkscs | 18,594 | 18,391 | 11 | 192 |
+| gb18030, GBK | gb18030 | 23,940 | 23,920 | 20 | 0 |
+| EUC-JP | euc_jp | 13,466 | 13,002 | 7 | 457 |
+| ISO-2022-JP | iso2022_jp_ext | 7,336 | 6,873 | 6 | 457 |
+
+The differences are rare symbols and vendor extensions, such as EUC-JP 0xA1C1, which Python decodes as U+301C WAVE DASH and the standard as U+FF5E FULLWIDTH TILDE. All 20 gb18030 differences are sequences Python decodes to private-use characters and the standard to real ones, most of them characters that GB18030's 2022 revision moved out of the private-use area. They change a link only when its href contains one of these characters unescaped. Each codec errs on a single bad byte without swallowing the ASCII byte after it, so the markup around it parses the same.
