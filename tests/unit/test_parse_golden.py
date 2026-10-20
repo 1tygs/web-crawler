@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 
+from web_crawler.config import MIB
 from web_crawler.parse import parse_page
 from web_crawler.types import ParseJob, WorkerContext
 
@@ -35,7 +36,7 @@ def test_golden(name: str) -> None:
         http_charset=case.get("http_charset"),
         truncated=case.get("truncated", False),
     )
-    result = parse_page(job, WorkerContext(SCOPE, all_urls=case.get("all_urls", False)))
+    result = parse_page(job, WorkerContext(SCOPE, MIB, all_urls=case.get("all_urls", False)))
     assert result.record.decode() == "".join(
         [job.url, "\n", *(f"  {url}\n" for url in case["printed"]), "\n"]
     )

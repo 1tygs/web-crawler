@@ -23,6 +23,8 @@ HTML = "text/html; charset=utf-8"
 class Resource:
     status: int = 200
     body: bytes = b""
+    # Sent in order, and only these: a name given twice is sent as two fields, and with no
+    # Content-Type there's none, as aiohttp would otherwise add.
     headers: tuple[tuple[str, str], ...] = (("Content-Type", HTML),)
 
 
@@ -100,9 +102,15 @@ class Site:
             )
         if not isinstance(resource, Resource):
             return await resource(request)
-        response = web.Response(status=resource.status, body=resource.body)
+        response = _Response(status=resource.status, body=resource.body)
+        sent: set[str] = set()
         for name, value in resource.headers:
-            response.headers[name] = value
+            if name.lower() in sent:  # a field sent more than once
+                response.headers.add(name, value)
+            else:
+                response.headers[name] = value
+                sent.add(name.lower())
+        response.typed = "content-type" in sent
         return response
 
     async def __aenter__(self) -> Self:
@@ -131,6 +139,18 @@ class Site:
     ) -> None:
         if self._runner is not None:
             await self._runner.cleanup()
+
+
+class _Response(web.Response):
+    """Sends a Resource's fields as given. aiohttp adds a Content-Type to any body that has
+    none, which a page without a type, to be sniffed, mustn't get."""
+
+    typed = True
+
+    async def _prepare_headers(self) -> None:
+        await super()._prepare_headers()
+        if not self.typed:
+            self.headers.popall("Content-Type", None)
 
 
 def unused_port() -> int:

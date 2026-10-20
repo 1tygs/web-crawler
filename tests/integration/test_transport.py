@@ -1,6 +1,7 @@
 import asyncio
 import gzip
 import zlib
+from collections.abc import Callable
 from compression import zstd
 
 import aiohttp
@@ -115,14 +116,42 @@ async def test_reuses_a_connection_only_after_reading_to_the_end() -> None:
         ("zstd", zstd.compress),
     ],
 )
-async def test_decodes_compressed_bodies(encoding: str, compress: object) -> None:
-    body = b"<!doctype html>" + b"<p>compressible</p>" * 1000
-    assert callable(compress)
+async def test_returns_compressed_bodies_as_sent(
+    encoding: str, compress: Callable[[bytes], bytes]
+) -> None:
+    # The parser workers decompress them (DESIGN.md D8).
+    compressed = compress(b"<!doctype html>" + b"<p>compressible</p>" * 1000)
     resource = Resource(
-        body=compress(body), headers=(("Content-Type", "text/html"), ("Content-Encoding", encoding))
+        body=compressed, headers=(("Content-Type", "text/html"), ("Content-Encoding", encoding))
     )
-    async with Site({"/": resource}) as site, make_transport() as transport:
-        assert await fetch(transport, site.url()) == (200, body)
+    async with (
+        Site({"/": resource}) as site,
+        make_transport() as transport,
+        transport.open(site.url()) as response,
+    ):
+        assert response.headers["Content-Encoding"] == encoding
+        assert await response.read(1 << 20) == (compressed, False)
+
+
+async def test_joins_the_values_of_a_header_sent_twice() -> None:
+    reply = (
+        b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\ncontent-encoding: br\r\n"
+        b"Content-Type: text/html\r\nX-Count: 1\r\nx-count: 2\r\nX-COUNT: 3\r\n"
+        b"Content-Length: 0\r\n\r\n"
+    )
+    async with (
+        RawServer(reply) as server,
+        make_transport() as transport,
+        transport.open(f"http://127.0.0.1:{server.port}/") as response,
+    ):
+        headers = response.headers
+        assert headers["Content-Encoding"] == "gzip, br"  # RFC 9110 §5.3
+        assert headers["x-count"] == "1, 2, 3"
+        assert headers["Content-Type"] == "text/html"
+        assert headers.get("Location") is None
+        assert "content-type" in headers
+        assert len(headers) == 4
+        assert list(headers) == ["Content-Encoding", "Content-Type", "X-Count", "Content-Length"]
 
 
 async def test_accepts_headers_beyond_aiohttps_default_limits() -> None:

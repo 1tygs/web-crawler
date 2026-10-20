@@ -9,7 +9,16 @@ import re
 import ada_url
 from selectolax.lexbor import LexborHTMLParser, LexborNode
 
-from web_crawler.content import Charset, Source, change_encoding, meta_encoding, pick_charset
+from web_crawler.content import (
+    UNDECODABLE,
+    Charset,
+    ContentDecodeError,
+    Source,
+    change_encoding,
+    decode_body,
+    meta_encoding,
+    pick_charset,
+)
 from web_crawler.encodings import UTF_8, decode
 from web_crawler.types import ParseJob, ParseResult, WorkerContext
 from web_crawler.urls import dedupe_key, strip_fragment
@@ -83,13 +92,21 @@ _UTF_8_BOM = b"\xef\xbb\xbf"
 
 
 def parse_page(job: ParseJob, ctx: WorkerContext) -> ParseResult:
-    """Every link on the page, resolved as a browser resolves it, in document order."""
-    tree, _ = parse_html(job.body, job.http_charset, truncated=job.truncated)
+    """Every link on the page, resolved as a browser resolves it, in document order.
+
+    The body is decompressed first, to at most ctx.max_bytes. A body that can't be is an
+    error, and nothing is printed for it.
+    """
+    try:
+        body, cut = decode_body(job.body, job.content_encoding, ctx.max_bytes)
+    except ContentDecodeError:
+        return ParseResult(b"", [], 0, 0, UNDECODABLE)
+    tree, _ = parse_html(body, job.http_charset, truncated=job.truncated or cut)
     links = _Links(job.url, _base_url(tree, job.url), ctx)
     links.extract(tree)
     printed = links.printed
     record = "".join([job.url, "\n", *[f"  {url}\n" for url in printed], "\n"]).encode()
-    return ParseResult(record=record, links=links.followed, links_found=len(printed))
+    return ParseResult(record, links.followed, len(printed), len(body), None)
 
 
 def _base_url(tree: LexborHTMLParser, url: str) -> str:

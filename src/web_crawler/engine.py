@@ -106,6 +106,7 @@ async def crawl(
         sink=sink,
         stats=stats,
         all_urls=cfg.all_urls,
+        max_bytes=cfg.max_page_bytes,
         concurrency=min(INITIAL_CONCURRENCY, cfg.max_concurrency),
         max_pages=cfg.max_pages,
         robots=robots,
@@ -352,6 +353,7 @@ class _Dispatcher:
     sink: Sink
     stats: Stats
     all_urls: bool
+    max_bytes: int  # the most a page's body may decompress to
     concurrency: int
     max_pages: int | None  # stop once this many pages are printed
     robots: RobotsFetcher | None  # None under --ignore-robots
@@ -371,7 +373,7 @@ class _Dispatcher:
     async def run(self, start: CrawlItem, page: Page) -> ExitCode:
         """Crawl from the start page until nothing is outstanding."""
         # The scope is fixed now, so the parsers' context can be too.
-        self._ctx = WorkerContext(self.admission.scope.prefixes, self.all_urls)
+        self._ctx = WorkerContext(self.admission.scope.prefixes, self.max_bytes, self.all_urls)
         if self.robots is not None:
             self._refresh = asyncio.get_running_loop().call_later(
                 self.robots_refresh, self._start_refresh
@@ -461,9 +463,14 @@ class _Dispatcher:
 
     def _page(self, item: CrawlItem, page: Page) -> None:
         result = parse_page(page.job, self._ctx)
+        self.stats.body_bytes += len(page.job.body)
+        if result.error is not None:
+            self.stats.failures[result.error] += 1
+            return
         self.sink.write(result.record)
         # The links are admitted before the page finishes, so that outstanding reaches 0
         # only when the crawl is complete (DESIGN.md §4.2).
         self.admission.admit(result.links, item.depth + 1)
         self.stats.pages += 1
         self.stats.links_found += result.links_found
+        self.stats.decoded_bytes += result.decoded_bytes

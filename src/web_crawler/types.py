@@ -23,17 +23,20 @@ class ParseJob:
     """A page for a parser: coordinator to worker."""
 
     url: str  # final URL after redirects, which is also the base URL
-    body: bytes
+    body: bytes  # as it arrived: still compressed, as content_encoding says
     http_charset: str | None = None  # the Content-Type header's charset parameter
     truncated: bool = False  # the body was cut at the size cap
+    content_encoding: str | None = None  # the Content-Encoding header
 
 
 class ParseResult(NamedTuple):
     """What a parser returns: worker to coordinator."""
 
-    record: bytes  # rendered output, written verbatim
+    record: bytes  # rendered output, written verbatim; b"" when there's an error
     links: list[tuple[str, str]]  # in-scope (key, url) pairs, unique by key, in document order
     links_found: int  # links printed on the page, for stats
+    decoded_bytes: int  # the body's size once decompressed, for stats
+    error: str | None  # why the page can't be printed, e.g. its body can't be decompressed
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +44,7 @@ class WorkerContext:
     """What every parse needs and never changes during a crawl, sent to each worker once."""
 
     scope_prefixes: tuple[str, ...]
+    max_bytes: int  # the most a body may decompress to; the rest is cut off
     all_urls: bool = False  # print every URL-bearing attribute, not only navigational links
 
 

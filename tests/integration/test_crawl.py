@@ -1,18 +1,23 @@
 """Whole crawls of in-process sites over real sockets, checked against ground truth."""
 
 import asyncio
+import gzip
 import os
 import signal
 import sys
+import zlib
 from collections import Counter
+from collections.abc import Callable
+from compression import zstd
 
+import brotli
 import pytest
 from aiohttp import web
 
 from tests.support.bench import make_site
 from tests.support.command import CRAWL, run, split_records
 from tests.support.graphs import expected_records, graph_site
-from tests.support.site import Handler, Resource, Site, page, redirect, unused_port
+from tests.support.site import HTML, Handler, Resource, Site, page, redirect, unused_port
 from web_crawler.config import Config
 from web_crawler.engine import crawl
 from web_crawler.output import MemorySink
@@ -125,6 +130,88 @@ async def test_a_hand_built_site() -> None:
     assert stats.statuses == {200: 9, 301: 1, 302: 1, 404: 1}
     assert report.unique_urls == 13  # /new, reached only by redirect, among them
     assert report.rejected == {"robots.txt": 1}
+
+
+def _compressed(name: str, *codings: str, content_type: str | None = HTML) -> Resource:
+    """A page that links to /NAME/next, with codings applied in order."""
+    body = f'<!doctype html><a href="/{name}/next">next</a>'.encode()
+    for coding in codings:
+        body = COMPRESS[coding](body)
+    headers = [("Content-Type", content_type)] if content_type else []
+    headers += [("Content-Encoding", coding) for coding in codings]
+    return Resource(body=body, headers=tuple(headers))
+
+
+COMPRESS: dict[str, Callable[[bytes], bytes]] = {
+    "gzip": gzip.compress,
+    "x-gzip": gzip.compress,
+    "deflate": zlib.compress,
+    "br": brotli.compress,
+    "zstd": zstd.compress,
+    "utf-8": lambda body: body,  # a coding no server should send: not one at all
+}
+
+
+def _compressed_site() -> dict[str, Resource]:
+    pages = {
+        "gzip": _compressed("gzip", "gzip"),
+        "x-gzip": _compressed("x-gzip", "x-gzip"),
+        "deflate": _compressed("deflate", "deflate"),
+        "br": _compressed("br", "br"),
+        "zstd": _compressed("zstd", "zstd"),
+        "stacked": _compressed("stacked", "gzip", "br"),  # two Content-Encoding fields
+        "utf-8": _compressed("utf-8", "utf-8"),
+        "sniffed": _compressed("sniffed", "gzip", content_type=None),
+    }
+    resources = {f"/{name}": page for name, page in pages.items()}
+    resources |= {f"/{name}/next": page() for name in pages}
+    raw = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+    body = b'<a href="/raw-deflate/next">next</a>'
+    resources["/raw-deflate"] = Resource(
+        body=raw.compress(body) + raw.flush(),
+        headers=(("Content-Type", HTML), ("Content-Encoding", "deflate")),
+    )
+    resources["/raw-deflate/next"] = page()
+    # 64 MiB of zeros after a link, in 64 KiB: the crawl decompresses only up to the cap.
+    bomb = b'<a href="/bomb/next">next</a>' + bytes(64 << 20)
+    resources["/bomb"] = Resource(
+        body=gzip.compress(bomb), headers=(("Content-Type", HTML), ("Content-Encoding", "gzip"))
+    )
+    resources["/bomb/next"] = page()
+    resources["/corrupt"] = Resource(
+        body=b"<a href=/corrupt/next>", headers=(("Content-Type", HTML), ("Content-Encoding", "br"))
+    )
+    resources["/nosniff"] = Resource(
+        body=b"<a href=/nosniff/next>", headers=(("X-Content-Type-Options", "nosniff"),)
+    )
+    names = [*pages, "raw-deflate", "bomb", "corrupt", "nosniff"]
+    resources["/"] = page(*(f"/{name}" for name in names))
+    return resources
+
+
+async def test_compressed_pages_are_crawled_as_a_browser_reads_them() -> None:
+    async with Site(_compressed_site()) as site:
+        sink = MemorySink()
+        cfg = Config(start_url=site.url(), max_page_bytes=1 << 20)
+        report = await crawl(cfg, sink)
+    assert report.exit_code is ExitCode.OK
+    o = site.origin
+    names = ["gzip", "x-gzip", "deflate", "br", "zstd", "stacked", "utf-8", "sniffed"]
+    names += ["raw-deflate", "bomb"]
+    assert sorted(sink.records) == sorted(
+        [
+            b"".join(
+                [f"{o}/\n".encode()]
+                + [f"  {o}/{name}\n".encode() for name in [*names, "corrupt", "nosniff"]]
+                + [b"\n"]
+            ),
+            *(f"{o}/{name}\n  {o}/{name}/next\n\n".encode() for name in names),
+            *(f"{o}/{name}/next\n\n".encode() for name in names),
+        ]
+    )
+    assert report.stats.failures == {"bad content-encoding": 1}
+    assert report.stats.not_html == 1  # nosniff: its body isn't sniffed
+    assert report.stats.decoded_bytes < 2 << 20  # the bomb stopped at the cap
 
 
 @pytest.mark.parametrize("seed", range(4))

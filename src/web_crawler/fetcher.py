@@ -16,7 +16,17 @@ from typing import Protocol
 import ada_url
 
 from web_crawler import robots
-from web_crawler.content import HTML_TYPES, parse_content_type
+from web_crawler.content import (
+    HTML_TYPES,
+    SNIFF_BYTES,
+    UNDECODABLE,
+    UNKNOWN_TYPES,
+    ContentDecodeError,
+    decode_body,
+    nosniff,
+    parse_content_type,
+    sniff_html,
+)
 from web_crawler.frontier import Admission, Hop
 from web_crawler.robots import Availability, RobotsTxt
 from web_crawler.stats import Stats
@@ -30,6 +40,9 @@ MAX_REDIRECTS = 10
 DRAIN_LIMIT = 64 * 1024
 REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 SUCCESSFUL = range(200, 300)
+# How much of a body without a usable type is read to sniff it: far more than its first
+# SNIFF_BYTES need, even compressed.
+SNIFF_READ = 16 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,18 +109,25 @@ class AdmissionHops:
 class Triage(enum.Enum):
     REDIRECT = enum.auto()
     PAGE = enum.auto()
+    SNIFF = enum.auto()  # a page if its first bytes are HTML
     NOT_PAGE = enum.auto()
     FINAL = enum.auto()
 
 
 def triage(status: int, headers: Mapping[str, str]) -> Triage:
     """What to do with a response, from its status and headers. A page is a 2xx response
-    whose Content-Type is HTML (DESIGN.md §2.4)."""
+    whose Content-Type is HTML, or that has no usable type and whose body is sniffed as HTML,
+    unless the server forbids sniffing (DESIGN.md §2.4, MIME Sniffing)."""
     if status in REDIRECT_STATUSES and "Location" in headers:
         return Triage.REDIRECT
     if status in SUCCESSFUL:
         essence, _ = parse_content_type(headers.get("Content-Type"))
-        return Triage.PAGE if essence in HTML_TYPES else Triage.NOT_PAGE
+        if essence in HTML_TYPES:
+            return Triage.PAGE
+        if essence is None or essence in UNKNOWN_TYPES:
+            forbidden = nosniff(headers.get("X-Content-Type-Options"))
+            return Triage.NOT_PAGE if forbidden else Triage.SNIFF
+        return Triage.NOT_PAGE
     return Triage.FINAL
 
 
@@ -179,15 +199,31 @@ class Fetcher:
                 return _Redirect(status, target)
             case Triage.PAGE:
                 body, truncated = await response.read(self._max_page_bytes)
-                _, charset = parse_content_type(response.headers.get("Content-Type"))
-                return Page(ParseJob(response.url, body, charset, truncated))
+                return _page(response, body, truncated)
+            case Triage.SNIFF:
+                return await self._sniff(response, chain)
             case Triage.NOT_PAGE:
-                size = _content_length(response.headers)
-                if size is not None and size <= DRAIN_LIMIT:
-                    await response.read(DRAIN_LIMIT)
+                await _drain_if_small(response)
                 return NotPage(response.url, response.headers.get("Content-Type"))
             case Triage.FINAL:  # pragma: no branch  (the cases are exhaustive)
                 return Final(f"HTTP {status}", f"HTTP {status}", chain, status)
+
+    async def _sniff(self, response: Response, chain: tuple[str, ...]) -> Page | NotPage | Final:
+        """A 2xx response without a usable type: a page if its body starts as HTML does. The
+        body is still compressed, so the start of it is decompressed to sniff."""
+        start, more = await response.read(min(SNIFF_READ, self._max_page_bytes))
+        try:
+            header, _ = decode_body(start, response.headers.get("Content-Encoding"), SNIFF_BYTES)
+        except ContentDecodeError as error:
+            return Final(UNDECODABLE, f"HTTP {response.status}, {error}", chain, response.status)
+        if not sniff_html(header):
+            if more:
+                await _drain_if_small(response)
+            return NotPage(response.url, response.headers.get("Content-Type"))
+        rest, truncated = b"", False
+        if more:
+            rest, truncated = await response.read(self._max_page_bytes - len(start))
+        return _page(response, start + rest, truncated)
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,9 +231,10 @@ class _Answer:
     """One response to a robots.txt request, as much of it as the file's fate needs."""
 
     status: int
-    body: bytes = b""
+    body: bytes = b""  # decompressed
     truncated: bool = False
     location: str | None = None  # for a redirect: where to, resolved; "" if invalid
+    undecodable: str | None = None  # what's wrong with a body that can't be decompressed
 
 
 class RobotsFetcher:
@@ -249,6 +286,9 @@ class RobotsFetcher:
                 kind = str(answer.kind)
                 return RobotsTxt(url, Availability.UNREACHABLE, str(answer), no_answer=kind)
             if answer.location is None:
+                if answer.undecodable is not None:  # what the rules are can't be known
+                    detail = f"HTTP {answer.status}, {answer.undecodable}"
+                    return RobotsTxt(url, Availability.UNREACHABLE, detail)
                 if answer.status in SUCCESSFUL:
                     return RobotsTxt.found(url, answer.body, truncated=answer.truncated)
                 return robots.without_file(url, answer.status)
@@ -261,7 +301,8 @@ class RobotsFetcher:
 
     async def _ask(self, url: str) -> _Answer | TransportError:
         """url's answer, or what kept it from answering. An answer that could change on
-        retry, a 429, a 5xx or an error, isn't kept for the next request."""
+        retry, a 429, a 5xx, a body that couldn't be decompressed or an error, isn't kept for
+        the next request."""
         if (pending := self._answers.get(url)) is not None:
             return await pending
         pending = self._answers[url] = asyncio.get_running_loop().create_future()
@@ -271,7 +312,11 @@ class RobotsFetcher:
             del self._answers[url]
             pending.cancel()  # whoever waits on it stops too
             raise
-        if isinstance(answer, TransportError) or robots.unreachable(answer.status):
+        if (
+            isinstance(answer, TransportError)
+            or robots.unreachable(answer.status)
+            or answer.undecodable is not None
+        ):
             del self._answers[url]
         pending.set_result(answer)
         return answer
@@ -281,8 +326,15 @@ class RobotsFetcher:
             async with self._transport.open(url) as response:
                 status = response.status
                 if status in SUCCESSFUL:
-                    body, truncated = await response.read(robots.MAX_BYTES)
-                    return _Answer(status, body, truncated)
+                    # RFC 9309's limit is on the file decompressed. As many compressed bytes
+                    # hold at least that much of any file that compresses at all.
+                    body, more = await response.read(robots.MAX_BYTES)
+                    encoding = response.headers.get("Content-Encoding")
+                    try:
+                        text, cut = decode_body(body, encoding, robots.MAX_BYTES)
+                    except ContentDecodeError as error:
+                        return _Answer(status, undecodable=str(error))
+                    return _Answer(status, text, more or cut)
                 await response.read(DRAIN_LIMIT)  # so its connection can be reused
                 if status in REDIRECT_STATUSES and "Location" in response.headers:
                     try:
@@ -301,6 +353,22 @@ def _too_many_redirects(chain: tuple[str, ...], looped: bool, target: str, statu
         return Final("redirect loop", detail, chain, status)
     detail = f"more than {MAX_REDIRECTS} redirects; the last was to {target}"
     return Final("too many redirects", detail, chain, status)
+
+
+def _page(response: Response, body: bytes, truncated: bool) -> Page:
+    """The page in response, whose body, still compressed, has been read."""
+    headers = response.headers
+    _, charset = parse_content_type(headers.get("Content-Type"))
+    encoding = headers.get("Content-Encoding")
+    return Page(ParseJob(response.url, body, charset, truncated, encoding))
+
+
+async def _drain_if_small(response: Response) -> None:
+    """Read the rest of an unwanted body if it's small, so that its connection can be
+    reused; a bigger one is cheaper to drop with its connection."""
+    size = _content_length(response.headers)
+    if size is not None and size <= DRAIN_LIMIT:
+        await response.read(DRAIN_LIMIT)
 
 
 def _content_length(headers: Mapping[str, str]) -> int | None:

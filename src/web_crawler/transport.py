@@ -8,7 +8,7 @@ import enum
 import logging
 import ssl
 import urllib.request
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from types import TracebackType
@@ -16,6 +16,7 @@ from typing import Protocol, Self
 
 import aiohttp
 import yarl
+from multidict import CIMultiDictProxy
 
 from web_crawler.config import Config
 
@@ -23,7 +24,8 @@ log = logging.getLogger(__name__)
 
 KIB = 1024
 
-# The types the crawler parses and the encodings it can decode (DESIGN.md §5.2).
+# The types the crawler parses, and the content codings content.decode_body can undo
+# (DESIGN.md §5.2).
 ACCEPT = "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8"
 ACCEPT_ENCODING = "gzip, deflate, br, zstd"
 
@@ -35,7 +37,7 @@ class ErrorKind(enum.StrEnum):
     CONNECT_TIMEOUT = "connect_timeout"
     TIMEOUT = "timeout"
     RESET = "reset"  # the connection was closed or reset
-    PAYLOAD = "payload"  # the body ended early or couldn't be decoded
+    PAYLOAD = "payload"  # the body ended early
     PROTOCOL = "protocol"  # the response wasn't valid HTTP
     INVALID_URL = "invalid_url"
 
@@ -56,10 +58,15 @@ class Response(Protocol):
     @property
     def status(self) -> int: ...
     @property
-    def headers(self) -> Mapping[str, str]: ...  # case-insensitive keys
+    def headers(self) -> Mapping[str, str]:
+        """Case-insensitive. A field sent more than once has its values joined with ", ", as
+        HTTP defines (RFC 9110 §5.3)."""
+        ...
+
     async def read(self, limit: int) -> tuple[bytes, bool]:
-        """Up to limit more bytes of the body, and whether any are left after them.
-        Repeated calls continue where the last one stopped."""
+        """Up to limit more bytes of the body, as sent: still compressed, as the
+        Content-Encoding header says. Also whether any are left after them. Repeated calls
+        continue where the last one stopped."""
         ...
 
 
@@ -104,8 +111,9 @@ class AiohttpTransport:
                 "Accept": ACCEPT,
                 "Accept-Encoding": ACCEPT_ENCODING,
             },
-            # aiohttp decodes bodies until the parser workers do (DESIGN.md §5.5).
-            auto_decompress=True,
+            # The parser workers decompress bodies, off the event loop, which halves its CPU
+            # per request (DESIGN.md D8).
+            auto_decompress=False,
             # Browsers accept cookies from IP-address hosts too; aiohttp needs unsafe=True.
             cookie_jar=aiohttp.CookieJar(unsafe=True),
             timeout=aiohttp.ClientTimeout(total=cfg.timeout, sock_connect=10, sock_read=20),
@@ -186,7 +194,7 @@ class _AiohttpResponse:
     def __init__(self, url: str, response: aiohttp.ClientResponse) -> None:
         self.url = url
         self.status = response.status
-        self.headers: Mapping[str, str] = response.headers
+        self.headers: Mapping[str, str] = _Headers(response.headers)
         self._content = response.content
         self._pending = b""  # read past the last limit, to know whether more was left
 
@@ -208,6 +216,30 @@ class _AiohttpResponse:
             return body[:limit], True
         self._pending = b""
         return body, False
+
+
+class _Headers(Mapping[str, str]):
+    """aiohttp's headers, with a field sent more than once read as one value: its values
+    joined with ", ", in order (RFC 9110 §5.3). aiohttp's own lookup gives the first."""
+
+    __slots__ = ("_fields",)
+
+    def __init__(self, fields: CIMultiDictProxy[str]) -> None:
+        self._fields = fields
+
+    def __getitem__(self, name: str) -> str:
+        values = self._fields.getall(name)
+        return values[0] if len(values) == 1 else ", ".join(values)
+
+    def __iter__(self) -> Iterator[str]:
+        """Each field's name once, as first sent."""
+        names: dict[str, str] = {}
+        for name in self._fields:
+            names.setdefault(name.lower(), name)
+        return iter(names.values())
+
+    def __len__(self) -> int:
+        return len({name.lower() for name in self._fields})
 
 
 @dataclass(frozen=True, slots=True)
