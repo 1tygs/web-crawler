@@ -42,12 +42,22 @@ From the simulation in DESIGN.md A.11 (`bench/limiter_sim.py`, 3 seeds of 20,000
 ## Consequences
 
 - Easier: the law has no I/O, so it's deterministic to test, and the same class runs per host in a multi-host crawler (DESIGN.md §14).
-- Harder: there are three thresholds (1.5×, 10 rounds, 20%) to tune, validated in simulation only. `-v` logs every decision so real crawls can check them.
+- Harder: there are three thresholds (1.5×, 10 rounds, 20%) to tune, validated in simulation only. `-v` logs every decision that changes something, and `-vv` the rest, so real crawls can check them.
 - On CDN-fronted sites with spare capacity the limiter sits at the ceiling, so the ceiling is the politeness setting there. 64 is about ten times the six connections a browser opens per host. It stays the default because it only binds on servers with spare capacity, and the 429/503 and 403 rules catch a server that objects. Revisit it if real crawls run into firewall blocks.
 - Revisit the thresholds after the first real crawls, and if a target's latency rises with load but it never returns errors.
+
+## First real crawls
+
+Two 200-page crawls at `-v`, on 2026-10-20, with the defaults:
+
+- **www.python.org.** The first round's median was 82 ms. Slow start doubled the limit to 32, where a round's median of 130 ms passed 1.5 times the base and halved it to 16; after one held round it grew by one a round, to 23. 104 pages/s.
+- **docs.python.org.** Its pages come from a CDN's cache in about 10 ms, or from the origin in 100–170 ms: the spread of 11.9 times in DESIGN.md A.12. The first round, mostly cached, set the base at 19 ms, so the second, at 170 ms, ended slow start at 8 and halved the limit to 4. Rounds of 4 to 11 responses then swung between the two, holding and growing by turns, and the limit reached 11 in 200 pages: 54 pages/s. No round held ten times in a row, so no probe rebased it.
+
+On docs.python.org the law read the cache's misses as queueing. That costs throughput, not politeness, and a long crawl still grows a round at a time, but it's the case this ADR expected to revisit: a target whose latency swings without load from us.
 
 ## Action items
 
 1. [x] Implement the law as a class with no I/O in `src/web_crawler/limiter.py`. Done in step 3 of v1: `ConcurrencyLaw`, which also cuts once per congestion event (DESIGN.md §5.3).
 2. [x] Turn the scenarios in `bench/limiter_sim.py` into `tests/unit/test_limiter.py`, asserting that D stays within 15% of B's crawl time where the server has spare capacity, and under half of B's queueing on the small origin. Done in step 3: the tests load the simulator, which runs the production class, on every seed, and add an origin that answers 429 above 20 requests in flight (DESIGN.md A.11).
-3. [ ] Log every decision at `-v`, and check the thresholds against real crawls.
+3. [x] Log every decision at `-v`, and check the thresholds against real crawls. Done in step 5: `-v` logs each decision that changes the limit or the law's state, and `-vv` the rest (DESIGN.md §10); the first real crawls are above.
+4. [ ] Revisit the base and the probe for a target whose response times fall in two groups, as docs.python.org's do: for instance a base taken over more rounds than the first, a floor on a round's size, or a probe after ten held rounds out of twenty rather than in a row. Add such a target to `bench/limiter_sim.py` first, and rerun A.11 with any change. Step 3's note belongs here too: slow start that reaches the ceiling stays in slow start, so a late inflated round there halves the limit rather than holding it (DESIGN.md A.15).

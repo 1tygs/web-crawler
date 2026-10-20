@@ -1,9 +1,15 @@
-"""Appendix A.16: what admission costs per URL it hasn't seen, with its rules.
+"""Appendix A.16: what admission costs per URL it hasn't seen, with its rules; and per link it
+has, with and without --max-depth.
 
 Admission runs its rules once per new URL: the trap rules, the extension filter and robots.txt
 (DESIGN.md §5.1). This times Admission.admit on generated URLs, as a crawl's pages hand them
 over, in batches of 120, with no robots.txt and with a short one. Run it on two checkouts to
 compare them.
+
+Most links a crawl's pages hand over have been seen before. Admission drops each with a set
+lookup; under --max-depth it also looks up whether the item is still queued, at a greater
+depth, to lower it. The second measurement admits every URL again, with half of them still
+queued, as a crawl in its middle has them.
 
 Usage: uv run python bench/admission_bench.py [--urls N] [--repeat R]
 """
@@ -52,6 +58,25 @@ def time_admission(links: list[tuple[str, str]], policy: RobotsPolicy | None, re
     return times
 
 
+def time_seen(links: list[tuple[str, str]], max_depth: int | None, repeat: int) -> list[float]:
+    """Microseconds per link for each of `repeat` runs, each admitting again every link,
+    half of them still queued."""
+    scope = Scope.for_url(f"{ORIGIN}/")
+    times = []
+    for _ in range(repeat):
+        frontier = Frontier(max_depth)
+        admission = Admission(frontier, scope)
+        for i in range(0, len(links), 120):
+            admission.admit(links[i : i + 120], depth=1)
+        for _ in range(frontier.queued // 2):
+            frontier.pop(0.0)
+        started = time.perf_counter()
+        for i in range(0, len(links), 120):
+            admission.admit(links[i : i + 120], depth=1)
+        times.append((time.perf_counter() - started) / len(links) * 1e6)
+    return times
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--urls", type=int, default=200_000)
@@ -64,6 +89,11 @@ def main() -> None:
         times = time_admission(links, policy, args.repeat)
         print(f"{label:>14}: {statistics.median(times):.2f} µs per new URL "
               f"(min {min(times):.2f}, median of {args.repeat})")
+    for label, max_depth in {"no --max-depth": None, "--max-depth": 10}.items():
+        times = time_seen(links, max_depth, args.repeat)
+        per = statistics.median(times)
+        print(f"{label:>14}: {per * 1000:.0f} ns per link seen before, {per * 120:.2f} µs per "
+              f"page of 120 (min {min(times) * 1000:.0f} ns, median of {args.repeat})")
 
 
 if __name__ == "__main__":
