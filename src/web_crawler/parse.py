@@ -21,7 +21,7 @@ from web_crawler.content import (
 )
 from web_crawler.encodings import UTF_8, decode
 from web_crawler.types import ParseJob, ParseResult, WorkerContext
-from web_crawler.urls import dedupe_key, strip_fragment
+from web_crawler.urls import dedupe_key
 
 # The elements that hold a page's links, as one selector list, which lexbor matches in
 # document order. Navigational links are printed and crawled (DESIGN.md §2.4); --all-urls
@@ -63,10 +63,13 @@ _URL_ATTRIBUTES = {
     "body": ("background",),
 }
 _SRCSET = frozenset({"srcset", "imagesrcset"})
+_HYPERLINKS = frozenset({"a", "area"})
+_FRAMES = frozenset({"iframe", "frame"})
 _ACTION = frozenset({"action", "formaction"})
 _HYPERLINK_RELS = frozenset({"canonical", "alternate", "next", "prev"})
 
 _HTTP = ("http:", "https:")
+_join_url = ada_url.join_url
 _IGNORED_BASES = ("data:", "javascript:")
 _ASCII_WHITESPACE = "\t\n\f\r "
 _SPLIT_ASCII_WHITESPACE = re.compile("[\t\n\f\r ]+").split
@@ -106,7 +109,7 @@ def parse_page(job: ParseJob, ctx: WorkerContext) -> ParseResult:
     links.extract(tree)
     printed = links.printed
     record = "".join([job.url, "\n", *[f"  {url}\n" for url in printed], "\n"]).encode()
-    return ParseResult(record, links.followed, len(printed), len(body), None)
+    return ParseResult(record, list(links.followed.items()), len(printed), len(body), None)
 
 
 def _base_url(tree: LexborHTMLParser, url: str) -> str:
@@ -122,7 +125,21 @@ def _base_url(tree: LexborHTMLParser, url: str) -> str:
 
 
 class _Links:
-    """A page's links, collected in document order: what to print, and what to crawl."""
+    """A page's links, collected in document order: what to print, and what to crawl.
+
+    _add runs for every URL on a page, hundreds of times, so it keeps to a few operations;
+    the dicts keep each URL's first occurrence, in order (DESIGN.md §5.5)."""
+
+    __slots__ = (
+        "_all_urls",
+        "_base_url",
+        "_document_url",
+        "_refreshed",
+        "_scope",
+        "_selector",
+        "followed",
+        "printed",
+    )
 
     def __init__(self, document_url: str, base_url: str, ctx: WorkerContext) -> None:
         self._document_url = document_url
@@ -130,10 +147,8 @@ class _Links:
         self._scope = ctx.scope_prefixes
         self._all_urls = ctx.all_urls
         self._selector = _ALL_URLS if ctx.all_urls else _NAVIGATIONAL
-        self.printed: list[str] = []  # display URLs, each once
-        self._printed: set[str] = set()
-        self.followed: list[tuple[str, str]] = []  # in-scope navigational (key, url), by key
-        self._keys: set[str] = set()
+        self.printed: dict[str, None] = {}  # display URLs
+        self.followed: dict[str, str] = {}  # in-scope navigational links: key to display URL
         self._refreshed = False  # a meta refresh took effect; any later one is ignored
 
     def extract(self, root: LexborHTMLParser | LexborNode) -> None:
@@ -146,11 +161,11 @@ class _Links:
                     shadow_roots = _shadow_roots(root)
                 if (shadow_root := shadow_roots.get(node.mem_id)) is not None:
                     self.extract(shadow_root)
-            elif tag in ("a", "area"):
+            elif tag in _HYPERLINKS:
                 self._hyperlink(node)
-            elif tag in ("iframe", "frame"):
+            elif tag in _FRAMES:
                 if src := node.attrs.get("src"):  # an empty src loads about:blank
-                    self._add(src, navigational=True)
+                    self._add(src, True)
             elif tag == "link":
                 self._link(node)
             elif tag == "meta":
@@ -163,9 +178,9 @@ class _Links:
         # A valueless href is "", a link to the page itself. [href] also matches an SVG <a>
         # that has only xlink:href.
         if (href := attributes.get("href")) is not None or "href" in attributes:
-            self._add(href or "", navigational=True)
+            self._add(href or "", True)
         elif "xlink:href" in attributes:
-            self._add(attributes.get("xlink:href") or "", navigational=True)
+            self._add(attributes.get("xlink:href") or "", True)
         if self._all_urls and (ping := attributes.get("ping")):
             for url in _SPLIT_ASCII_WHITESPACE(ping):
                 if url:
@@ -180,7 +195,7 @@ class _Links:
             if "stylesheet" in tokens:  # an alternative style sheet isn't a hyperlink
                 tokens.discard("alternate")
             if not tokens.isdisjoint(_HYPERLINK_RELS):
-                self._add(href, navigational=True)
+                self._add(href, True)
             elif self._all_urls and href:  # a resource such as a style sheet or an icon
                 self._add(href)
         if self._all_urls and (srcset := attributes.get("imagesrcset")):
@@ -199,7 +214,7 @@ class _Links:
                 ada_url.join_url(self._base_url, url)
             except ValueError:  # a refresh to an invalid URL doesn't happen
                 return
-            self._add(url, navigational=True)
+            self._add(url, True)
         self._refreshed = True
 
     def _other(self, node: LexborNode) -> None:
@@ -218,25 +233,20 @@ class _Links:
             else:
                 self._add(value)
 
-    def _add(self, value: str, *, navigational: bool = False) -> None:
+    def _add(self, value: str, navigational: bool = False) -> None:
         try:
-            url = ada_url.join_url(self._base_url, value)
+            url = _join_url(self._base_url, value)
         except ValueError:  # not a URL a browser could follow
             return
         if not (url.startswith(_HTTP) or self._all_urls):
             return
-        url = strip_fragment(url)
-        if url not in self._printed:
-            self._printed.add(url)
-            self.printed.append(url)
-        # Both /~a and /%7Ea are printed, as written, but they're one resource to crawl.
-        if (
-            navigational
-            and url.startswith(self._scope)
-            and (key := dedupe_key(url)) not in self._keys
-        ):
-            self._keys.add(key)
-            self.followed.append((key, url))
+        if (hash_at := url.find("#")) != -1:  # urls.strip_fragment, inlined
+            url = url[:hash_at]
+        self.printed[url] = None
+        if navigational and url.startswith(self._scope):
+            # Both /~a and /%7Ea are printed, as written, but they're one resource to crawl.
+            # dedupe_key returns url itself without a "%", as most URLs are.
+            self.followed.setdefault(dedupe_key(url) if "%" in url else url, url)
 
 
 def _shadow_roots(root: LexborHTMLParser | LexborNode) -> dict[int, LexborNode]:
