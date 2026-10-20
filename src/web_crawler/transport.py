@@ -7,6 +7,7 @@ Nothing above this module imports aiohttp: its exceptions arrive as TransportErr
 import enum
 import logging
 import ssl
+import time
 import urllib.request
 from collections.abc import Iterator, Mapping
 from contextlib import AbstractAsyncContextManager
@@ -61,6 +62,11 @@ class Response(Protocol):
     def headers(self) -> Mapping[str, str]:
         """Case-insensitive. A field sent more than once has its values joined with ", ", as
         HTTP defines (RFC 9110 §5.3)."""
+        ...
+
+    @property
+    def ttfb(self) -> float:
+        """Time to first byte: seconds from the request's start until its headers arrived."""
         ...
 
     async def read(self, limit: int) -> tuple[bytes, bool]:
@@ -165,6 +171,7 @@ class _Exchange:
             # ?b=%2f becomes ?b=/, %7E becomes ~ and %zz becomes %25zz (plan §2).
             target = yarl.URL(self._url, encoded=True)
             route = self._proxies.route(target)
+            started = time.perf_counter()
             self._response = await self._session.get(
                 target,
                 allow_redirects=False,
@@ -172,9 +179,10 @@ class _Exchange:
                 headers=route.headers,
                 proxy_headers=route.proxy_headers,
             )
+            ttfb = time.perf_counter() - started
         except (aiohttp.ClientError, TimeoutError, ValueError) as error:
             raise transport_error(error) from error
-        return _AiohttpResponse(self._url, self._response)
+        return _AiohttpResponse(self._url, self._response, ttfb)
 
     async def __aexit__(
         self,
@@ -189,12 +197,13 @@ class _Exchange:
 
 
 class _AiohttpResponse:
-    __slots__ = ("_content", "_pending", "headers", "status", "url")
+    __slots__ = ("_content", "_pending", "headers", "status", "ttfb", "url")
 
-    def __init__(self, url: str, response: aiohttp.ClientResponse) -> None:
+    def __init__(self, url: str, response: aiohttp.ClientResponse, ttfb: float) -> None:
         self.url = url
         self.status = response.status
         self.headers: Mapping[str, str] = _Headers(response.headers)
+        self.ttfb = ttfb
         self._content = response.content
         self._pending = b""  # read past the last limit, to know whether more was left
 

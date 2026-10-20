@@ -237,22 +237,24 @@ async def test_random_sites_match_breadth_first_ground_truth(
     assert max(Counter(site.targets()).values()) == 1  # no URL requested twice
 
 
-async def test_the_crawl_command_prints_the_ground_truth() -> None:
+async def test_the_crawl_command_prints_the_ground_truth(parse_workers: int) -> None:
     graph = make_site(7, pages=200, branching=3.0, cross_links=2)
     async with Site({}) as site:
         site.resources = graph_site(site.origin, graph)
-        code, stdout, stderr = await run(CRAWL, site.url())
+        code, stdout, stderr = await run(CRAWL, "--parse-workers", str(parse_workers), site.url())
     assert code == 0
     assert split_records(stdout) == expected_records(site.origin, graph)
     assert stderr.startswith(f"{len(graph)} pages in ")
     assert "Traceback" not in stderr
 
 
-async def test_python_dash_m_crawls_the_hand_built_site() -> None:
+async def test_python_dash_m_crawls_the_hand_built_site(parse_workers: int) -> None:
     other_port = unused_port()
     async with Site({}) as site:
         site.resources = hand_built(site.port, other_port)
-        code, stdout, stderr = await run(sys.executable, "-m", "web_crawler", site.url())
+        code, stdout, stderr = await run(
+            sys.executable, "-m", "web_crawler", "--parse-workers", str(parse_workers), site.url()
+        )
     assert code == 0
     assert split_records(stdout) == hand_built_records(site.port, other_port)
     assert "statuses: 200 (9), 301 (1), 302 (1), 404 (1)" in stderr
@@ -357,10 +359,13 @@ async def test_a_start_url_robots_txt_disallows_exits_3() -> None:
     assert site.targets() == ["/robots.txt"]
 
 
-async def test_ignore_robots_crawls_without_reading_robots_txt() -> None:
+async def test_ignore_robots_crawls_without_reading_robots_txt(parse_workers: int) -> None:
     resources = {"/robots.txt": DISALLOW_ALL, "/": page("/a"), "/a": page()}
     async with Site(resources) as site:
-        code, stdout, _ = await run(CRAWL, "--ignore-robots", site.url())
+        workers = str(parse_workers)
+        code, stdout, _ = await run(
+            CRAWL, "--ignore-robots", "--parse-workers", workers, site.url()
+        )
     assert code == 0
     assert len(split_records(stdout)) == 2
     assert site.targets() == ["/", "/a"]
@@ -389,7 +394,7 @@ WITH_SIGINT = (
     [(signal.SIGINT, ExitCode.INTERRUPTED), (signal.SIGTERM, ExitCode.TERMINATED)],
 )
 async def test_a_signal_stops_the_crawl_with_whole_records(
-    sig: signal.Signals, code: ExitCode
+    sig: signal.Signals, code: ExitCode, parse_workers: int
 ) -> None:
     started = asyncio.Event()
 
@@ -403,6 +408,8 @@ async def test_a_signal_stops_the_crawl_with_whole_records(
         process = await asyncio.create_subprocess_exec(
             *WITH_SIGINT,
             CRAWL,
+            "--parse-workers",
+            str(parse_workers),
             site.url(),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,

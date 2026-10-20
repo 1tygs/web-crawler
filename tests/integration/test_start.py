@@ -254,10 +254,13 @@ async def test_tls_certificates_are_verified_unless_insecure(
     assert records == [record("https://example.test/")]
 
 
-async def test_the_crawl_command_falls_back_to_http_for_localhost() -> None:
+async def test_the_crawl_command_falls_back_to_http_for_localhost(parse_workers: int) -> None:
     # `crawl localhost:PORT` against a plain local server: https fails its TLS handshake.
     async with Site({"/": page("/a"), "/a": page()}) as site:
-        code, stdout, stderr = await run(CRAWL, f"localhost:{site.port}")
+        workers = str(parse_workers)
+        code, stdout, stderr = await run(
+            CRAWL, "--parse-workers", workers, f"localhost:{site.port}"
+        )
     assert code == 0, stderr
     origin = f"http://localhost:{site.port}"
     assert split_records(stdout) == sorted(
@@ -266,12 +269,15 @@ async def test_the_crawl_command_falls_back_to_http_for_localhost() -> None:
     assert f"https://localhost:{site.port}/ got no answer (tls); trying {origin}/" in stderr
 
 
-async def test_the_crawl_command_with_insecure_accepts_any_certificate() -> None:
+async def test_the_crawl_command_with_insecure_accepts_any_certificate(parse_workers: int) -> None:
     ca = trustme.CA()  # trusted by nothing
     server_ssl = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
     ca.issue_cert("127.0.0.1").configure_cert(server_ssl)
     async with Site({"/": page()}, tls=server_ssl) as site:
-        code, stdout, _ = await run(CRAWL, "--insecure", f"{site.tls_origin}/")
+        workers = str(parse_workers)
+        code, stdout, _ = await run(
+            CRAWL, "--insecure", "--parse-workers", workers, f"{site.tls_origin}/"
+        )
         refused, _, stderr = await run(CRAWL, f"{site.tls_origin}/")
     assert code == 0
     assert split_records(stdout) == [record(f"{site.tls_origin}/")]

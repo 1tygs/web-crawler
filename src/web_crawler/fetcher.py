@@ -9,6 +9,7 @@ by triage() from the status and headers alone.
 import asyncio
 import enum
 import random
+import time
 from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Protocol
@@ -30,7 +31,7 @@ from web_crawler.content import (
 from web_crawler.frontier import Admission, Hop
 from web_crawler.robots import Availability, RobotsTxt
 from web_crawler.stats import Stats
-from web_crawler.transport import Response, Transport, TransportError
+from web_crawler.transport import ErrorKind, Response, Transport, TransportError
 from web_crawler.types import CrawlItem, ParseJob
 from web_crawler.urls import dedupe_key, strip_fragment
 
@@ -96,6 +97,29 @@ class HopPolicy(Protocol):
         ...
 
 
+class Signals(Protocol):
+    """What each request says about the server's load: the concurrency limiter's inputs
+    (DESIGN.md §5.3). Times are the fetcher's clock's."""
+
+    def answered(self, status: int, ttfb: float, issued_at: float) -> None:
+        """The headers of a request sent at issued_at arrived, ttfb seconds after it started."""
+        ...
+
+    def failed(self, kind: ErrorKind, issued_at: float) -> None:
+        """A request sent at issued_at got no response, or its body was cut off."""
+        ...
+
+
+class _Unheard:
+    """Signals for no one: a fetcher that has no limiter to feed."""
+
+    def answered(self, status: int, ttfb: float, issued_at: float) -> None:
+        pass
+
+    def failed(self, kind: ErrorKind, issued_at: float) -> None:
+        pass
+
+
 class AdmissionHops:
     """The hop policy of every item but the start URL: admission decides, at once."""
 
@@ -145,10 +169,20 @@ _STOPPED = {
 
 
 class Fetcher:
-    def __init__(self, transport: Transport, max_page_bytes: int, stats: Stats) -> None:
+    def __init__(
+        self,
+        transport: Transport,
+        max_page_bytes: int,
+        stats: Stats,
+        *,
+        signals: Signals | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self._transport = transport
         self._max_page_bytes = max_page_bytes
         self._stats = stats
+        self._signals = signals or _Unheard()
+        self._clock = clock
 
     async def fetch(self, item: CrawlItem, hops: HopPolicy) -> FetchOutcome:
         """Request item.url and follow its redirects to a page, or to why there isn't one.
@@ -161,10 +195,13 @@ class Fetcher:
         chain = [item.url]
         keys = {item.key}
         while True:
+            issued = self._clock()
             try:
                 async with self._transport.open(chain[-1]) as response:
+                    self._signals.answered(response.status, response.ttfb, issued)
                     outcome = await self._handle(response, tuple(chain))
             except TransportError as error:
+                self._signals.failed(error.kind, issued)
                 return Final(str(error.kind), str(error), tuple(chain))
             if not isinstance(outcome, _Redirect):
                 return outcome

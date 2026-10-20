@@ -12,6 +12,7 @@ def test_defaults_follow_the_design() -> None:
     assert cfg.user_agent.startswith("web-crawler/")
     assert cfg.max_concurrency == 64
     assert cfg.parse_workers is None  # one fewer than the CPUs
+    assert cfg.max_rps is None
     assert cfg.timeout == 60.0
     assert cfg.max_page_bytes == 32 * MIB
     assert not cfg.all_urls
@@ -32,6 +33,9 @@ def test_is_immutable() -> None:
         ("max_concurrency", 0, "max_concurrency must be at least 1"),
         ("max_concurrency", -3, "max_concurrency must be at least 1"),
         ("parse_workers", -1, "parse_workers must be at least 0"),
+        ("max_rps", 0.0, "max_rps must be a positive number"),
+        ("max_rps", -1.0, "max_rps must be a positive number"),
+        ("max_rps", math.nan, "max_rps must be a positive number"),
         ("timeout", 0.0, "timeout must be a positive number"),
         ("timeout", -1.0, "timeout must be a positive number"),
         ("timeout", math.inf, "timeout must be a positive number"),

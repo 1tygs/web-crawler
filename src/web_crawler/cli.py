@@ -47,6 +47,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="stop once N pages are printed; Ctrl-C also stops cleanly, printing whole records",
     )
     parser.add_argument(
+        "--max-concurrency",
+        type=int,
+        metavar="N",
+        default=64,
+        help="the most requests in flight at once; the crawl adapts below it to what the "
+        "server sustains (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--max-rps",
+        type=float,
+        metavar="R",
+        help="the most requests started per second; robots.txt's Crawl-delay can lower it",
+    )
+    parser.add_argument(
+        "--parse-workers",
+        type=_parse_workers,
+        metavar="N",
+        help="parser processes: auto for one fewer than the CPUs, within a container's "
+        "quota, or a number; 0 parses in the crawler's own process (default: auto)",
+    )
+    parser.add_argument(
         "--ignore-robots",
         action="store_true",
         help="don't fetch or obey robots.txt: for crawling your own site",
@@ -72,6 +93,15 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _parse_workers(value: str) -> int | None:
+    if value == "auto":
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"auto or a number, not {value!r}") from None
+
+
 def parse_args(argv: Sequence[str] | None = None) -> Config:
     """Build the Config for argv; exit with status 2 on a usage error, as argparse does."""
     parser = build_parser()
@@ -82,6 +112,9 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
             user_agent=args.user_agent,
             all_urls=args.all_urls,
             max_pages=args.max_pages,
+            max_concurrency=args.max_concurrency,
+            max_rps=args.max_rps,
+            parse_workers=args.parse_workers,
             ignore_robots=args.ignore_robots,
             strict_host=args.strict_host,
             insecure=args.insecure,

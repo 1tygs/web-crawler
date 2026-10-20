@@ -1,8 +1,9 @@
-"""How many requests a crawl keeps in flight (DESIGN.md §5.3).
+"""How many requests a crawl keeps in flight, and how fast it starts them (DESIGN.md §5.3).
 
 ConcurrencyLaw is ADR-001's law: errors cut the limit, latency only stops it growing, and a
-probe confirms that a slowdown is the crawl's own doing. It's pure: the engine passes the
-time in, and bench/limiter_sim.py runs the same class on simulated servers.
+probe confirms that a slowdown is the crawl's own doing. PauseGate spaces request starts
+under --max-rps and robots.txt's Crawl-delay. Both are pure: the engine passes the time in,
+and bench/limiter_sim.py runs the same law on simulated servers.
 """
 
 import enum
@@ -151,3 +152,32 @@ class ConcurrencyLaw:
         self._held = 0
         self._round = []
         return Decision(Kind.CUT, previous, self.limit)
+
+
+class PauseGate:
+    """When the next request may start (DESIGN.md §5.3).
+
+    Under a rate ceiling, each start makes the next wait 1/rate seconds, so requests are
+    spaced evenly rather than sent in bursts, and a quiet spell earns no catching up. With
+    no ceiling, requests start whenever the limit allows.
+    """
+
+    def __init__(self, rate: float | None = None) -> None:
+        self.rate = rate  # requests per second, or None
+        self._next = -math.inf
+
+    def delay(self, now: float) -> float:
+        """Seconds until a request may start: 0 if one may start now."""
+        return max(0.0, self._next - now) if self.rate else 0.0
+
+    def take(self, now: float) -> None:
+        """A request starts now."""
+        if self.rate:
+            self._next = now + 1 / self.rate
+
+
+def rate_ceiling(max_rps: float | None, crawl_delay: float | None) -> float | None:
+    """Requests per second at most: --max-rps, or robots.txt's Crawl-delay of d seconds
+    between requests, 1/d per second, whichever is lower. None if neither applies."""
+    rates = [rate for rate in (max_rps, 1 / crawl_delay if crawl_delay else None) if rate]
+    return min(rates, default=None)

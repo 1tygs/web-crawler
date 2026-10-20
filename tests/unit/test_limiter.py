@@ -4,7 +4,7 @@ behaviour on A.11's simulated servers, which bench/limiter_sim.py runs on this s
 import pytest
 
 from tests.support.bench import simulate
-from web_crawler.limiter import ConcurrencyLaw, Decision, Kind
+from web_crawler.limiter import ConcurrencyLaw, Decision, Kind, PauseGate, rate_ceiling
 
 BASE = 0.100  # seconds: the first round's median time to first byte
 
@@ -171,6 +171,38 @@ def test_decisions_read_as_log_lines() -> None:
         "grow: 8 -> 16, median 123.4 ms, base 100.0 ms"
     )
     assert str(Decision(Kind.CUT, 40, 20)) == "cut: 40 -> 20"
+
+
+def test_the_pause_gate_spaces_starts_evenly() -> None:
+    gate = PauseGate(rate=4)  # a start every 0.25 s
+    assert gate.delay(10.0) == 0
+    gate.take(10.0)
+    assert gate.delay(10.0) == 0.25
+    assert gate.delay(10.1) == pytest.approx(0.15)
+    assert gate.delay(10.3) == 0
+    gate.take(10.3)  # a start that came late: the next waits its full turn, no catching up
+    assert gate.delay(10.5) == pytest.approx(0.05)
+
+
+def test_without_a_rate_the_gate_never_waits() -> None:
+    gate = PauseGate()
+    gate.take(1.0)
+    assert gate.delay(1.0) == 0
+
+
+@pytest.mark.parametrize(
+    ("max_rps", "crawl_delay", "rate"),
+    [
+        (None, None, None),
+        (10.0, None, 10.0),
+        (None, 2.0, 0.5),  # Crawl-delay: 2, a request every 2 s
+        (10.0, 2.0, 0.5),  # whichever allows fewer
+        (0.25, 2.0, 0.25),
+        (None, 0.0, None),  # Crawl-delay: 0 asks for nothing
+    ],
+)
+def test_rate_ceiling(max_rps: float | None, crawl_delay: float | None, rate: float | None) -> None:
+    assert rate_ceiling(max_rps, crawl_delay) == rate
 
 
 SEEDS = (1, 2, 3)

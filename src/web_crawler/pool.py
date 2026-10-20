@@ -39,6 +39,11 @@ class ParseCrashed(Exception):
 
 
 class Parser(Protocol):
+    @property
+    def workers(self) -> int:
+        """The most parser processes it runs: 0 for parsing on the event loop."""
+        ...
+
     async def parse(self, job: ParseJob) -> ParseResult:
         """job's result; raises ParseCrashed if parsing it kills a worker every time."""
         ...
@@ -54,6 +59,8 @@ class Parser(Protocol):
 
 class InlineParser:
     """parse_page on the event loop, for --parse-workers 0."""
+
+    workers = 0
 
     def __init__(self, ctx: WorkerContext) -> None:
         self._ctx = ctx
@@ -130,7 +137,7 @@ class ProcessParser:
         self._target = target
         self._context = context or start_method()
         self._pool = self._new_pool(workers)
-        self._workers = workers
+        self.workers = workers
         self._generation = 0  # how many times the main pool has been replaced
         self._isolation: ProcessPoolExecutor | None = None
         self._suspects = asyncio.Lock()  # one at a time in the isolation pool
@@ -155,7 +162,7 @@ class ProcessParser:
                 if generation == self._generation:  # the first to see it broken
                     log.warning("a parser process died; starting its pool again")
                     # The broken pool stops its other workers and cleans up on its own.
-                    self._pool = self._new_pool(self._workers)
+                    self._pool = self._new_pool(self.workers)
                     self._generation += 1
                 if breaks >= _SUSPECT:
                     return await self._parse_alone(job)
