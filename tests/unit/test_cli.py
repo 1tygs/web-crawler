@@ -41,6 +41,13 @@ def test_all_urls() -> None:
     assert parse_args(["--all-urls", "https://example.com/"]).all_urls
 
 
+def test_start_url_options() -> None:
+    cfg = parse_args(["https://example.com/", "--strict-host", "--insecure"])
+    assert (cfg.strict_host, cfg.insecure) == (True, True)
+    cfg = parse_args(["https://example.com/"])
+    assert (cfg.strict_host, cfg.insecure) == (False, False)
+
+
 def test_robots_options() -> None:
     cfg = parse_args(["https://example.com/", "--ignore-robots", "--user-agent", "MyBot/2.0"])
     assert cfg.ignore_robots
@@ -60,7 +67,7 @@ def test_help_exits_zero(capsys: pytest.CaptureFixture[str]) -> None:
         parse_args(["--help"])
     assert exit_info.value.code == 0
     assert capsys.readouterr().out.startswith(
-        "usage: crawl [-h] [--all-urls] [--ignore-robots] [--user-agent UA] [--version]"
+        "usage: crawl [-h] [--all-urls] [--ignore-robots] [--strict-host] [--insecure]"
     )
 
 

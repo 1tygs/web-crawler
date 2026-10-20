@@ -28,6 +28,8 @@ class Config:
     max_page_bytes: int = 32 * MIB  # body bytes read from one page
     all_urls: bool = False  # print every URL-bearing attribute; still crawl only links
     ignore_robots: bool = False  # for crawling your own site
+    strict_host: bool = False  # a start URL that redirects to its www. variant can't start
+    insecure: bool = False  # don't verify TLS certificates
     robots_refresh: float = 24 * 3600.0  # seconds between fetches of robots.txt (RFC 9309)
 
     def __post_init__(self) -> None:

@@ -46,6 +46,7 @@ Checked on 2026-10-20 against the versions pinned in Appendix A (Python 3.14.6, 
 | Found in PR 2: Python's single-byte codecs decode 89 bytes unlike the standard's indexes: windows-874 and windows-1250 to 1258 leave bytes in 0x80–0x9F undefined that WHATWG maps to C1 controls, and KOI8-U and windows-1255 differ on three. Its multi-byte codecs differ on a few hundred rare characters (DESIGN A.14) | Single-byte encodings decode through tables built from Python's codecs with those bytes filled in, tested byte for byte against the standard's indexes. Multi-byte encodings use Python's codecs |
 | Found in PR 2: lexbor reads a UTF-8 byte order mark in `bytes` as text, which ends `<head>` there and makes it ignore a `<frameset>` after it | `parse.py` drops the mark before parsing |
 | Found in PR 2: Protego doesn't skip a UTF-8 byte order mark, so a robots.txt that starts with one loses its first line, often `User-agent: *` and with it the group's rules | robots.txt is decoded as `utf-8-sig` |
+| Found in PR 2: `--user-agent` and `--insecure` weren't assigned to a PR | Both landed in PR 2: the User-Agent's product token selects the robots.txt group, and the TLS test harness checks `--insecure` end to end |
 | Found in PR 2: selectolax parses the selector string on every `css()` call, about 1.65 µs for the navigational list; `template_fragments()` walks the whole tree (31 µs on a 1.4 MB page with none); `node.attributes` copies every attribute, where `node.attrs.get` reads one, about twice as fast on attribute-heavy pages | One selector pass per tree, `template_fragments()` only for a page with a declarative shadow root, and `node.attrs` |
 | Found in PR 2: html5lib's encoding tests expect a `<meta>` after the first 1,024 bytes to count, as the HTML standard's "change the encoding" makes it when the parser reaches it | A charset from the prescan or the guess is tentative: `parse.py` checks the parsed page's first declaring `<meta>` and decodes again if it names another encoding. It costs about 1 µs a page (`css_first`) |
 | Python 3.14 has `ProcessPoolExecutor.kill_workers()`, `os.process_cpu_count()` and `asyncio.run(loop_factory=)`. `PYTHON_CPU_COUNT` and `-X cpu_count` override `process_cpu_count()`; isolated mode (`-I`) ignores the variable | The second Ctrl-C calls `kill_workers()`. uvloop comes in through `loop_factory`. The cgroup cap applies only when no override is set (§5.12) |
@@ -383,15 +384,15 @@ It loops over at most 10 hops. Each iteration opens the request, feeds the limit
 
 `async def crawl(cfg, sink, *, transport=None, clock=time.monotonic, rng=None) -> CrawlReport`
 
-**Startup**
+**Startup** is `engine._Start`, which is also the start item's `HopPolicy`:
 1. `normalize_start`, then `Scope`, then open the transport.
-2. Fetch robots.txt for the scope's origins in parallel, unless `--ignore-robots`. If the start URL is disallowed, exit 3.
-3. Fetch the start item under a `StartHopPolicy`:
+2. Fetch robots.txt for the scope's origins in parallel, unless `--ignore-robots`. If the start URL is disallowed, or its origin's file is unreachable, exit 3; if its host never answered, say that instead.
+3. Fetch the start item under the start policy:
    - same-host hops are admitted normally;
-   - a host change that only adds or removes `www.` (unless `--strict-host`) re-scopes, says so on stderr, and fetches the new origins' robots.txt before the hop;
+   - a host change that only adds or removes `www.`, on the same ports and schemes (`Scope.www_switch`, unless `--strict-host`), re-scopes, says so on stderr, and fetches the new origins' robots.txt before the hop. Files already read are kept, so a hop back costs nothing;
    - any other host change exits 3 and prints the URL to use.
 
-   The start item's retries run inline, since nothing else is queued yet. A start URL whose scheme was implicit and fails at connect or TLS is retried once as `http://`. A start outcome that isn't a page exits 3 with its reason.
+   The start item's retries run inline, since nothing else is queued yet. A start URL whose scheme was implicit, and whose host gives no answer over https (connect, connect timeout or TLS, for robots.txt or the page), is retried once as `http://`. A start outcome that isn't a page exits 3 with its reason.
 4. The scope is now fixed. Create the pool, and send the start page through the normal parse path.
 
 **Dispatch.** `_pump()` is synchronous. It runs after every completion, permit release, timer and sink drain:

@@ -1,12 +1,14 @@
 """An in-process HTTP site for tests, with a log of every request it served.
 
 Resources are keyed by the raw request target, exactly as it arrives in the request line, so
-a test can tell /a?b=%2f from /a?b=/.
+a test can tell /a?b=%2f from /a?b=/. A site given a TLS context serves the same resources
+over https too, on a port of its own.
 """
 
 import asyncio
 import html
 import socket
+import ssl
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from types import TracebackType
@@ -43,20 +45,33 @@ class Request:
     target: str  # the raw request target, as sent
     headers: Mapping[str, str]
     peer: tuple[str, int]  # the client's address: the same port means a reused connection
+    scheme: str = "http"
+
+    @property
+    def url(self) -> str:
+        """The URL requested, from the scheme, the Host header and the target."""
+        return f"{self.scheme}://{self.headers['Host']}{self.target}"
 
 
 @dataclass(slots=True)
 class Site:
-    """Serves resources on http://127.0.0.1:PORT, and 404 for any other target."""
+    """Serves resources on http://127.0.0.1:PORT, and 404 for any other target; with tls,
+    on https://127.0.0.1:TLS_PORT as well."""
 
     resources: Mapping[str, Resource | Handler]
+    tls: ssl.SSLContext | None = None
     requests: list[Request] = field(default_factory=list)
     port: int = 0
+    tls_port: int = 0
     _runner: web.AppRunner | None = None
 
     @property
     def origin(self) -> str:
         return f"http://127.0.0.1:{self.port}"
+
+    @property
+    def tls_origin(self) -> str:
+        return f"https://127.0.0.1:{self.tls_port}"
 
     def url(self, target: str = "/") -> str:
         return self.origin + target
@@ -64,10 +79,19 @@ class Site:
     def targets(self) -> list[str]:
         return [request.target for request in self.requests]
 
+    def urls(self) -> list[str]:
+        return [request.url for request in self.requests]
+
     async def _handle(self, request: web.Request) -> web.StreamResponse:
         peer = request.transport.get_extra_info("peername") if request.transport else None
         self.requests.append(
-            Request(request.method, request.raw_path, dict(request.headers), tuple(peer or ("", 0)))
+            Request(
+                request.method,
+                request.raw_path,
+                dict(request.headers),
+                tuple(peer or ("", 0)),
+                request.scheme,
+            )
         )
         resource = self.resources.get(request.raw_path)
         if resource is None:
@@ -92,6 +116,11 @@ class Site:
         sock.bind(("127.0.0.1", 0))
         self.port = sock.getsockname()[1]
         await web.SockSite(self._runner, sock).start()
+        if self.tls is not None:
+            tls_sock = socket.socket()
+            tls_sock.bind(("127.0.0.1", 0))
+            self.tls_port = tls_sock.getsockname()[1]
+            await web.SockSite(self._runner, tls_sock, ssl_context=self.tls).start()
         return self
 
     async def __aexit__(

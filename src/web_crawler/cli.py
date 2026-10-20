@@ -46,6 +46,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="don't fetch or obey robots.txt: for crawling your own site",
     )
     parser.add_argument(
+        "--strict-host",
+        action="store_true",
+        help="refuse a start URL that redirects to another host, even when only www. differs",
+    )
+    parser.add_argument(
+        "--insecure",
+        action="store_true",
+        help="don't verify TLS certificates: for development hosts",
+    )
+    parser.add_argument(
         "--user-agent",
         metavar="UA",
         default=USER_AGENT,
@@ -66,6 +76,8 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
             user_agent=args.user_agent,
             all_urls=args.all_urls,
             ignore_robots=args.ignore_robots,
+            strict_host=args.strict_host,
+            insecure=args.insecure,
         )
     except ConfigError as error:
         parser.error(str(error))

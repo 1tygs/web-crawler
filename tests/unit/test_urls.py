@@ -5,7 +5,14 @@ import pytest
 from hypothesis import assume, given
 from hypothesis import strategies as st
 
-from web_crawler.urls import Scope, StartURLError, dedupe_key, normalize_start, strip_fragment
+from web_crawler.urls import (
+    Scope,
+    StartURLError,
+    dedupe_key,
+    is_www_variant,
+    normalize_start,
+    strip_fragment,
+)
 
 
 @pytest.mark.parametrize(
@@ -150,6 +157,54 @@ def test_scope_edge_cases(start: str, href: str, inside: bool) -> None:
     start_url, _ = normalize_start(start)
     url = strip_fragment(ada_url.join_url(start_url, href))
     assert Scope.for_url(start_url).contains(url) is inside
+
+
+BOTH = ("https://www.example.com", "http://www.example.com")
+
+
+@pytest.mark.parametrize(
+    ("start", "target", "origins"),
+    [
+        # Adding or removing "www." moves the crawl, on the default ports with both schemes.
+        ("https://example.com/", "https://www.example.com/x", BOTH),
+        ("https://example.com/", "http://www.example.com/", BOTH),
+        (
+            "https://www.example.com/",
+            "https://example.com/",
+            ("https://example.com", "http://example.com"),
+        ),
+        (
+            "http://example.com:8080/",
+            "http://www.example.com:8080/",
+            ("http://www.example.com:8080",),
+        ),
+        # Changing the port, or the scheme of an explicit port, is another service.
+        ("http://example.com:8080/", "https://www.example.com:8080/", None),
+        ("https://example.com/", "https://www.example.com:8443/", None),
+        ("http://example.com:8080/", "http://www.example.com/", None),
+        # Any other host, or the same one, isn't a switch.
+        ("https://example.com/", "https://blog.example.com/", None),
+        ("https://example.com/", "https://www2.example.com/", None),
+        ("https://example.com/", "https://www.www.example.com/", None),
+        ("https://example.com/", "https://example.com/other", None),
+        ("https://example.com/", "https://wwwexample.com/", None),
+        # Nor is a URL that isn't http(s), or doesn't parse.
+        ("https://example.com/", "ftp://www.example.com/", None),
+        ("https://example.com/", "https://www.exa mple.com/", None),
+        ("https://127.0.0.1/", "https://www.127.0.0.1/", None),
+    ],
+)
+def test_www_switch(start: str, target: str, origins: tuple[str, ...] | None) -> None:
+    switched = Scope.for_url(start).www_switch(target)
+    assert (switched and switched.origins) == origins
+
+
+def test_is_www_variant() -> None:
+    assert is_www_variant("example.com", "www.example.com")
+    assert is_www_variant("www.example.com", "example.com")
+    assert not is_www_variant("example.com", "example.com")
+    assert not is_www_variant("example.com", "www2.example.com")
+    assert not is_www_variant("example.com", "www.example.org")
 
 
 def test_scope_rejects_a_non_http_url() -> None:

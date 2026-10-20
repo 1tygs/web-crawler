@@ -1,11 +1,11 @@
 import asyncio
 import itertools
-import random
 from collections.abc import Collection
 
 import pytest
 
 from tests.support.fake_transport import Answer, FakeTransport, Reply
+from tests.support.jitter import Highest
 from web_crawler.fetcher import (
     DRAIN_LIMIT,
     MAX_REDIRECTS,
@@ -138,6 +138,7 @@ async def test_does_not_follow_a_redirect_out_of_scope(location: str) -> None:
         f"HTTP 301 to {location}, outside the crawl's scope",
         (START,),
         301,
+        location,
     )
     assert transport.requested == [START]
 
@@ -312,13 +313,6 @@ class Sleeps:
 
     async def __call__(self, delay: float) -> None:
         self.delays.append(delay)
-
-
-class Highest(random.Random):
-    """Jitter at the top of its range, so that backoffs are predictable."""
-
-    def uniform(self, a: float, b: float) -> float:
-        return b
 
 
 ROBOTS = "https://example.com/robots.txt"

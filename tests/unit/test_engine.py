@@ -1,13 +1,13 @@
 import asyncio
 import itertools
 import logging
-import random
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 
 import pytest
 
 from tests.support.fake_transport import Answer, FakeResponse, FakeTransport, Reply
+from tests.support.jitter import Lowest
 from web_crawler.config import Config
 from web_crawler.engine import INITIAL_CONCURRENCY, crawl
 from web_crawler.output import MemorySink
@@ -28,11 +28,6 @@ def pages(transport: FakeTransport) -> list[str]:
 
 def robots(rules: str) -> Reply:
     return Reply(headers=TEXT, body=rules.encode())
-
-
-class NoJitter(random.Random):
-    def uniform(self, a: float, b: float) -> float:
-        return a
 
 
 def html(*hrefs: str, delay: float = 0.0) -> Reply:
@@ -96,8 +91,9 @@ async def test_keeps_a_fixed_number_of_fetches_in_flight(
         ),
         (Reply(headers={}), "isn't an HTML page (Content-Type: none)"),
         (
-            Reply(301, {"Location": "https://www.example.com/"}),
-            "HTTP 301 to https://www.example.com/, outside the crawl's scope",
+            Reply(301, {"Location": "https://blog.example.com/"}),
+            "can't start: https://example.com/ redirects to https://blog.example.com/, outside "
+            "the crawl's scope; to crawl there instead, run: crawl https://blog.example.com/",
         ),
     ],
 )
@@ -321,7 +317,7 @@ async def test_an_unreachable_robots_txt_on_the_other_origin_disallows_it(
         "https://example.com/secure": html(),
     }
     transport = FakeTransport(replies)
-    report = await crawl(Config(start_url=START), MemorySink(), transport=transport, rng=NoJitter())
+    report = await crawl(Config(start_url=START), MemorySink(), transport=transport, rng=Lowest())
     assert report.exit_code is ExitCode.OK
     assert sorted(pages(transport)) == [START, "https://example.com/secure"]
     assert report.rejected == {"robots.txt": 1}
@@ -357,7 +353,7 @@ async def test_a_start_url_robots_txt_keeps_from_crawling_cant_start(
 ) -> None:
     transport = FakeTransport({ROBOTS: robots_txt, START: html()})
     sink = MemorySink()
-    report = await crawl(Config(start_url=START), sink, transport=transport, rng=NoJitter())
+    report = await crawl(Config(start_url=START), sink, transport=transport, rng=Lowest())
     assert report.exit_code is ExitCode.CANNOT_START
     assert message in caplog.text
     assert pages(transport) == []
@@ -414,7 +410,7 @@ async def test_a_refetch_that_fails_keeps_the_rules(caplog: pytest.LogCaptureFix
     replies[ROBOTS] = [robots("User-agent: *\nDisallow: /4\n"), Reply(503, TEXT)]
     transport = FakeTransport(replies)
     cfg = Config(start_url=START, robots_refresh=0.05)
-    report = await crawl(cfg, MemorySink(), transport=transport, rng=NoJitter())
+    report = await crawl(cfg, MemorySink(), transport=transport, rng=Lowest())
     assert report.rejected == {"robots.txt": 1}
     assert (
         "https://example.com/robots.txt is unreachable (HTTP 503, 3 tries): keeping its rules"
@@ -443,3 +439,19 @@ async def test_a_bug_in_a_refetch_is_counted_and_the_crawl_continues(
     assert report.stats.internal_errors >= 1
     assert report.stats.pages == 5
     assert "internal error while refetching robots.txt" in caplog.text
+
+
+async def test_records_stream_in_the_order_pages_complete() -> None:
+    # DESIGN.md §2.4: output isn't sorted. /slow is linked first, and printed last.
+    replies: dict[str, Answer | list[Answer]] = {
+        START: html("/slow", "/fast"),
+        "https://example.com/slow": html(delay=0.05),
+        "https://example.com/fast": html(),
+    }
+    sink = MemorySink()
+    await crawl(Config(start_url=START), sink, transport=FakeTransport(replies))
+    assert [record.split(b"\n")[0] for record in sink.records] == [
+        b"https://example.com/",
+        b"https://example.com/fast",
+        b"https://example.com/slow",
+    ]

@@ -77,6 +77,7 @@ class Scope:
     port, only the start URL's own scheme and port are: another port is another service.
     """
 
+    host: str  # as WHATWG serializes it: an IPv6 literal keeps its brackets
     prefixes: tuple[str, ...]  # every in-scope display URL starts with one of these
     origins: tuple[str, ...]  # the origins whose robots.txt applies
 
@@ -85,17 +86,36 @@ class Scope:
         parsed = ada_url.URL(url)
         if parsed.protocol not in ("http:", "https:"):
             raise ValueError(f"not an http or https URL: {url!r}")
-        host = parsed.hostname  # an IPv6 literal keeps its brackets
+        host = parsed.hostname
         if parsed.port:
             origins: tuple[str, ...] = (f"{parsed.protocol}//{host}:{parsed.port}",)
         else:
             origins = (f"https://{host}", f"http://{host}")
-        return cls(prefixes=tuple(f"{origin}/" for origin in origins), origins=origins)
+        return cls(host, tuple(f"{origin}/" for origin in origins), origins)
 
     def contains(self, url: str) -> bool:
         """Whether a display URL is in scope. Look-alikes such as example.com.evil.net,
         example.com:8443 and example.com@evil.net fail without being parsed."""
         return url.startswith(self.prefixes)
+
+    def www_switch(self, url: str) -> Scope | None:
+        """The scope a start URL moves to when it redirects to url (DESIGN.md §2.4): url's
+        host, if it only adds or removes "www." from this scope's, on the same ports and
+        schemes. None for any other URL."""
+        try:
+            hostname = ada_url.URL(url).hostname
+            switched = Scope.for_url(url)
+        except ValueError:
+            return None
+        same_ports = switched.origins == tuple(
+            origin.replace(f"//{self.host}", f"//{hostname}", 1) for origin in self.origins
+        )
+        return switched if same_ports and is_www_variant(self.host, hostname) else None
+
+
+def is_www_variant(a: str, b: str) -> bool:
+    """Whether two hosts differ only by a "www." label at the start of one of them."""
+    return a == f"www.{b}" or b == f"www.{a}"
 
 
 def strip_fragment(url: str) -> str:

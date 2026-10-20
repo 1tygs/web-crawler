@@ -63,6 +63,7 @@ class Final:
     detail: str  # what happened, for messages
     chain: tuple[str, ...]  # the URLs requested, in order; the last one's answer ended it
     status: int | None = None  # that answer's status, if it was an HTTP response
+    location: str | None = None  # where a redirect that wasn't followed led
 
     @property
     def url(self) -> str:
@@ -159,7 +160,8 @@ class Fetcher:
                 return Claimed(target, tuple(chain))
             else:
                 reason, why = _STOPPED[hop]
-                return Final(reason, f"HTTP {status} to {target}, {why}", tuple(chain), status)
+                detail = f"HTTP {status} to {target}, {why}"
+                return Final(reason, detail, tuple(chain), status, target)
 
     async def _handle(self, response: Response, chain: tuple[str, ...]) -> FetchOutcome | _Redirect:
         """The outcome of one response, the last of chain, or the redirect it makes."""

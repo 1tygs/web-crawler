@@ -6,6 +6,7 @@ Nothing above this module imports aiohttp: its exceptions arrive as TransportErr
 
 import enum
 import logging
+import ssl
 import urllib.request
 from collections.abc import Mapping
 from contextlib import AbstractAsyncContextManager
@@ -72,9 +73,20 @@ class Transport(Protocol):
 
 
 class AiohttpTransport:
-    """Transport over an aiohttp keep-alive pool. Create it inside the event loop."""
+    """Transport over an aiohttp keep-alive pool. Create it inside the event loop.
 
-    def __init__(self, cfg: Config) -> None:
+    resolver and ssl_context are for tests: a resolver that sends test hosts' default ports
+    to local servers, and a context that trusts their certificates. Otherwise TLS
+    certificates are verified, unless cfg.insecure.
+    """
+
+    def __init__(
+        self,
+        cfg: Config,
+        *,
+        resolver: aiohttp.abc.AbstractResolver | None = None,
+        ssl_context: ssl.SSLContext | None = None,
+    ) -> None:
         # Four connections beyond the concurrency limit, for requests the dispatcher doesn't
         # count, such as robots.txt refetches and health probes.
         connections = cfg.max_concurrency + 4
@@ -84,6 +96,8 @@ class AiohttpTransport:
                 limit_per_host=connections,
                 ttl_dns_cache=300,
                 keepalive_timeout=30,
+                resolver=resolver,
+                ssl=ssl_context if ssl_context is not None else not cfg.insecure,
             ),
             headers={
                 "User-Agent": cfg.user_agent,

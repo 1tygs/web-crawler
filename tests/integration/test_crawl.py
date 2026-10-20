@@ -4,38 +4,18 @@ import asyncio
 import signal
 import sys
 from collections import Counter
-from pathlib import Path
 
 import pytest
 from aiohttp import web
 
 from tests.support.bench import make_site
+from tests.support.command import CRAWL, run, split_records
 from tests.support.graphs import expected_records, graph_site
 from tests.support.site import Handler, Resource, Site, page, redirect, unused_port
 from web_crawler.config import Config
 from web_crawler.engine import crawl
 from web_crawler.output import MemorySink
 from web_crawler.types import ExitCode
-
-# The console script that `uv sync` installs next to the interpreter.
-CRAWL = str(Path(sys.executable).with_name("crawl"))
-
-
-def split_records(stdout: bytes) -> list[bytes]:
-    """stdout as whole records, sorted. Each record ends with a blank line, and no line
-    is blank otherwise."""
-    *records, rest = stdout.split(b"\n\n")
-    assert rest == b"", "the output ends inside a record"
-    return sorted(record + b"\n\n" for record in records)
-
-
-async def run(*args: str) -> tuple[int, bytes, str]:
-    process = await asyncio.create_subprocess_exec(
-        *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-    )
-    stdout, stderr = await process.communicate()
-    assert process.returncode is not None
-    return process.returncode, stdout, stderr.decode()
 
 
 def hand_built(port: int, other_port: int) -> dict[str, Resource]:
@@ -232,7 +212,8 @@ START_FAILURES = {
     ),
     "redirect to another host": (
         redirect("http://localhost:{port}/"),
-        "{start}: HTTP 301 to http://localhost:{port}/, outside the crawl's scope",
+        "{start} redirects to http://localhost:{port}/, outside the crawl's scope; to crawl "
+        "there instead, run: crawl http://localhost:{port}/",
     ),
 }
 
