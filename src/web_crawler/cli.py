@@ -11,6 +11,7 @@ from web_crawler import __version__
 from web_crawler.config import MIB, USER_AGENT, Config, ConfigError
 from web_crawler.engine import crawl
 from web_crawler.output import ThreadedSink, to_devnull
+from web_crawler.records import FORMATS
 from web_crawler.types import ExitCode
 
 log = logging.getLogger(__name__)
@@ -53,6 +54,28 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help="crawl only pages within N links of the start URL, exactly, however the "
         "fetches interleave; 0 crawls the start URL alone",
+    )
+    parser.add_argument(
+        "--format",
+        choices=FORMATS,
+        default="text",
+        help="text prints each page's URL, then each link on it indented by two spaces, then "
+        "a blank line; jsonl prints a JSON object per page, with its url, status, depth and "
+        "links, and redirected_from, truncated and canonical when there's something to say "
+        "(default: %(default)s)",
+    )
+    parser.add_argument(
+        "--include-errors",
+        action="store_true",
+        help="with --format jsonl, also print a record for each URL that ended without a "
+        "page, saying why: an error, a response that isn't HTML, or a redirect to a page "
+        "that another link leads to",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        metavar="FILE",
+        help="write the records to FILE, replacing it, rather than to stdout",
     )
     parser.add_argument(
         "--max-concurrency",
@@ -161,7 +184,10 @@ def _parse_workers(value: str) -> int | None:
 def parse_args(argv: Sequence[str] | None = None) -> Config:
     """Build the Config for argv; exit with status 2 on a usage error, as argparse does."""
     parser = build_parser()
-    args = parser.parse_args(argv)
+    return _config(parser, parser.parse_args(argv))
+
+
+def _config(parser: argparse.ArgumentParser, args: argparse.Namespace) -> Config:
     try:
         return Config(
             start_url=args.url,
@@ -169,6 +195,8 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
             all_urls=args.all_urls,
             max_pages=args.max_pages,
             max_depth=args.max_depth,
+            format=args.format,
+            include_errors=args.include_errors,
             max_concurrency=args.max_concurrency,
             max_rps=args.max_rps,
             parse_workers=args.parse_workers,
@@ -186,17 +214,27 @@ def parse_args(argv: Sequence[str] | None = None) -> Config:
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the command line and return its exit code."""
-    cfg = parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    cfg = _config(parser, args)
+    try:
+        # Opened before the crawl starts, so that a path that can't be written to is a
+        # usage error rather than a crawl's worth of output lost.
+        output = open(args.output, "wb") if args.output is not None else None  # noqa: SIM115
+    except OSError as error:
+        parser.error(f"can't write to {args.output}: {error.strerror}")
     logging.basicConfig(format="crawl: %(message)s", level=logging.WARNING, stream=sys.stderr)
     try:
-        report = asyncio.run(
-            crawl(cfg, ThreadedSink(sys.stdout.buffer)), loop_factory=_loop_factory
-        )
+        sink = ThreadedSink(output or sys.stdout.buffer)
+        report = asyncio.run(crawl(cfg, sink), loop_factory=_loop_factory)
     except KeyboardInterrupt:
         return ExitCode.INTERRUPTED
     except Exception:
         log.exception("internal error")
         return ExitCode.INTERNAL_ERROR
+    finally:
+        if output is not None:
+            output.close()
     if report.exit_code is not ExitCode.CANNOT_START:
         try:
             print(report.summary, file=sys.stderr, flush=True)

@@ -1,5 +1,6 @@
 import asyncio
 import itertools
+import json
 import logging
 import time
 from collections.abc import AsyncIterator, Callable, Mapping
@@ -16,7 +17,7 @@ from web_crawler.engine import CrawlReport
 from web_crawler.limiter import BLOCKED_AFTER, OPENS_AFTER, CircuitBreaker, ConcurrencyLaw
 from web_crawler.limiter import START as INITIAL_LIMIT
 from web_crawler.output import MemorySink, Sink
-from web_crawler.pool import InlineParser
+from web_crawler.pool import InlineParser, ParseCrashed
 from web_crawler.transport import TransportError
 from web_crawler.types import ErrorKind, ExitCode, ParseJob, ParseResult, WorkerContext
 
@@ -1143,6 +1144,156 @@ async def test_max_depth_waits_for_403s_held_until_their_run_is_settled() -> Non
     assert pages(transport)[-1] == "https://example.com/deep"
     assert report.stats.pages == 4
     assert report.stats.failures == {"HTTP 403": 1}
+
+
+def records(sink: MemorySink) -> dict[str, dict[str, object]]:
+    """The JSONL records a crawl wrote, by URL: one each."""
+    parsed = [json.loads(record) for record in sink.records]
+    assert all(record.endswith(b"\n") and record.count(b"\n") == 1 for record in sink.records)
+    by_url = {record["url"]: record for record in parsed}
+    assert len(by_url) == len(parsed)
+    return by_url
+
+
+async def test_jsonl_records_have_each_pages_status_depth_and_redirects() -> None:
+    replies = {START: html("/a", "https://elsewhere.org/")} | chain(
+        ("/a", Reply(301, {"Location": "/b"})),
+        ("/b", Reply(203, HTML, b'<link rel=canonical href=/b><a href="/">home</a>')),
+    )
+    sink = MemorySink()
+    cfg = Config(start_url=START, format="jsonl")
+    report = await crawl(cfg, sink, transport=FakeTransport(replies))
+    assert report.exit_code is ExitCode.OK
+    assert records(sink) == {
+        START: {
+            "url": START,
+            "status": 200,
+            "depth": 0,
+            "links": ["https://example.com/a", "https://elsewhere.org/"],
+        },
+        "https://example.com/b": {
+            "url": "https://example.com/b",
+            "status": 203,
+            "depth": 1,
+            "links": ["https://example.com/b", START],
+            "redirected_from": ["https://example.com/a"],
+            "canonical": "https://example.com/b",
+        },
+    }
+
+
+async def test_include_errors_writes_a_record_for_every_item_without_a_page() -> None:
+    corrupt = Reply(headers=HTML | {"Content-Encoding": "br"}, body=b"<a href=/x>")
+    replies = {
+        START: html(
+            "/page", "/old", "/missing", "/image", "/down", "/off", "/corrupt", "/forbidden"
+        )
+    } | chain(
+        ("/page", html()),
+        ("/old", Reply(301, {"Location": "/page"}, delay=0.01)),
+        ("/missing", Reply(404, HTML)),
+        ("/image", Reply(headers={"Content-Type": "image/png"})),
+        ("/down", ErrorKind.RESET),
+        ("/off", Reply(302, {"Location": "https://elsewhere.org/"})),
+        ("/corrupt", corrupt),
+        ("/forbidden", Reply(403, HTML)),
+    )
+    sink = MemorySink()
+    cfg = Config(start_url=START, format="jsonl", include_errors=True, retries=1)
+    report = await crawl(cfg, sink, transport=FakeTransport(replies), rng=Lowest())
+    assert report.exit_code is ExitCode.OK
+    errors = {url: record for url, record in records(sink).items() if "error" in record}
+    o = "https://example.com"
+    assert errors == {
+        f"{o}/old": {
+            "url": f"{o}/old",
+            "status": 301,
+            "depth": 1,
+            "error": "redirect to a URL already claimed",
+            "location": f"{o}/page",
+        },
+        f"{o}/missing": {"url": f"{o}/missing", "status": 404, "depth": 1, "error": "HTTP 404"},
+        f"{o}/image": {
+            "url": f"{o}/image",
+            "status": 200,
+            "depth": 1,
+            "error": "not HTML",
+            "content_type": "image/png",
+        },
+        f"{o}/down": {
+            "url": f"{o}/down",
+            "depth": 1,
+            "error": "reset",
+            "detail": "reset: scripted",
+        },
+        f"{o}/off": {
+            "url": f"{o}/off",
+            "status": 302,
+            "depth": 1,
+            "error": "redirect out of scope",
+            "detail": "HTTP 302 to https://elsewhere.org/, outside the crawl's scope",
+            "location": "https://elsewhere.org/",
+        },
+        f"{o}/corrupt": {
+            "url": f"{o}/corrupt",
+            "status": 200,
+            "depth": 1,
+            "error": "bad content-encoding",
+        },
+        f"{o}/forbidden": {
+            "url": f"{o}/forbidden",
+            "status": 403,
+            "depth": 1,
+            "error": "HTTP 403",
+        },
+    }
+    # Every item has a record: a page's, or one saying why there's none.
+    assert len(sink.records) == report.stats.pages + sum(report.stats.failures.values()) + 1
+
+
+async def test_include_errors_records_held_403s_and_crashed_parses() -> None:
+    class Crashing(InlineParser):
+        async def parse(self, job: ParseJob) -> ParseResult:
+            if job.url.endswith("/crash"):
+                raise ParseCrashed(job.url)
+            return await super().parse(job)
+
+    replies = {START: html("/old", "/crash")} | chain(
+        ("/old", Reply(301, {"Location": "/forbidden"})),
+        ("/forbidden", Reply(403, HTML, delay=0.01)),
+        ("/crash", html()),
+    )
+    sink = MemorySink()
+    cfg = Config(start_url=START, format="jsonl", include_errors=True)
+    report = await engine.crawl(cfg, sink, transport=FakeTransport(replies), parser=Crashing)
+    assert report.stats.failures == {"HTTP 403": 1, "parse crashed": 1}
+    errors = [record for record in records(sink).values() if "error" in record]
+    assert errors == [
+        {"url": f"{START}crash", "status": 200, "depth": 1, "error": "parse crashed"},
+        {  # held until nothing else could settle its run, then final
+            "url": f"{START}forbidden",
+            "status": 403,
+            "depth": 1,
+            "error": "HTTP 403",
+            "redirected_from": [f"{START}old"],
+        },
+    ]
+
+
+async def test_include_errors_records_a_start_url_that_cant_start() -> None:
+    sink = MemorySink()
+    cfg = Config(start_url=START, format="jsonl", include_errors=True)
+    report = await crawl(cfg, sink, transport=FakeTransport({START: Reply(404, HTML)}))
+    assert report.exit_code is ExitCode.CANNOT_START
+    assert records(sink) == {START: {"url": START, "status": 404, "depth": 0, "error": "HTTP 404"}}
+
+
+async def test_without_include_errors_only_pages_have_records() -> None:
+    replies = {START: html("/missing")}
+    sink = MemorySink()
+    cfg = Config(start_url=START, format="jsonl")
+    await crawl(cfg, sink, transport=FakeTransport(replies))
+    assert list(records(sink)) == [START]
 
 
 async def test_records_stream_in_the_order_pages_complete() -> None:

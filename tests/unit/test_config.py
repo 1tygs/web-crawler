@@ -25,6 +25,7 @@ def test_defaults_follow_the_design() -> None:
     assert not cfg.all_urls
     assert cfg.max_pages is None
     assert cfg.max_depth is None
+    assert (cfg.format, cfg.include_errors) == ("text", False)
     assert not cfg.ignore_robots
     assert cfg.robots_refresh == 24 * 3600  # RFC 9309 §2.4
     assert (cfg.first_probe, cfg.give_up_after) == (1.0, 300.0)
@@ -65,11 +66,18 @@ def test_is_immutable() -> None:
         ("user_agent", "   ", "user_agent must be non-blank ASCII"),
         ("user_agent", "crawler/1.0 (über)", "user_agent must be non-blank ASCII"),
         ("user_agent", "crawler/1.0\r\nX-Injected: 1", "can't contain control characters"),
+        ("format", "xml", "format must be text or jsonl, not 'xml'"),
+        ("include_errors", True, "include_errors needs format jsonl"),
     ],
 )
 def test_rejects_values_out_of_range(field: str, value: object, message: str) -> None:
     with pytest.raises(ConfigError, match=message):
         Config(start_url="https://example.com/", **{field: value})  # type: ignore[arg-type]
+
+
+def test_include_errors_with_jsonl() -> None:
+    cfg = Config(start_url="https://example.com/", format="jsonl", include_errors=True)
+    assert cfg.include_errors
 
 
 def test_config_error_is_a_value_error() -> None:

@@ -62,8 +62,13 @@ class Page:
 class NotPage:
     """A 2xx response that isn't HTML: counted, never parsed."""
 
-    url: str
     content_type: str | None
+    chain: tuple[str, ...]  # the URLs requested, in order; the last one's answer is this
+    status: int
+
+    @property
+    def url(self) -> str:
+        return self.chain[-1]
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +77,7 @@ class Claimed:
 
     url: str  # where the redirect led
     chain: tuple[str, ...]  # the URLs the item requested, in order
+    status: int  # the redirect's
 
 
 @dataclass(frozen=True, slots=True)
@@ -250,7 +256,7 @@ class Fetcher:
                 chain.append(target)
                 keys.add(key)
             elif hop is Hop.CLAIMED:
-                return Claimed(target, tuple(chain))
+                return Claimed(target, tuple(chain), status)
             else:
                 reason, why = _STOPPED[hop]
                 detail = f"HTTP {status} to {target}, {why}"
@@ -285,12 +291,12 @@ class Fetcher:
                 return _Redirect(status, target)
             case Triage.PAGE:
                 body, truncated = await response.read(self._max_page_bytes)
-                return _page(response, body, truncated)
+                return _page(response, body, truncated, chain, item.depth)
             case Triage.SNIFF:
-                return await self._sniff(response, chain)
+                return await self._sniff(response, chain, item.depth)
             case Triage.NOT_PAGE:
                 await _drain_if_small(response)
-                return NotPage(response.url, response.headers.get("Content-Type"))
+                return NotPage(response.headers.get("Content-Type"), chain, status)
             case Triage.FINAL:  # pragma: no branch  (the cases are exhaustive)
                 return await self._failed(response, chain, item)
 
@@ -307,7 +313,9 @@ class Fetcher:
         value = response.headers.get("Retry-After")
         return Retry(resume(item, chain), cls, final, parse_retry_after(value, self._wall_clock()))
 
-    async def _sniff(self, response: Response, chain: tuple[str, ...]) -> Page | NotPage | Final:
+    async def _sniff(
+        self, response: Response, chain: tuple[str, ...], depth: int
+    ) -> Page | NotPage | Final:
         """A 2xx response without a usable type: a page if its body starts as HTML does. The
         body is still compressed, so the start of it is decompressed to sniff."""
         start, more = await response.read(min(SNIFF_READ, self._max_page_bytes))
@@ -318,11 +326,11 @@ class Fetcher:
         if not sniff_html(header):
             if more:
                 await _drain_if_small(response)
-            return NotPage(response.url, response.headers.get("Content-Type"))
+            return NotPage(response.headers.get("Content-Type"), chain, response.status)
         rest, truncated = b"", False
         if more:
             rest, truncated = await response.read(self._max_page_bytes - len(start))
-        return _page(response, start + rest, truncated)
+        return _page(response, start + rest, truncated, chain, depth)
 
 
 @dataclass(frozen=True, slots=True)
@@ -459,12 +467,19 @@ def _too_many_redirects(chain: tuple[str, ...], looped: bool, target: str, statu
     return Final("too many redirects", detail, chain, status)
 
 
-def _page(response: Response, body: bytes, truncated: bool) -> Page:
-    """The page in response, whose body, still compressed, has been read."""
+def _page(
+    response: Response, body: bytes, truncated: bool, chain: tuple[str, ...], depth: int
+) -> Page:
+    """The page in response, the answer to the last URL of chain, whose body, still
+    compressed, has been read."""
     headers = response.headers
     _, charset = parse_content_type(headers.get("Content-Type"))
     encoding = headers.get("Content-Encoding")
-    return Page(ParseJob(response.url, body, charset, truncated, encoding))
+    return Page(
+        ParseJob(
+            response.url, body, charset, truncated, encoding, depth, response.status, chain[:-1]
+        )
+    )
 
 
 async def _drain_if_small(response: Response) -> None:

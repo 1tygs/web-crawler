@@ -1,3 +1,4 @@
+import dataclasses
 import gzip
 import html
 import zlib
@@ -47,6 +48,28 @@ def test_renders_the_text_record() -> None:
         b"\n"
     )
     assert result.links == [("https://example.com/about", "https://example.com/about")]
+    assert result.links_found == 2
+
+
+def test_renders_the_jsonl_record() -> None:
+    # The page's depth, status and the redirects to it come with the job; the parse finds
+    # the rest.
+    job = ParseJob(
+        url=PAGE,
+        body=gzip.compress(b'<link rel=canonical href=/c><a href="/about">a</a><a href'),
+        truncated=True,
+        content_encoding="gzip",
+        depth=3,
+        status=203,
+        redirected_from=("http://example.com/dir/page.html", "https://example.com/old"),
+    )
+    result = parse_page(job, dataclasses.replace(CTX, format="jsonl"))
+    assert result.record == (
+        b'{"url":"https://example.com/dir/page.html","status":203,"depth":3,'
+        b'"links":["https://example.com/c","https://example.com/about"],'
+        b'"redirected_from":["http://example.com/dir/page.html","https://example.com/old"],'
+        b'"truncated":true,"canonical":"https://example.com/c"}\n'
+    )
     assert result.links_found == 2
 
 

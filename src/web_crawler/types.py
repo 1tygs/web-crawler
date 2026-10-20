@@ -6,7 +6,9 @@ changed, and the parse contracts cross a process boundary by pickle.
 
 from dataclasses import dataclass
 from enum import IntEnum, StrEnum
-from typing import NamedTuple
+from typing import Literal, NamedTuple
+
+type Format = Literal["text", "jsonl"]  # what a record looks like (DESIGN.md §5.8)
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +49,11 @@ class ParseJob:
     http_charset: str | None = None  # the Content-Type header's charset parameter
     truncated: bool = False  # the body was cut at the size cap
     content_encoding: str | None = None  # the Content-Encoding header
+    # For a JSONL record: the page's depth, its response's status, and the redirects that
+    # led to url, in order.
+    depth: int = 0
+    status: int = 200
+    redirected_from: tuple[str, ...] = ()
 
 
 class ParseResult(NamedTuple):
@@ -67,6 +74,7 @@ class WorkerContext:
     scope_prefixes: tuple[str, ...]
     max_bytes: int  # the most a body may decompress to; the rest is cut off
     all_urls: bool = False  # print every URL-bearing attribute, not only navigational links
+    format: Format = "text"  # how records are rendered
 
 
 class ExitCode(IntEnum):

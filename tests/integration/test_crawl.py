@@ -2,6 +2,7 @@
 
 import asyncio
 import gzip
+import json
 import os
 import random
 import signal
@@ -288,6 +289,71 @@ async def test_python_dash_m_crawls_the_hand_built_site(parse_workers: int) -> N
     assert (
         "not printed: not HTML (1), HTTP 404 (1), redirect to a URL already claimed (1)" in stderr
     )
+
+
+async def test_the_crawl_command_writes_jsonl_with_errors_to_a_file(
+    tmp_path: Path, parse_workers: int
+) -> None:
+    other_port = unused_port()
+    out = tmp_path / "crawl.jsonl"
+    async with Site({}) as site:
+        site.resources = hand_built(site.port, other_port)
+        code, stdout, stderr = await run(
+            CRAWL,
+            "--format",
+            "jsonl",
+            "--include-errors",
+            "-o",
+            str(out),
+            "--parse-workers",
+            str(parse_workers),
+            site.url(),
+        )
+    assert code == 0
+    assert stdout == b""
+    assert "Traceback" not in stderr
+    records = {r["url"]: r for r in map(json.loads, out.read_bytes().splitlines())}
+    o = site.origin
+    # The same pages as in text, with the same links, and their depths.
+    expected = {}
+    for record in hand_built_records(site.port, other_port):
+        url, *links = record.decode().split("\n")[:-2]
+        expected[url] = [link.removeprefix("  ") for link in links]
+    pages = {url: r for url, r in records.items() if "links" in r}
+    assert {url: r["links"] for url, r in pages.items()} == expected
+    assert {url: r["depth"] for url, r in pages.items()} == {
+        f"{o}/": 0,
+        f"{o}/a": 1,
+        f"{o}/b": 1,
+        f"{o}/c?x=%2f": 1,
+        f"{o}/new": 1,
+        f"{o}/~user/": 1,
+        f"{o}/a/deeper/": 2,
+        f"{o}/cycle": 3,
+    }
+    # /new was reached by redirect, from /old or /also-old, whichever answered first; the
+    # other's redirect found it claimed.
+    [first] = pages[f"{o}/new"]["redirected_from"]
+    [second] = {f"{o}/old", f"{o}/also-old"} - {first}
+    errors = {url: r for url, r in records.items() if "error" in r}
+    assert errors == {
+        f"{o}/download": {
+            "url": f"{o}/download",
+            "status": 200,
+            "depth": 1,
+            "error": "not HTML",
+            "content_type": "application/octet-stream",
+        },
+        f"{o}/missing": {"url": f"{o}/missing", "status": 404, "depth": 1, "error": "HTTP 404"},
+        second: {
+            "url": second,
+            "status": 302 if second.endswith("also-old") else 301,
+            "depth": 1,
+            "error": "redirect to a URL already claimed",
+            "location": f"{o}/new",
+        },
+    }
+    assert len(records) == len(out.read_bytes().splitlines())  # one record a URL
 
 
 async def test_follows_a_cookie_gate_back_to_the_page(parse_workers: int) -> None:

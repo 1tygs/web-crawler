@@ -1,5 +1,6 @@
 {
   "about": "An empty or valueless href is a link to the page itself, printed once.",
   "printed": ["https://example.com/dir/page.html", "https://example.com/other"],
-  "crawled": ["https://example.com/dir/page.html", "https://example.com/other"]
+  "crawled": ["https://example.com/dir/page.html", "https://example.com/other"],
+  "canonical": "https://example.com/dir/page.html"
 }

@@ -2,11 +2,13 @@
 it prints and crawls.
 
 Each NAME.json has "about", what the case shows; "printed", the links in the page's record;
-and "crawled", the in-scope navigational links it returns to crawl. Optional keys set the
-job: "url" (https://example.com/dir/page.html otherwise), "http_charset", "truncated" and
+and "crawled", the in-scope navigational links it returns to crawl. "canonical" is its
+canonical URL, which only a JSONL record shows, if it has one. Optional keys set the job:
+"url" (https://example.com/dir/page.html otherwise), "http_charset", "truncated" and
 "all_urls".
 """
 
+import dataclasses
 import json
 from pathlib import Path
 from typing import Any
@@ -36,9 +38,20 @@ def test_golden(name: str) -> None:
         http_charset=case.get("http_charset"),
         truncated=case.get("truncated", False),
     )
-    result = parse_page(job, WorkerContext(SCOPE, MIB, all_urls=case.get("all_urls", False)))
+    ctx = WorkerContext(SCOPE, MIB, all_urls=case.get("all_urls", False))
+    result = parse_page(job, ctx)
     assert result.record.decode() == "".join(
         [job.url, "\n", *(f"  {url}\n" for url in case["printed"]), "\n"]
     )
     assert [url for _, url in result.links] == case["crawled"]
     assert result.links_found == len(case["printed"])
+    jsonl = parse_page(job, dataclasses.replace(ctx, format="jsonl"))
+    assert jsonl._replace(record=b"") == result._replace(record=b"")
+    expected: dict[str, object] = {"url": job.url, "status": 200, "depth": 0}
+    expected["links"] = case["printed"]
+    if job.truncated:
+        expected["truncated"] = True
+    if "canonical" in case:
+        expected["canonical"] = case["canonical"]
+    assert jsonl.record.endswith(b"\n")
+    assert json.loads(jsonl.record) == expected

@@ -52,17 +52,21 @@ from web_crawler.limiter import (
 from web_crawler.output import Sink
 from web_crawler.pool import ParseCrashed, Parser, worker_count
 from web_crawler.pool import start as start_parser
+from web_crawler.records import error_record
 from web_crawler.retry import Class
 from web_crawler.robots import Availability, RobotsPolicy, RobotsTxt, product_token
 from web_crawler.stats import Stats
 from web_crawler.transport import AiohttpTransport, Transport
-from web_crawler.types import CrawlItem, ErrorKind, ExitCode, WorkerContext
+from web_crawler.types import CrawlItem, ErrorKind, ExitCode, Format, ParseJob, WorkerContext
 from web_crawler.urls import Scope, dedupe_key, normalize_start
 
 log = logging.getLogger(__name__)
 
 # Why a page whose parse crashed its worker, even alone, isn't printed.
 PARSE_CRASHED = "parse crashed"
+NOT_HTML = "not HTML"  # a 2xx response, but not a page
+CLAIMED = "redirect to a URL already claimed"  # the page it leads to is another item's
+FORBIDDEN = "HTTP 403"
 
 # What says a server is in distress, or the way to it congested, and cuts the concurrency
 # limit (DESIGN.md §5.3): a refused connection, a timeout, a reset or a body cut off. DNS
@@ -140,6 +144,7 @@ async def crawl(  # noqa: PLR0913  (the collaborators that tests replace)
     if parser is None:
         workers = worker_count(cfg.parse_workers)
         parser = functools.partial(start_parser, workers=workers)
+    not_printed = _NotPrinted(stats, sink if cfg.include_errors else None)
     start = _Start(
         admission=admission,
         frontier=frontier,
@@ -148,6 +153,7 @@ async def crawl(  # noqa: PLR0913  (the collaborators that tests replace)
         product=product,
         strict_host=cfg.strict_host,
         stats=stats,
+        not_printed=not_printed,
         retries=cfg.retries,
         rng=rng,
         clock=clock,
@@ -159,7 +165,9 @@ async def crawl(  # noqa: PLR0913  (the collaborators that tests replace)
         admission=admission,
         sink=sink,
         stats=stats,
+        not_printed=not_printed,
         all_urls=cfg.all_urls,
+        format=cfg.format,
         max_bytes=cfg.max_page_bytes,
         make_parser=parser,
         law=law,
@@ -324,6 +332,7 @@ class _Start:
     product: str  # the User-Agent's product token, which robots.txt groups name
     strict_host: bool
     stats: Stats
+    not_printed: _NotPrinted
     retries: int  # for errors, from --retries
     rng: random.Random  # for retries' backoff
     clock: Callable[[], float]
@@ -375,7 +384,7 @@ class _Start:
         if isinstance(outcome, Page):
             return item, outcome  # it's outstanding until the dispatcher parses its page
         self.frontier.finish(item)
-        _count(self.stats, outcome)
+        self.not_printed.outcome(item, outcome)
         if self._problem is not None:
             return self._problem
         if isinstance(outcome, NotPage):
@@ -467,15 +476,86 @@ def _answered(outcome: FetchOutcome) -> bool:
     return not isinstance(outcome, Final) or outcome.status is not None
 
 
-def _count(stats: Stats, outcome: NotPage | Claimed | Final) -> None:
-    """Count an item that ended without a page."""
-    if isinstance(outcome, NotPage):
-        stats.not_html += 1
-    elif isinstance(outcome, Claimed):
-        # The page it leads to is printed once, by the item that claimed it.
-        stats.failures["redirect to a URL already claimed"] += 1
-    else:
-        stats.failures[outcome.reason] += 1
+@dataclass(frozen=True, slots=True)
+class _NotPrinted:
+    """Counts each item that ends without a page, by why; under --include-errors, it writes
+    a JSONL record for each as well, so that every item has one (DESIGN.md §5.8)."""
+
+    stats: Stats
+    sink: Sink | None  # for the records; None without --include-errors
+
+    def outcome(self, item: CrawlItem, outcome: NotPage | Claimed | Final) -> None:
+        """item's fetch ended with outcome."""
+        if isinstance(outcome, NotPage):
+            self.stats.not_html += 1
+            if self.sink is not None:
+                self.sink.write(
+                    error_record(
+                        outcome.url,
+                        item.depth,
+                        NOT_HTML,
+                        status=outcome.status,
+                        redirected_from=outcome.chain[:-1],
+                        content_type=outcome.content_type,
+                    )
+                )
+        elif isinstance(outcome, Claimed):
+            # The page it leads to is printed once, by the item that claimed it.
+            self.stats.failures[CLAIMED] += 1
+            if self.sink is not None:
+                *redirected_from, url = outcome.chain
+                self.sink.write(
+                    error_record(
+                        url,
+                        item.depth,
+                        CLAIMED,
+                        status=outcome.status,
+                        redirected_from=redirected_from,
+                        location=outcome.url,
+                    )
+                )
+        else:
+            self.stats.failures[outcome.reason] += 1
+            if self.sink is not None:
+                self.sink.write(
+                    error_record(
+                        outcome.url,
+                        item.depth,
+                        outcome.reason,
+                        status=outcome.status,
+                        detail=outcome.detail,
+                        redirected_from=outcome.chain[:-1],
+                        location=outcome.location,
+                    )
+                )
+
+    def forbidden(self, item: CrawlItem) -> None:
+        """item, as the block guard held it, is forbidden: its 403 is final."""
+        self.stats.failures[FORBIDDEN] += 1
+        if self.sink is not None:
+            self.sink.write(
+                error_record(
+                    item.url,
+                    item.depth,
+                    FORBIDDEN,
+                    status=HTTPStatus.FORBIDDEN,
+                    redirected_from=item.redirected_from,
+                )
+            )
+
+    def unparsed(self, item: CrawlItem, job: ParseJob, reason: str) -> None:
+        """item's page, job, can't be printed, for reason."""
+        self.stats.failures[reason] += 1
+        if self.sink is not None:
+            self.sink.write(
+                error_record(
+                    job.url,
+                    item.depth,
+                    reason,
+                    status=job.status,
+                    redirected_from=job.redirected_from,
+                )
+            )
 
 
 @dataclass(slots=True, kw_only=True)
@@ -494,7 +574,9 @@ class _Dispatcher:
     admission: Admission
     sink: Sink
     stats: Stats
+    not_printed: _NotPrinted
     all_urls: bool
+    format: Format  # the records'
     max_bytes: int  # the most a page's body may decompress to
     make_parser: Callable[[WorkerContext], Parser]
     law: ConcurrencyLaw
@@ -532,7 +614,9 @@ class _Dispatcher:
         up on its host."""
         # The scope is fixed now, so the parsers' context can be, and the gateway can start:
         # each worker gets the context once, as it starts (DESIGN.md §5.5).
-        ctx = WorkerContext(self.admission.scope.prefixes, self.max_bytes, self.all_urls)
+        ctx = WorkerContext(
+            self.admission.scope.prefixes, self.max_bytes, self.all_urls, self.format
+        )
         self._parser = self.make_parser(ctx)
         # Room for every request the limit may allow, and for each worker's parse in
         # progress and a few queued for it.
@@ -801,7 +885,7 @@ class _Dispatcher:
             self._refused(self.guard.answered(issued))
         if isinstance(outcome, Retry):
             return not self._retry(outcome)
-        _count(self.stats, outcome)
+        self.not_printed.outcome(item, outcome)
         return True
 
     def _forbidden(self, item: CrawlItem, final: Final, issued: float) -> bool:
@@ -810,7 +894,7 @@ class _Dispatcher:
         item stays outstanding."""
         verdict = self.guard.forbidden(resume(item, final.chain), issued, self.clock())
         if verdict is Verdict.FINAL:
-            _count(self.stats, final)
+            self.not_printed.outcome(item, final)
             return False
         if verdict is Verdict.TRIPPED:
             log.warning(
@@ -827,7 +911,7 @@ class _Dispatcher:
     def _refused(self, held: list[CrawlItem]) -> None:
         """The block guard settled a run of 403s: the pages it held are forbidden."""
         for item in held:
-            self.stats.failures["HTTP 403"] += 1
+            self.not_printed.forbidden(item)
             self.frontier.finish(item)
 
     def _retry(self, outcome: Retry) -> bool:
@@ -850,7 +934,7 @@ class _Dispatcher:
             self._gate.pause(now + pause)
         again = _next_attempt(outcome, self.retries, self.rng, self.stats)
         if again is None:
-            _count(self.stats, outcome.final)
+            self.not_printed.outcome(outcome.item, outcome.final)
             return False
         item, delay = again
         self.frontier.schedule_retry(item, now + delay)
@@ -870,11 +954,11 @@ class _Dispatcher:
             result = await self._parser.parse(page.job)
         except ParseCrashed:
             log.warning("%s isn't printed: parsing it crashed the parser process", item.url)
-            self.stats.failures[PARSE_CRASHED] += 1
+            self.not_printed.unparsed(item, page.job, PARSE_CRASHED)
             return
         self.stats.body_bytes += len(page.job.body)
         if result.error is not None:
-            self.stats.failures[result.error] += 1
+            self.not_printed.unparsed(item, page.job, result.error)
             return
         self.sink.write(result.record)
         # The links are admitted before the page finishes, so that outstanding reaches 0

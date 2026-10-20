@@ -1,6 +1,7 @@
 import importlib.metadata
 import subprocess
 import sys
+from pathlib import Path
 from typing import NoReturn
 
 import pytest
@@ -9,6 +10,7 @@ import web_crawler
 from web_crawler.cli import main, parse_args
 from web_crawler.config import Config
 from web_crawler.engine import CrawlReport
+from web_crawler.output import Sink
 from web_crawler.stats import Stats
 from web_crawler.types import ExitCode
 
@@ -66,6 +68,66 @@ def test_max_depth_below_0_is_a_usage_error(capsys: pytest.CaptureFixture[str]) 
         parse_args(["https://example.com/", "--max-depth", "-1"])
     assert exit_info.value.code == 2
     assert "max_depth must be at least 0, not -1" in capsys.readouterr().err
+
+
+def test_output_options() -> None:
+    cfg = parse_args(["https://example.com/", "--format", "jsonl", "--include-errors"])
+    assert (cfg.format, cfg.include_errors) == ("jsonl", True)
+    cfg = parse_args(["https://example.com/", "-o", "out.txt"])
+    assert (cfg.format, cfg.include_errors) == ("text", False)
+
+
+@pytest.mark.parametrize(
+    ("argv", "message"),
+    [
+        (["--format", "xml"], "argument --format: invalid choice: 'xml'"),
+        (["--include-errors"], "include_errors needs format jsonl"),
+    ],
+)
+def test_output_options_that_dont_fit_are_usage_errors(
+    argv: list[str], message: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        parse_args(["https://example.com/", *argv])
+    assert exit_info.value.code == 2
+    assert message in capsys.readouterr().err
+
+
+async def _two_records(cfg: Config, sink: Sink, **_: object) -> CrawlReport:
+    sink.start(lambda: None, lambda: None)
+    sink.write(b"first\n\n")
+    sink.write(b"second\n\n")
+    sink.close()
+    return CrawlReport(ExitCode.OK, Stats(started=0.0, pages=2), unique_urls=2, finished=1.0)
+
+
+@pytest.mark.parametrize("option", ["-o", "--output"])
+def test_output_goes_to_a_file(
+    option: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    out = tmp_path / "records.txt"
+    out.write_bytes(b"what was there before")
+    monkeypatch.setattr("web_crawler.cli.crawl", _two_records)
+    assert main(["https://example.com/", option, str(out)]) == ExitCode.OK
+    assert out.read_bytes() == b"first\n\nsecond\n\n"  # replaced
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("2 pages in 1.0 s")
+
+
+def test_an_output_file_that_cant_be_written_is_a_usage_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr("web_crawler.cli.crawl", _two_records)
+    with pytest.raises(SystemExit) as exit_info:
+        main(["https://example.com/", "-o", str(tmp_path / "missing" / "records.txt")])
+    assert exit_info.value.code == 2
+    assert f"can't write to {tmp_path}/missing/records.txt: No such file or directory" in (
+        capsys.readouterr().err
+    )
 
 
 def test_speed_options() -> None:
@@ -177,9 +239,9 @@ def test_help_exits_zero(capsys: pytest.CaptureFixture[str]) -> None:
     assert exit_info.value.code == 0
     usage = " ".join(capsys.readouterr().out.split())  # however the terminal's width wraps it
     assert usage.startswith(
-        "usage: crawl [-h] [--all-urls] [--max-pages N] [--max-depth N] [--max-concurrency N] "
-        "[--max-rps R] "
-        "[--parse-workers N] [--timeout S] [--max-page-bytes N] [--retries N] "
+        "usage: crawl [-h] [--all-urls] [--max-pages N] [--max-depth N] "
+        "[--format {text,jsonl}] [--include-errors] [-o FILE] [--max-concurrency N] "
+        "[--max-rps R] [--parse-workers N] [--timeout S] [--max-page-bytes N] [--retries N] "
         "[--no-skip-extensions] [--ignore-robots]"
     )
 

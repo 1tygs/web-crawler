@@ -12,6 +12,11 @@ def test_items_are_immutable() -> None:
         item.depth = 1  # type: ignore[misc]
 
 
+def test_a_parse_job_is_for_a_page_at_the_start_unless_it_says_otherwise() -> None:
+    job = ParseJob(url="https://example.com/", body=b"")
+    assert (job.depth, job.status, job.redirected_from) == (0, 200, ())
+
+
 def test_a_new_item_has_had_no_retries_and_followed_no_redirects() -> None:
     item = CrawlItem(url="https://example.com/", key="https://example.com/", depth=0)
     assert (item.attempt, item.throttled, item.redirected_from) == (0, 0, ())
@@ -22,11 +27,15 @@ def test_a_new_item_has_had_no_retries_and_followed_no_redirects() -> None:
     [
         ParseJob(url="https://example.com/", body=b"<a href=/x>"),
         ParseJob("https://example.com/", b"<a href=/\xe9>", "latin1", True, "gzip, br"),
+        ParseJob(
+            "https://example.com/b", b"", None, False, None, 3, 203, ("https://example.com/a",)
+        ),
         ParseResult(record=b"r\n", links=[("k", "u")], links_found=1, decoded_bytes=2, error=None),
         ParseResult(b"", [], 0, 0, "bad content-encoding"),
         ParseResult(b"r\n", [], 0, 5, None, truncated=True),
         WorkerContext(("https://example.com/", "http://example.com/"), max_bytes=1 << 20),
         WorkerContext(scope_prefixes=("http://127.0.0.1:8000/",), max_bytes=1, all_urls=True),
+        WorkerContext(("https://example.com/",), max_bytes=1, format="jsonl"),
     ],
 )
 def test_parse_contracts_survive_pickling(value: object) -> None:
