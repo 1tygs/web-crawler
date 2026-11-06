@@ -558,7 +558,7 @@ On this machine the client becomes the bottleneck only above about 2,800 pages/s
 | HTML parsing | selectolax with the lexbor engine (1.0 removed the old Modest engine) | 1.0.1 |
 | URL parsing | ada-url | 4.0.0 |
 | robots.txt | protego | 0.7.0 |
-| Brotli, zstd | brotli; `compression.zstd` from the standard library | 1.2.0; 3.14 |
+| Brotli, zstd | brotli (its floor is 1.2.1, the first release without CVE-2026-111497); `compression.zstd` from the standard library | 1.2.0; 3.14 |
 | JSON output | orjson | 3.13.0 |
 | CLI | argparse (standard library) | — |
 | Tooling | uv (lockfile), ruff, mypy `--strict`, pytest + pytest-asyncio, hypothesis | — |

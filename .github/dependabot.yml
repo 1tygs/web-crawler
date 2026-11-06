@@ -2,8 +2,12 @@
 # non-major updates. Major updates come one at a time, since they can need code changes.
 version: 2
 updates:
+  # pyproject.toml's floors are the versions evaluated and uv.lock holds the exact ones, so an
+  # update within a range moves only the lock. A release outside the range, such as a new major
+  # version, still comes through and changes the requirement; lockfile-only would drop it.
   - package-ecosystem: uv
     directory: /
+    versioning-strategy: increase-if-necessary
     schedule:
       interval: weekly
     groups:
