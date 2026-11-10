@@ -53,13 +53,13 @@ bench = [
     "yarl>=1.25.1",
 ]
 dev = [
-    "coverage>=7.16.2",
-    "hypothesis>=6.170.5",
+    "coverage>=7.17.2",
+    "hypothesis>=6.170.15",
     "mypy>=2.4.0",
     "pre-commit>=4.7.0",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
-    "ruff>=0.17.1",
+    "ruff>=0.17.4",
     "trustme>=1.2.1",
 ]
 
