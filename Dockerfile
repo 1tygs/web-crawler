@@ -8,9 +8,9 @@
 # nothing else, uv included, as a user who isn't root. The base images are pinned by digest;
 # Dependabot keeps them current.
 
-FROM ghcr.io/astral-sh/uv:0.13.7@sha256:96f40d3904aad8d0bd010539001d36c8e2188b981e1334471a90c4a1d93bb490 AS uv
+FROM ghcr.io/astral-sh/uv:0.13.9@sha256:d3b601f0c7b118bc1753febf7c41cc80981df678445e0254284eecf84db79a7d AS uv
 
-FROM python:3.14.9-slim-trixie@sha256:35caba83af2fe6da9a5d922f9b0156f21d1246a48278c58a08bd253303ba42e8 AS build
+FROM python:3.14.10-slim-trixie@sha256:9aaa474097d094040649f2162a627c0049b408f52138d980916788d80f04802f AS build
 COPY --from=uv /uv /bin/uv
 # The image's own Python, bytecode compiled ahead, and files copied out of uv's cache, which
 # is a mount of its own.
@@ -27,7 +27,7 @@ COPY src ./src
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev --no-editable
 
-FROM python:3.14.9-slim-trixie@sha256:35caba83af2fe6da9a5d922f9b0156f21d1246a48278c58a08bd253303ba42e8
+FROM python:3.14.10-slim-trixie@sha256:9aaa474097d094040649f2162a627c0049b408f52138d980916788d80f04802f
 LABEL org.opencontainers.image.title="web-crawler" \
       org.opencontainers.image.description="A fast, accurate and polite single-host web crawler" \
       org.opencontainers.image.source="https://github.com/1tygs/web-crawler" \
